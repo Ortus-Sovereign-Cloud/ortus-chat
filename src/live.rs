@@ -130,7 +130,7 @@ fn events(request: &Request, instance: Arc<Instance>, user: String) -> Response 
             first = false;
             if store::now() - pinged > 2_000 {
                 pinged = store::now();
-                if sender.comment("").is_err() {
+                if sender.comment("ping").is_err() {
                     return;
                 }
             }

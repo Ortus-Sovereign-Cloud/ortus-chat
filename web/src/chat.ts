@@ -546,6 +546,13 @@ export class OrtusChatMain extends LitElement {
 
   private listen(): void {
     this.events = new EventSource("/api/v1/chat/events");
+    // After a break the stream starts afresh: read again what may have
+    // been missed in between.
+    let opened = false;
+    this.events.addEventListener("open", () => {
+      if (opened) void this.catchUp();
+      opened = true;
+    });
     this.events.addEventListener("event", (e) => void this.onEvent(JSON.parse((e as MessageEvent).data)));
     this.events.addEventListener("room", () => void this.loadRooms());
     this.events.addEventListener("typing", (e) => {
@@ -578,6 +585,18 @@ export class OrtusChatMain extends LitElement {
     } else if (m.about) {
       await this.refresh(m.about);
     }
+  }
+
+  private async catchUp(): Promise<void> {
+    await this.loadRooms();
+    const room = this.current;
+    if (!room) return;
+    const list = await call<{ messages: Message[]; people: Record<string, Person> }>("GET", `/chat/rooms/${encodeURIComponent(room)}/messages`).catch(() => null);
+    if (list && room === this.current) {
+      this.people = { ...this.people, ...list.people };
+      this.messages = list.messages;
+    }
+    if (this.thread) await this.openThread(this.thread);
   }
 
   /** One message again (after a reply, an edit, a reaction). */
