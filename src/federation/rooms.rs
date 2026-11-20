@@ -584,13 +584,18 @@ pub async fn state_and_chain(
         .collect();
     let mut chain = Vec::new();
     while let Some(id) = queue.pop() {
-        if !seen.insert(id.clone()) || seen.len() > 10_000 {
+        // Only this room's events (an event id named by a partner could
+        // point into another room), and at most 2000 of them.
+        if seen.len() >= 2000 {
+            break;
+        }
+        if !seen.insert(id.clone()) {
             continue;
         }
         if let Some(r) = s
             .query(
-                "SELECT pdu FROM chat_pdus WHERE event_id = $1",
-                &[id.as_str().into()],
+                "SELECT pdu FROM chat_pdus WHERE event_id = $1 AND room = $2",
+                &[id.as_str().into(), room.into()],
             )
             .await
             .map_err(|e| e.to_string())?
