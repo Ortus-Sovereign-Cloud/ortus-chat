@@ -25,6 +25,8 @@ const en = {
   unread: {"one": "{count} unread", "other": "{count} unread"},
   members: {"one": "{count} member", "other": "{count} members"},
   endToEnd: "End-to-end encrypted",
+  cannotRead: "This message can't be opened on this device yet.",
+  noRoomKey: "This device has no key for this room yet: a member's device gives it when they are online.",
   sharedWithPartners: "Shared with partners",
   shareWithPartners: "Share with partners",
   inviteButton: "Invite",

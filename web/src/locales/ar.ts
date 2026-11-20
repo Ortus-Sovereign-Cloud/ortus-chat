@@ -24,6 +24,8 @@ const messages: Record<ChatKey, ChatMessage> = {
   unread: {"zero": "لا رسائل غير مقروءة", "one": "رسالة غير مقروءة", "two": "رسالتان غير مقروءتين", "few": "{count} رسائل غير مقروءة", "many": "{count} رسالة غير مقروءة", "other": "{count} رسالة غير مقروءة"},
   members: {"zero": "لا أعضاء", "one": "عضو واحد", "two": "عضوان", "few": "{count} أعضاء", "many": "{count} عضوًا", "other": "{count} عضو"},
   endToEnd: "مشفّر من طرف إلى طرف",
+  cannotRead: "لا يمكن فتح هذه الرسالة على هذا الجهاز بعد.",
+  noRoomKey: "لا يملك هذا الجهاز مفتاحًا لهذه الغرفة بعد: سيمنحه جهاز أحد الأعضاء عندما يكون متصلًا.",
   sharedWithPartners: "مشتركة مع الشركاء",
   shareWithPartners: "مشاركة مع الشركاء",
   inviteButton: "دعوة",

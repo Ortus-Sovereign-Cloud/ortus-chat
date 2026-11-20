@@ -2,6 +2,7 @@
 // open room in the middle, a thread on the right with its recorded
 // decision, which can become a task. Everything new arrives live.
 import { ApiError, LitElement, LocalizeController, call, controls, css, customElement, html, nothing, state, type TemplateResult } from "ortus-kit";
+import { Sealer, type Sealed } from "./e2e.js";
 import { t } from "./i18n.js";
 
 interface RoomItem {
@@ -47,6 +48,10 @@ interface Message {
   replies: number | null;
   reactions: { key: string; who: string[] }[];
   file: { id: string; name: string; mime: string } | null;
+  /** An end-to-end room's message as the server keeps it. */
+  sealed?: Sealed | null;
+  /** A sealed message this device cannot open. */
+  locked?: boolean;
 }
 
 const TONES = ["#a5b4ff", "#f9b77a", "#6ee0d0", "#d4f27a", "#ffa39a", "#eceef3"];
@@ -555,6 +560,8 @@ export class OrtusChatMain extends LitElement {
   /** Whether this installation federates (Matrix). */
   @state() private federation = false;
   @state() private inviting = false;
+  /** End-to-end rooms on this browser. */
+  private sealer: Sealer | null = null;
   private events: EventSource | null = null;
   private lastTyping = 0;
 
@@ -588,8 +595,12 @@ export class OrtusChatMain extends LitElement {
     const p = new URLSearchParams(location.search);
     const room = p.get("room") ?? this.rooms.find((r) => r.state === "join")?.id ?? null;
     if (room) await this.open(room, p.get("thread") ?? undefined);
-    call<{ federation?: boolean }>("GET", "/chat/policy")
-      .then((r) => (this.federation = !!r.federation))
+    call<{ federation?: boolean; encryptedRooms?: boolean }>("GET", "/chat/policy")
+      .then((r) => {
+        this.federation = !!r.federation;
+        // This device's key, so members can give it room keys.
+        if (r.encryptedRooms || this.rooms.some((x) => x.encrypted)) void this.sealer?.ready().catch(() => undefined);
+      })
       .catch(() => undefined);
     call<{ apps: { id: string }[] }>("GET", "/apps")
       .then((r) => (this.tasksInstalled = r.apps.some((a) => a.id === "tasks")))
@@ -634,7 +645,9 @@ export class OrtusChatMain extends LitElement {
     }
     this.shown = Math.max(this.shown, m.seq);
     if (m.kind === "m.room.message") {
-      const one = await call<Message>("GET", `/chat/messages/${encodeURIComponent(m.id)}`).catch(() => null);
+      const fetched = await call<Message>("GET", `/chat/messages/${encodeURIComponent(m.id)}`).catch(() => null);
+      if (!fetched) return;
+      const [one] = await this.reveal([fetched]);
       if (!one) return;
       if (!one.thread && !this.messages.some((x) => x.id === one.id)) this.messages = [...this.messages, one];
       if (one.thread) {
@@ -648,6 +661,8 @@ export class OrtusChatMain extends LitElement {
       if (info) {
         this.members = info.members;
         this.people = { ...this.people, ...info.people };
+        // A new member's devices get the room key; a key may have come.
+        if (this.room()?.encrypted) await this.syncKeys(m.room);
       }
     } else if (m.about) {
       await this.refresh(m.about);
@@ -661,8 +676,10 @@ export class OrtusChatMain extends LitElement {
     const n = ++this.loads;
     const list = await call<{ messages: Message[]; people: Record<string, Person> }>("GET", `/chat/rooms/${encodeURIComponent(room)}/messages`).catch(() => null);
     if (!list || n !== this.loads || room !== this.current) return;
+    const messages = await this.reveal(list.messages);
+    if (n !== this.loads || room !== this.current) return;
     this.people = { ...this.people, ...list.people };
-    this.messages = list.messages;
+    this.messages = messages;
   }
 
   /** The room's last event this screen has taken in. */
@@ -673,6 +690,12 @@ export class OrtusChatMain extends LitElement {
     await this.loadRooms().catch(() => undefined);
     const now = this.room()?.lastSeq ?? 0;
     if (this.current && now > this.shown) await this.catchUp();
+    if (this.current && this.room()?.encrypted && this.room()?.state === "join") {
+      // Members' new devices get the room key from this one; this one may
+      // have been given it meanwhile.
+      await this.syncKeys(this.current);
+      if (this.messages.some((m) => m.locked)) await this.loadMessages(this.current);
+    }
   }
 
   private async catchUp(): Promise<void> {
@@ -686,7 +709,9 @@ export class OrtusChatMain extends LitElement {
 
   /** One message again (after a reply, an edit, a reaction). */
   private async refresh(id: string): Promise<void> {
-    const one = await call<Message>("GET", `/chat/messages/${encodeURIComponent(id)}`).catch(() => null);
+    const fetched = await call<Message>("GET", `/chat/messages/${encodeURIComponent(id)}`).catch(() => null);
+    if (!fetched) return;
+    const [one] = await this.reveal([fetched]);
     if (!one) return;
     this.messages = this.messages.map((x) => (x.id === id ? one : x));
     this.threadMessages = this.threadMessages.map((x) => (x.id === id ? one : x));
@@ -696,6 +721,7 @@ export class OrtusChatMain extends LitElement {
     const r = await call<{ rooms: RoomItem[]; people: Record<string, Person>; me: string }>("GET", "/chat/rooms");
     this.rooms = r.rooms;
     this.people = { ...this.people, ...r.people };
+    if (r.me !== this.me || !this.sealer) this.sealer = new Sealer(r.me);
     this.me = r.me;
   }
 
@@ -713,11 +739,21 @@ export class OrtusChatMain extends LitElement {
     url.searchParams.delete("message");
     history.replaceState(null, "", url);
     const [info] = await Promise.all([
-      call<{ members: Member[]; people: Record<string, Person>; state: string }>("GET", `/chat/rooms/${encodeURIComponent(id)}`),
+      call<{ members: Member[]; people: Record<string, Person>; state: string }>("GET", `/chat/rooms/${encodeURIComponent(id)}`).catch(() => null),
       this.loadMessages(id),
     ]);
+    if (!info) {
+      // Invited to a private room: it opens once joined.
+      this.members = [];
+      this.messages = [];
+      return;
+    }
     this.members = info.members;
     this.people = { ...this.people, ...info.people };
+    if (this.room()?.encrypted && this.room()?.state === "join") {
+      await this.syncKeys(id);
+      await this.loadMessages(id);
+    }
     this.shown = this.room()?.lastSeq ?? 0;
     if (thread) await this.openThread(thread);
     const last = this.room()?.lastSeq;
@@ -739,12 +775,29 @@ export class OrtusChatMain extends LitElement {
       .catch(() => undefined);
   }
 
+  /** Room keys for this device, and for members' devices that lack them. */
+  private async syncKeys(room: string): Promise<void> {
+    await this.sealer?.sync(room, this.isOwner()).catch(() => undefined);
+  }
+
+  /** Sealed messages opened on this device (or marked as not readable). */
+  private async reveal(list: Message[]): Promise<Message[]> {
+    const sealer = this.sealer;
+    return Promise.all(
+      list.map(async (m) => {
+        if (!m.sealed || m.deleted || !sealer) return m;
+        const text = await sealer.open(m.room, m.sealed);
+        return text === null ? { ...m, text: "", locked: true } : { ...m, text, locked: false };
+      }),
+    );
+  }
+
   private async openThread(id: string): Promise<void> {
     this.thread = id;
     this.taskMade = "";
     const r = await call<{ messages: Message[]; people: Record<string, Person> }>("GET", `/chat/rooms/${encodeURIComponent(this.current!)}/messages?thread=${encodeURIComponent(id)}`);
     this.people = { ...this.people, ...r.people };
-    this.threadMessages = r.messages;
+    this.threadMessages = await this.reveal(r.messages);
   }
 
   private name(id: string): string {
@@ -774,7 +827,11 @@ export class OrtusChatMain extends LitElement {
     const text = box.value.trim();
     if (!text || !this.current) return;
     try {
-      await call("POST", `/chat/rooms/${encodeURIComponent(this.current)}/messages`, { text, thread, mentions: this.mentions(text), decision });
+      if (this.room()?.encrypted) {
+        if (!this.sealer?.canSeal(this.current)) await this.syncKeys(this.current);
+        if (!this.sealer?.canSeal(this.current)) throw new Error(t(this.localize, "noRoomKey"));
+        await this.sealer.send(this.current, text, thread);
+      } else await call("POST", `/chat/rooms/${encodeURIComponent(this.current)}/messages`, { text, thread, mentions: this.mentions(text), decision });
       box.value = "";
       if (thread) await this.openThread(thread);
       else {
@@ -925,6 +982,7 @@ export class OrtusChatMain extends LitElement {
 
   private body(m: Message): TemplateResult {
     if (m.deleted) return html`<p class="gone">${t(this.localize, "deleted")}</p>`;
+    if (m.locked) return html`<p class="gone">🔒 ${t(this.localize, "cannotRead")}</p>`;
     // @Name of a mentioned person stands out.
     const names = (m.mentions ?? []).map((id) => `@${this.name(id).split(" ")[0]}`);
     const parts = names.length ? m.text.split(new RegExp(`(${names.map((n) => n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})`)) : [m.text];
@@ -954,7 +1012,7 @@ export class OrtusChatMain extends LitElement {
         : html`<div class="actions" role="toolbar" aria-label=${t(this.localize, "messageActions")}>
             ${REACTIONS.map((k) => html`<button aria-label=${t(this.localize, "reactWith", { key: k })} @click=${() => this.react(m, k)}>${k}</button>`)}
             <button @click=${() => this.openThread(m.id)}>${t(this.localize, "replyInThread")}</button>
-            ${mine ? html`<button @click=${() => this.edit(m)}>${t(this.localize, "edit")}</button><button @click=${() => this.deleteMessage(m)}>${t(this.localize, "delete")}</button>` : nothing}
+            ${mine ? html`${m.sealed ? nothing : html`<button @click=${() => this.edit(m)}>${t(this.localize, "edit")}</button>`}<button @click=${() => this.deleteMessage(m)}>${t(this.localize, "delete")}</button>` : nothing}
           </div>`}
     </article>`;
   }
@@ -1067,9 +1125,9 @@ export class OrtusChatMain extends LitElement {
                   ? html`<form class="compose" @submit=${(e: Event) => this.send(e)}>
                       <textarea rows="2" aria-label=${t(this.localize, "messageTo", { room: this.roomName(room) })} placeholder=${t(this.localize, "messageTo", { room: room.kind === "direct" ? this.roomName(room) : `# ${room.name}` })} @keydown=${this.keydown}></textarea>
                       <div class="row">
-                        <button type="button" class="icon" aria-label=${t(this.localize, "fromDrive")} @click=${this.pickFile}>
+                        ${room.encrypted ? nothing : html`<button type="button" class="icon" aria-label=${t(this.localize, "fromDrive")} @click=${this.pickFile}>
                           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M21 12.5 12.6 20.9a5.5 5.5 0 0 1-7.8-7.8l8.5-8.5a3.7 3.7 0 0 1 5.2 5.2l-8.5 8.5a1.8 1.8 0 0 1-2.6-2.6l7.8-7.8" /></svg>
-                        </button>
+                        </button>`}
                         <button class="icon send" aria-label=${t(this.localize, "send")}>→</button>
                       </div>
                       ${this.error ? html`<p class="error" role="alert">${this.error}</p>` : nothing}
@@ -1085,7 +1143,7 @@ export class OrtusChatMain extends LitElement {
             ${room?.state === "join"
               ? html`<form @submit=${(e: Event) => this.send(e, this.thread!)}>
                   <textarea class="input" rows="2" aria-label=${t(this.localize, "replyToThread")} placeholder=${t(this.localize, "replyToThread")} @keydown=${this.keydown}></textarea>
-                  <label><input type="checkbox" class="decision" /> ${t(this.localize, "recordAsDecision")}</label>
+                  ${room?.encrypted ? nothing : html`<label><input type="checkbox" class="decision" /> ${t(this.localize, "recordAsDecision")}</label>`}
                   <button class="button primary">${t(this.localize, "reply")}</button>
                 </form>`
               : nothing}

@@ -479,20 +479,22 @@ pub fn event_json(
         "at": e.origin_ts, "editedAt": e.edited_at, "deleted": e.deleted_at.is_some(),
         "decision": e.decision,
         "file": if e.deleted_at.is_some() { Json::Null } else { e.content["ortus.file"].clone() },
+        "sealed": if e.deleted_at.is_some() { Json::Null } else { e.content["ortus.sealed"].clone() },
         "replies": threads.map(|t| t.0), "lastReply": threads.map(|t| t.1),
         "reactions": reactions.iter().map(|(k, who)| json!({"key": k, "who": who})).collect::<Vec<_>>(),
     })
 }
 
 /// Chat's retention: messages past the chat period go, unless their room
-/// or their sender is on hold.
+/// or their sender is on hold. A hold does not keep an end-to-end room's
+/// messages (the organisation cannot read them).
 pub async fn purge(tx: &mut dyn AsyncTx, rules: &ortus_core::retention::Rules) -> StoreResult<u64> {
     let Some(Some(days)) = rules.days.get("chat").copied() else {
         return Ok(0);
     };
     let before = rules.now - days * 86_400_000;
     let rows = tx
-        .query("SELECT room, event_id, sender_user, origin_ts FROM chat_events WHERE origin_ts < $1 AND kind = 'm.room.message' LIMIT 5000", &[before.into()])
+        .query("SELECT e.room, e.event_id, e.sender_user, e.origin_ts, r.encrypted FROM chat_events e JOIN chat_rooms r ON r.id = e.room WHERE e.origin_ts < $1 AND e.kind = 'm.room.message' LIMIT 5000", &[before.into()])
         .await?;
     let mut n = 0;
     for r in rows {
@@ -503,7 +505,13 @@ pub async fn purge(tx: &mut dyn AsyncTx, rules: &ortus_core::retention::Rules) -
             r.int(3).unwrap_or(0),
         );
         let people: Vec<&str> = user.iter().map(String::as_str).collect();
-        if rules.may_purge("chat", at, &people, Some(&format!("chat:room:{room}"))) {
+        let sealed = r.int(4).unwrap_or(0) != 0;
+        let due = if sealed {
+            rules.may_purge("chat", at, &[], None)
+        } else {
+            rules.may_purge("chat", at, &people, Some(&format!("chat:room:{room}")))
+        };
+        if due {
             tx.execute(
                 "DELETE FROM chat_reactions WHERE event_id = $1",
                 &[id.as_str().into()],
@@ -538,7 +546,17 @@ pub async fn forget(
         .filter_map(|r| r.text(0).map(str::to_string))
         .collect();
     for room in rooms {
-        if rules.held_channels.contains(&format!("chat:room:{room}")) {
+        let sealed = tx
+            .query(
+                "SELECT encrypted FROM chat_rooms WHERE id = $1",
+                &[room.as_str().into()],
+            )
+            .await?
+            .first()
+            .and_then(|r| r.int(0))
+            .unwrap_or(0)
+            != 0;
+        if !sealed && rules.held_channels.contains(&format!("chat:room:{room}")) {
             continue;
         }
         tx.execute(

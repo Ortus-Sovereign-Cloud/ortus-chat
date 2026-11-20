@@ -24,6 +24,8 @@ const messages: Record<ChatKey, ChatMessage> = {
   unread: {"one": "{count} non lu", "many": "{count} non lus", "other": "{count} non lus"},
   members: {"one": "{count} membre", "many": "{count} membres", "other": "{count} membres"},
   endToEnd: "Chiffré de bout en bout",
+  cannotRead: "Ce message ne peut pas encore être ouvert sur cet appareil.",
+  noRoomKey: "Cet appareil n'a pas encore de clé pour ce salon : l'appareil d'un membre la donnera dès qu'il sera en ligne.",
   sharedWithPartners: "Partagé avec les partenaires",
   shareWithPartners: "Partager avec les partenaires",
   inviteButton: "Inviter",

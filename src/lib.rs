@@ -4,6 +4,7 @@
 //! to a program through [`apps`].
 
 pub mod api;
+pub mod e2e;
 pub mod federation;
 pub mod index;
 pub mod live;
@@ -29,6 +30,7 @@ static MIGRATIONS: std::sync::LazyLock<Vec<Migration>> = std::sync::LazyLock::ne
     all.extend_from_slice(policy::MIGRATIONS);
     all.extend_from_slice(live::MIGRATIONS);
     all.extend_from_slice(federation::MIGRATIONS);
+    all.extend_from_slice(e2e::MIGRATIONS);
     all
 });
 
@@ -56,6 +58,7 @@ impl App for Chat {
         let mut all = api::routes();
         all.extend(live::routes());
         all.extend(policy::routes());
+        all.extend(e2e::routes());
         all
     }
 

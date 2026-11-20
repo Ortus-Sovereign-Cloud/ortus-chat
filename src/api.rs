@@ -658,6 +658,12 @@ pub(crate) async fn send(
     thread: Option<&str>,
     mentions: &[String],
 ) -> Result<Value, ApiError> {
+    // Nothing readable goes into an end-to-end room (an app's post either).
+    if room.encrypted {
+        return Err(ApiError::bad_request(
+            "This room is end-to-end encrypted: send through its encrypted route.",
+        ));
+    }
     let text = clean(text, store::MAX_TEXT);
     if text.is_empty() {
         return Err(ApiError::bad_request("Write something."));
@@ -844,6 +850,11 @@ async fn edit(
 ) -> Result<Response, ApiError> {
     let me = signed(request, instance).await?;
     let e = own_message(instance, &me, &message_param(params)).await?;
+    if e.content.get("ortus.sealed").is_some() {
+        return Err(ApiError::bad_request(
+            "A sealed message is not edited: delete it and send it again.",
+        ));
+    }
     let input: Edit = body(request)?;
     let text = clean(&input.text, store::MAX_TEXT);
     if text.is_empty() {

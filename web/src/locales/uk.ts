@@ -24,6 +24,8 @@ const messages: Record<ChatKey, ChatMessage> = {
   unread: {"one": "{count} непрочитане", "few": "{count} непрочитані", "many": "{count} непрочитаних", "other": "{count} непрочитаного"},
   members: {"one": "{count} учасник", "few": "{count} учасники", "many": "{count} учасників", "other": "{count} учасника"},
   endToEnd: "Наскрізне шифрування",
+  cannotRead: "Це повідомлення поки що не можна відкрити на цьому пристрої.",
+  noRoomKey: "Цей пристрій ще не має ключа до цієї кімнати: його передасть пристрій іншого учасника, коли той буде онлайн.",
   sharedWithPartners: "Спільний з партнерами",
   shareWithPartners: "Поділитися з партнерами",
   inviteButton: "Запросити",
