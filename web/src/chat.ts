@@ -577,7 +577,12 @@ export class OrtusChatMain extends LitElement {
       opened = true;
     });
     this.events.addEventListener("event", (e) => void this.onEvent(JSON.parse((e as MessageEvent).data)));
-    this.events.addEventListener("room", () => void this.loadRooms());
+    this.events.addEventListener("room", (e) => {
+      const m = JSON.parse((e as MessageEvent).data) as { room: string };
+      // The open room itself may have moved on meanwhile.
+      if (m.room === this.current) void this.catchUp();
+      else void this.loadRooms();
+    });
     this.events.addEventListener("typing", (e) => {
       const m = JSON.parse((e as MessageEvent).data) as { room: string; who: string[] };
       this.typing = { ...this.typing, [m.room]: m.who };

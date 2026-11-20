@@ -87,13 +87,31 @@ fn events(request: &Request, instance: Arc<Instance>, user: String) -> Response 
             for (room, state, _) in &rooms {
                 let was = known.get(&room.id).copied();
                 if was.is_none() {
-                    known.insert(room.id.clone(), room.last_seq);
+                    // A room this stream did not know: on the first look the
+                    // screen has just read it; found later (a new room, an
+                    // invitation, or a slow loop), what happened since the
+                    // stream began is still news.
+                    let since = if first {
+                        room.last_seq
+                    } else {
+                        s.query(
+                            "SELECT CAST(COALESCE(MAX(seq), 0) AS BIGINT) FROM chat_events WHERE room = $1 AND origin_ts < $2",
+                            &[room.id.as_str().into(), started.into()],
+                        )
+                        .await
+                        .ok()
+                        .and_then(|r| r.first().and_then(|r| r.int(0)))
+                        .unwrap_or(room.last_seq)
+                    };
+                    known.insert(room.id.clone(), since);
                     if !first && sender.send_async(SseEvent::data(json!({"room": room.id, "state": state}).to_string()).event_type("room")).await.is_err() {
                         return;
                     }
-                    continue;
+                    if first || since >= room.last_seq {
+                        continue;
+                    }
                 }
-                let from = was.unwrap_or(0);
+                let from = known.get(&room.id).copied().unwrap_or(0);
                 if state == "join" && room.last_seq > from {
                     let list = match store::since(s, &user, &room.id, from).await {
                         Ok(l) => l,
