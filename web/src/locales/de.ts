@@ -26,6 +26,7 @@ const messages: Record<ChatKey, ChatMessage> = {
   endToEnd: "Ende-zu-Ende-verschlüsselt",
   cannotRead: "Diese Nachricht lässt sich auf diesem Gerät noch nicht öffnen.",
   noRoomKey: "Dieses Gerät hat noch keinen Schlüssel für diesen Raum: Das Gerät eines Mitglieds gibt ihn, sobald es online ist.",
+  notSealed: "Dieser Raum war Ende-zu-Ende-verschlüsselt, und der Server sagt jetzt, er sei es nicht. Es wurde nichts gesendet.",
   sharedWithPartners: "Mit Partnern geteilt",
   shareWithPartners: "Mit Partnern teilen",
   inviteButton: "Einladen",

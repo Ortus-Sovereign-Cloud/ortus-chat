@@ -26,6 +26,7 @@ const messages: Record<ChatKey, ChatMessage> = {
   endToEnd: "مشفّر من طرف إلى طرف",
   cannotRead: "لا يمكن فتح هذه الرسالة على هذا الجهاز بعد.",
   noRoomKey: "لا يملك هذا الجهاز مفتاحًا لهذه الغرفة بعد: سيمنحه جهاز أحد الأعضاء عندما يكون متصلًا.",
+  notSealed: "كانت هذه الغرفة مشفرة من طرف إلى طرف، والخادم يقول الآن إنها ليست كذلك. لم يُرسل شيء.",
   sharedWithPartners: "مشتركة مع الشركاء",
   shareWithPartners: "مشاركة مع الشركاء",
   inviteButton: "دعوة",

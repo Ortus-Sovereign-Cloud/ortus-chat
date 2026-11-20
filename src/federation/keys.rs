@@ -75,6 +75,34 @@ pub async fn remote(instance: &Instance, server: &str, key_id: &str) -> Result<S
     if !super::partner(instance, server).await {
         return Err(format!("{server} is not a partner allowed chat"));
     }
+    // A key that could not be had is not asked for again for a minute
+    // (anyone can name a key id in a request).
+    static MISSES: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    > = std::sync::OnceLock::new();
+    let misses = MISSES.get_or_init(Default::default);
+    let miss_key = format!("{server} {key_id}");
+    if misses
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&miss_key)
+        .is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(60))
+    {
+        return Err(format!("{server} has no key {key_id}"));
+    }
+    let found = fetch(instance, server, key_id).await;
+    if found.is_err() {
+        let mut m = misses.lock().unwrap_or_else(|e| e.into_inner());
+        if m.len() > 10_000 {
+            m.clear();
+        }
+        m.insert(miss_key, std::time::Instant::now());
+    }
+    found
+}
+
+async fn fetch(instance: &Instance, server: &str, key_id: &str) -> Result<String, String> {
+    let s = instance.store.as_ref();
     let doc = super::client::get_json(instance, server, "/_matrix/key/v2/server", false).await?;
     if doc["server_name"].as_str() != Some(server) {
         return Err("the key list names another server".into());
@@ -83,6 +111,9 @@ pub async fn remote(instance: &Instance, server: &str, key_id: &str) -> Result<S
         .as_i64()
         .unwrap_or(0)
         .min(now() + VALID_FOR);
+    if valid_until <= now() {
+        return Err("the key list has expired".into());
+    }
     let keys = doc["verify_keys"].as_object().cloned().unwrap_or_default();
     let mut found = None;
     for (id, v) in &keys {

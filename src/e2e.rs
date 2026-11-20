@@ -1,52 +1,62 @@
-//! End-to-end rooms (when an administrator allows them): the server keeps
-//! only what it cannot read. Each device of a person has an ECDH P-256 key
-//! made on the device (its private half never leaves it); a room key
-//! (AES-256-GCM) is made by a member's device and wrapped for each
-//! member's device; messages are sealed with it on the device. The server
-//! stores devices' public keys, wrapped room keys and sealed messages; it
-//! indexes nothing of these rooms, records no decisions in them, lets no
-//! app post into them, does not federate them, and its legal hold does not
-//! keep their messages. The wire format is in docs/end-to-end.md.
+//! End-to-end rooms (when an administrator allows them), in Matrix's own
+//! shapes, so browsers (web/src/olm.ts) and the phones (vodozemac) read
+//! each other: each device has Curve25519 and Ed25519 identity keys
+//! (signed device keys) and publishes signed one-time keys; a sender's
+//! device shares its Megolm room session with each member's device over
+//! Olm (to-device messages); messages are Megolm-sealed. The server keeps
+//! only public keys, one-time keys until claimed, to-device messages until
+//! read, and sealed messages. It indexes nothing of these rooms, records no
+//! decisions in them, lets no app post into them, does not federate them,
+//! and its legal hold does not keep their messages. docs/end-to-end.md has
+//! the wire format.
 
 use std::sync::Arc;
 
 use ortus_core::api::{answer, body, ok, ApiError, Method, Route};
 use ortus_core::auth::Access;
 use ortus_core::instance::Instance;
-use ortus_core::storage::{BoxFuture, Migration};
+use ortus_core::storage::{AsyncStore, BoxFuture, Migration};
 use rust_web_server::prelude::*;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::api::{joined, signed};
+use crate::matrix;
 use crate::store::{self, now, NewEvent};
 
 pub const MIGRATIONS: &[Migration] = &[Migration {
     version: 5,
-    name: "end-to-end rooms: devices and wrapped room keys",
+    name: "end-to-end rooms: device keys, one-time keys, to-device messages",
     sql: "CREATE TABLE chat_devices (
         user_id TEXT NOT NULL,
         device TEXT NOT NULL,
-        public_key TEXT NOT NULL,
+        keys TEXT NOT NULL,
         created_at BIGINT NOT NULL,
         PRIMARY KEY (user_id, device)
     );
-    CREATE TABLE chat_room_keys (
-        room TEXT NOT NULL,
+    CREATE TABLE chat_one_time_keys (
         user_id TEXT NOT NULL,
         device TEXT NOT NULL,
-        version BIGINT NOT NULL,
-        wrapped TEXT NOT NULL,
-        from_user TEXT NOT NULL,
-        from_device TEXT NOT NULL,
-        created_at BIGINT NOT NULL,
-        PRIMARY KEY (room, user_id, device, version)
-    )",
+        key_id TEXT NOT NULL,
+        key TEXT NOT NULL,
+        PRIMARY KEY (user_id, device, key_id)
+    );
+    CREATE TABLE chat_to_device (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        device TEXT NOT NULL,
+        sender TEXT NOT NULL,
+        sender_device TEXT NOT NULL,
+        content TEXT NOT NULL,
+        at BIGINT NOT NULL
+    );
+    CREATE INDEX chat_to_device_for ON chat_to_device (user_id, device, at)",
 }];
 
-/// The algorithm messages and wrapped keys name.
-pub const ALGORITHM: &str = "ortus.p256-aes-gcm.v1";
+pub const OLM: &str = "m.olm.v1.curve25519-aes-sha2";
+pub const MEGOLM: &str = "m.megolm.v1.aes-sha2";
 const MAX_DEVICES: usize = 10;
+const MAX_ONE_TIME_KEYS: i64 = 100;
 const MAX_SEALED: usize = 64 * 1024;
 
 fn valid_id(s: &str) -> bool {
@@ -56,22 +66,16 @@ fn valid_id(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
+fn key32(v: &Value) -> Option<&str> {
+    v.as_str()
+        .filter(|k| matrix::unb64(k).is_some_and(|b| b.len() == 32))
+}
+
 fn b64ish(s: &str, max: usize) -> bool {
     !s.is_empty()
         && s.len() <= max
         && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'-' | b'_'))
-}
-
-/// A public key as a JWK: P-256, x and y only (never a private part).
-fn public_jwk(v: &Value) -> Option<Value> {
-    let (x, y) = (v["x"].as_str()?, v["y"].as_str()?);
-    (v["kty"] == "EC"
-        && v["crv"] == "P-256"
-        && v.get("d").is_none()
-        && b64ish(x, 64)
-        && b64ish(y, 64))
-    .then(|| json!({"kty": "EC", "crv": "P-256", "x": x, "y": y}))
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
 }
 
 async fn encrypted_room(
@@ -88,13 +92,31 @@ async fn encrypted_room(
     Ok(room)
 }
 
-#[derive(Deserialize)]
-struct Device {
-    #[serde(rename = "publicKey")]
-    public_key: Value,
+fn me_mx(instance: &Instance, user: &str) -> String {
+    store::mxid(user, &store::server_name(instance))
 }
 
-/// A device of mine says its public key (once; a device keeps its key).
+async fn one_time_count(s: &dyn AsyncStore, user: &str, device: &str) -> i64 {
+    s.query(
+        "SELECT COUNT(*) FROM chat_one_time_keys WHERE user_id = $1 AND device = $2",
+        &[user.into(), device.into()],
+    )
+    .await
+    .ok()
+    .and_then(|r| r.first().and_then(|r| r.int(0)))
+    .unwrap_or(0)
+}
+
+#[derive(Deserialize)]
+struct Upload {
+    #[serde(rename = "deviceKeys")]
+    device_keys: Value,
+    #[serde(rename = "oneTimeKeys", default)]
+    one_time_keys: serde_json::Map<String, Value>,
+}
+
+/// A device of mine publishes its signed device keys (once; a device
+/// keeps its keys) and signed one-time keys.
 async fn put_device(
     request: &Request,
     params: &PathParams,
@@ -107,44 +129,115 @@ async fn put_device(
             "A device id is letters, digits, - and _.",
         ));
     }
-    let input: Device = body(request)?;
-    let key = public_jwk(&input.public_key)
-        .ok_or_else(|| ApiError::bad_request("A device key is a P-256 public key (JWK)."))?;
+    let input: Upload = body(request)?;
+    let mx = me_mx(instance, &me.id);
+    let k = &input.device_keys;
+    let curve = key32(&k["keys"][format!("curve25519:{device}")]);
+    let ed = key32(&k["keys"][format!("ed25519:{device}")]).map(str::to_string);
+    let algorithms = k["algorithms"].as_array().cloned().unwrap_or_default();
+    let shaped = k["user_id"] == mx.as_str()
+        && k["device_id"] == device
+        && k["keys"].as_object().is_some_and(|o| o.len() == 2)
+        && algorithms.iter().any(|a| a == OLM)
+        && algorithms.iter().any(|a| a == MEGOLM)
+        && curve.is_some()
+        && ed
+            .as_deref()
+            .is_some_and(|ed| matrix::verify_json(k, &mx, &format!("ed25519:{device}"), ed));
+    let Some(ed) = ed.filter(|_| shaped) else {
+        return Err(ApiError::bad_request("Device keys are this person's and this device's, with Curve25519 and Ed25519 keys, signed by the device."));
+    };
+    // The signed fields as they were signed, nothing more.
+    let kept = json!({"user_id": mx, "device_id": device, "algorithms": k["algorithms"], "keys": k["keys"], "signatures": {mx.clone(): {format!("ed25519:{device}"): k["signatures"][&mx][format!("ed25519:{device}")]}}});
     let s = instance.store.as_ref();
     let mine = s
         .query(
-            "SELECT device, public_key FROM chat_devices WHERE user_id = $1",
+            "SELECT device, keys FROM chat_devices WHERE user_id = $1 ORDER BY created_at",
             &[me.id.as_str().into()],
         )
         .await?;
-    if let Some(r) = mine.iter().find(|r| r.text(0) == Some(device)) {
-        if r.text(1) != Some(key.to_string().as_str()) {
-            return Err(ApiError {
-                status: 409,
-                code: "device_key",
-                message: "This device already has another key.".into(),
-            });
+    match mine.iter().find(|r| r.text(0) == Some(device)) {
+        Some(r) => {
+            let had: Value =
+                serde_json::from_str(r.text(1).unwrap_or("null")).unwrap_or(Value::Null);
+            if had["keys"] != k["keys"] {
+                return Err(ApiError {
+                    status: 409,
+                    code: "device_keys",
+                    message: "This device already has other keys.".into(),
+                });
+            }
         }
-        return Ok(ok(&json!({"device": device})));
+        None => {
+            if mine.len() >= MAX_DEVICES {
+                // The oldest device makes way (a person's browsers come and go).
+                let oldest = mine[0].text(0).unwrap_or_default().to_string();
+                forget_device(s, &me.id, &oldest).await?;
+            }
+            s.execute(
+                "INSERT INTO chat_devices (user_id, device, keys, created_at) VALUES ($1, $2, $3, $4)",
+                &[me.id.as_str().into(), device.into(), kept.to_string().into(), now().into()],
+            )
+            .await?;
+        }
     }
-    if mine.len() >= MAX_DEVICES {
-        // The oldest device makes way (a person's browsers come and go).
+    let mut have = one_time_count(s, &me.id, device).await;
+    for (id, key) in &input.one_time_keys {
+        let Some(key_id) = id
+            .strip_prefix("signed_curve25519:")
+            .filter(|k| valid_id(k))
+        else {
+            return Err(ApiError::bad_request(
+                "One-time keys are signed_curve25519.",
+            ));
+        };
+        if key32(&key["key"]).is_none()
+            || !matrix::verify_json(key, &mx, &format!("ed25519:{device}"), &ed)
+        {
+            return Err(ApiError::bad_request(
+                "A one-time key is signed by its device.",
+            ));
+        }
+        if have >= MAX_ONE_TIME_KEYS {
+            break;
+        }
+        let one = json!({"key": key["key"], "signatures": key["signatures"]});
+        let exists = !s
+            .query("SELECT 1 FROM chat_one_time_keys WHERE user_id = $1 AND device = $2 AND key_id = $3", &[me.id.as_str().into(), device.into(), key_id.into()])
+            .await?
+            .is_empty();
+        if exists {
+            continue;
+        }
         s.execute(
-            "DELETE FROM chat_devices WHERE user_id = $1 AND device = (SELECT device FROM chat_devices WHERE user_id = $1 ORDER BY created_at LIMIT 1)",
-            &[me.id.as_str().into()],
+            "INSERT INTO chat_one_time_keys (user_id, device, key_id, key) VALUES ($1, $2, $3, $4)",
+            &[
+                me.id.as_str().into(),
+                device.into(),
+                key_id.into(),
+                one.to_string().into(),
+            ],
         )
         .await?;
+        have += 1;
     }
-    s.execute(
-        "INSERT INTO chat_devices (user_id, device, public_key, created_at) VALUES ($1, $2, $3, $4)",
-        &[me.id.as_str().into(), device.into(), key.to_string().into(), now().into()],
-    )
-    .await?;
-    Ok(ok(&json!({"device": device})))
+    Ok(ok(
+        &json!({"device": device, "oneTimeKeyCount": one_time_count(s, &me.id, device).await}),
+    ))
 }
 
-/// The devices of a room's members (joined or invited), each with the
-/// room key versions it already has.
+async fn forget_device(s: &dyn AsyncStore, user: &str, device: &str) -> Result<(), ApiError> {
+    for sql in [
+        "DELETE FROM chat_devices WHERE user_id = $1 AND device = $2",
+        "DELETE FROM chat_one_time_keys WHERE user_id = $1 AND device = $2",
+        "DELETE FROM chat_to_device WHERE user_id = $1 AND device = $2",
+    ] {
+        s.execute(sql, &[user.into(), device.into()]).await?;
+    }
+    Ok(())
+}
+
+/// The members' (joined or invited) devices, with their signed keys.
 async fn devices(
     request: &Request,
     params: &PathParams,
@@ -152,167 +245,238 @@ async fn devices(
 ) -> Result<Response, ApiError> {
     let me = signed(request, instance).await?;
     let room = encrypted_room(instance, &me.id, params.get("room").unwrap_or_default()).await?;
-    let s = instance.store.as_ref();
-    let rows = s
-        .query(
-            "SELECT d.user_id, d.device, d.public_key, m.member FROM chat_devices d JOIN chat_members m ON m.user_id = d.user_id AND m.room = $1 AND m.state IN ('join', 'invite') ORDER BY d.user_id, d.created_at",
-            &[room.id.as_str().into()],
-        )
-        .await?;
-    let have = s
-        .query(
-            "SELECT user_id, device, version FROM chat_room_keys WHERE room = $1",
-            &[room.id.as_str().into()],
-        )
-        .await?;
-    let latest = have.iter().filter_map(|r| r.int(2)).max().unwrap_or(0);
-    let list: Vec<Value> = rows
-        .iter()
-        .map(|r| {
-            let (user, device) = (r.text(0).unwrap_or_default(), r.text(1).unwrap_or_default());
-            let versions: Vec<i64> = have.iter().filter(|h| h.text(0) == Some(user) && h.text(1) == Some(device)).filter_map(|h| h.int(2)).collect();
-            json!({"user": r.text(3), "device": device, "publicKey": serde_json::from_str::<Value>(r.text(2).unwrap_or("null")).unwrap_or(Value::Null), "versions": versions})
-        })
-        .collect();
-    Ok(ok(
-        &json!({"devices": list, "latest": latest, "algorithm": ALGORITHM}),
-    ))
-}
-
-#[derive(Deserialize)]
-struct Keys {
-    #[serde(rename = "fromDevice")]
-    from_device: String,
-    keys: Vec<WrappedKey>,
-}
-
-#[derive(Deserialize)]
-struct WrappedKey {
-    /// The member's Matrix id.
-    user: String,
-    device: String,
-    version: i64,
-    wrapped: Value,
-}
-
-/// A member's device gives the room key to members' devices (wrapped for
-/// each); a key already given stays as it is.
-async fn give_keys(
-    request: &Request,
-    params: &PathParams,
-    instance: &Arc<Instance>,
-) -> Result<Response, ApiError> {
-    let me = signed(request, instance).await?;
-    let room = encrypted_room(instance, &me.id, params.get("room").unwrap_or_default()).await?;
-    let input: Keys = body(request)?;
-    if input.keys.len() > 500 {
-        return Err(ApiError::bad_request("Too many keys at once."));
-    }
-    let s = instance.store.as_ref();
-    let mine = !s
-        .query(
-            "SELECT 1 FROM chat_devices WHERE user_id = $1 AND device = $2",
-            &[me.id.as_str().into(), input.from_device.as_str().into()],
-        )
-        .await?
-        .is_empty();
-    if !mine {
-        return Err(ApiError::bad_request("Say this device's key first."));
-    }
-    let members = store::members(s, &room.id).await?;
-    let latest = s
-        .query(
-            "SELECT MAX(version) FROM chat_room_keys WHERE room = $1",
-            &[room.id.as_str().into()],
-        )
-        .await?
-        .first()
-        .and_then(|r| r.int(0))
-        .unwrap_or(0);
-    let mut given = 0;
-    let mut tx = s.begin().await?;
-    for k in &input.keys {
-        let w = &k.wrapped;
-        let shaped = w["algorithm"] == ALGORITHM
-            && public_jwk(&w["epk"]).is_some()
-            && w["iv"].as_str().is_some_and(|v| b64ish(v, 32))
-            && w["ciphertext"].as_str().is_some_and(|v| b64ish(v, 128));
-        // A new version is at most one past the newest (a new key after a
-        // member leaves); a member and a device of theirs.
-        let Some(user) = members
-            .iter()
-            .find(|(m, _, st, _)| *m == k.user && (st == "join" || st == "invite"))
-            .and_then(|(_, u, _, _)| u.clone())
-        else {
-            continue;
-        };
-        if !shaped || k.version < 1 || k.version > latest + 1 || !valid_id(&k.device) {
-            return Err(ApiError::bad_request(
-                "A wrapped key is not in the expected form.",
-            ));
-        }
-        let exists = !tx
-            .query(
-                "SELECT 1 FROM chat_room_keys WHERE room = $1 AND user_id = $2 AND device = $3 AND version = $4",
-                &[room.id.as_str().into(), user.as_str().into(), k.device.as_str().into(), k.version.into()],
-            )
-            .await?
-            .is_empty();
-        let device_known = !tx
-            .query(
-                "SELECT 1 FROM chat_devices WHERE user_id = $1 AND device = $2",
-                &[user.as_str().into(), k.device.as_str().into()],
-            )
-            .await?
-            .is_empty();
-        if exists || !device_known {
-            continue;
-        }
-        tx.execute(
-            "INSERT INTO chat_room_keys (room, user_id, device, version, wrapped, from_user, from_device, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-            &[room.id.as_str().into(), user.as_str().into(), k.device.as_str().into(), k.version.into(), w.to_string().into(), me.id.as_str().into(), input.from_device.as_str().into(), now().into()],
-        )
-        .await?;
-        given += 1;
-    }
-    tx.commit().await?;
-    Ok(ok(&json!({"given": given})))
-}
-
-/// The room keys given to one of my devices, with who gave them (their
-/// device's public key, so the device can tell a key from a member).
-async fn my_keys(
-    request: &Request,
-    params: &PathParams,
-    instance: &Arc<Instance>,
-) -> Result<Response, ApiError> {
-    let me = signed(request, instance).await?;
-    let room = encrypted_room(instance, &me.id, params.get("room").unwrap_or_default()).await?;
-    let device = params.get("device").unwrap_or_default();
     let rows = instance
         .store
         .query(
-            "SELECT version, wrapped, from_user, from_device FROM chat_room_keys WHERE room = $1 AND user_id = $2 AND device = $3 ORDER BY version",
-            &[room.id.as_str().into(), me.id.as_str().into(), device.into()],
+            "SELECT m.member, d.device, d.keys FROM chat_devices d JOIN chat_members m ON m.user_id = d.user_id AND m.room = $1 AND m.state IN ('join', 'invite') ORDER BY m.member, d.created_at",
+            &[room.id.as_str().into()],
         )
         .await?;
-    let keys: Vec<Value> = rows
+    let list: Vec<Value> = rows
         .iter()
-        .map(|r| json!({"version": r.int(0), "wrapped": serde_json::from_str::<Value>(r.text(1).unwrap_or("null")).unwrap_or(Value::Null), "fromUser": r.text(2), "fromDevice": r.text(3)}))
+        .map(|r| json!({"user": r.text(0), "device": r.text(1), "deviceKeys": serde_json::from_str::<Value>(r.text(2).unwrap_or("null")).unwrap_or(Value::Null)}))
         .collect();
-    Ok(ok(&json!({"keys": keys})))
+    Ok(ok(&json!({"devices": list})))
+}
+
+/// The member (joined or invited) behind a Matrix id, with their user id.
+async fn member_user(
+    instance: &Instance,
+    room: &str,
+    mx: &str,
+) -> Result<Option<String>, ApiError> {
+    Ok(store::members(instance.store.as_ref(), room)
+        .await?
+        .into_iter()
+        .find(|(m, _, st, _)| m == mx && (st == "join" || st == "invite"))
+        .and_then(|(_, u, _, _)| u))
+}
+
+#[derive(Deserialize)]
+struct Claim {
+    devices: Vec<Target>,
+}
+
+#[derive(Deserialize)]
+struct Target {
+    user: String,
+    device: String,
+}
+
+/// Takes one one-time key of each named member device (each key is given
+/// out once).
+async fn claim(
+    request: &Request,
+    params: &PathParams,
+    instance: &Arc<Instance>,
+) -> Result<Response, ApiError> {
+    let me = signed(request, instance).await?;
+    let room = encrypted_room(instance, &me.id, params.get("room").unwrap_or_default()).await?;
+    let input: Claim = body(request)?;
+    if input.devices.len() > 200 {
+        return Err(ApiError::bad_request("Too many devices at once."));
+    }
+    let s = instance.store.as_ref();
+    let mut out = serde_json::Map::new();
+    for t in &input.devices {
+        let Some(user) = member_user(instance, &room.id, &t.user).await? else {
+            continue;
+        };
+        // Two claims at once: the delete decides who has the key.
+        for _ in 0..5 {
+            let row = s
+                .query("SELECT key_id, key FROM chat_one_time_keys WHERE user_id = $1 AND device = $2 ORDER BY key_id LIMIT 1", &[user.as_str().into(), t.device.as_str().into()])
+                .await?;
+            let Some(r) = row.first() else { break };
+            let key_id = r.text(0).unwrap_or_default().to_string();
+            let gone = s
+                .execute("DELETE FROM chat_one_time_keys WHERE user_id = $1 AND device = $2 AND key_id = $3", &[user.as_str().into(), t.device.as_str().into(), key_id.as_str().into()])
+                .await?;
+            if gone == 1 {
+                let key: Value =
+                    serde_json::from_str(r.text(1).unwrap_or("null")).unwrap_or(Value::Null);
+                let entry = out.entry(t.user.clone()).or_insert_with(|| json!({}));
+                entry[&t.device] = json!({ format!("signed_curve25519:{key_id}"): key });
+                break;
+            }
+        }
+    }
+    Ok(ok(&json!({"oneTimeKeys": out})))
+}
+
+#[derive(Deserialize)]
+struct ToDevice {
+    #[serde(rename = "fromDevice")]
+    from_device: String,
+    messages: Vec<Message>,
+}
+
+#[derive(Deserialize)]
+struct Message {
+    user: String,
+    device: String,
+    content: Value,
+}
+
+async fn my_device(instance: &Instance, user: &str, device: &str) -> Result<(), ApiError> {
+    let found = !instance
+        .store
+        .query(
+            "SELECT 1 FROM chat_devices WHERE user_id = $1 AND device = $2",
+            &[user.into(), device.into()],
+        )
+        .await?
+        .is_empty();
+    if found {
+        Ok(())
+    } else {
+        Err(ApiError::bad_request("Publish this device's keys first."))
+    }
+}
+
+/// Olm messages from one of my devices to members' devices (a room key).
+async fn send_to_device(
+    request: &Request,
+    params: &PathParams,
+    instance: &Arc<Instance>,
+) -> Result<Response, ApiError> {
+    let me = signed(request, instance).await?;
+    let room = encrypted_room(instance, &me.id, params.get("room").unwrap_or_default()).await?;
+    let input: ToDevice = body(request)?;
+    my_device(instance, &me.id, &input.from_device).await?;
+    if input.messages.len() > 500 {
+        return Err(ApiError::bad_request("Too many messages at once."));
+    }
+    let s = instance.store.as_ref();
+    let sender = me_mx(instance, &me.id);
+    let mut sent = 0;
+    for m in &input.messages {
+        let c = &m.content;
+        let shaped = c["algorithm"] == OLM
+            && key32(&c["sender_key"]).is_some()
+            && c["ciphertext"].as_object().is_some_and(|o| {
+                o.len() == 1
+                    && o.values().all(|v| {
+                        matches!(v["type"].as_u64(), Some(0 | 1))
+                            && v["body"].as_str().is_some_and(|b| b64ish(b, MAX_SEALED))
+                    })
+            });
+        if !shaped {
+            return Err(ApiError::bad_request(
+                "A to-device message is one Olm message.",
+            ));
+        }
+        let Some(user) = member_user(instance, &room.id, &m.user).await? else {
+            continue;
+        };
+        let known = !s
+            .query(
+                "SELECT 1 FROM chat_devices WHERE user_id = $1 AND device = $2",
+                &[user.as_str().into(), m.device.as_str().into()],
+            )
+            .await?
+            .is_empty();
+        if !known {
+            continue;
+        }
+        let pending = s
+            .query(
+                "SELECT COUNT(*) FROM chat_to_device WHERE user_id = $1 AND device = $2",
+                &[user.as_str().into(), m.device.as_str().into()],
+            )
+            .await?
+            .first()
+            .and_then(|r| r.int(0))
+            .unwrap_or(0);
+        if pending >= 1000 {
+            continue;
+        }
+        s.execute(
+            "INSERT INTO chat_to_device (id, user_id, device, sender, sender_device, content, at) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            &[format!("td{}", ortus_core::auth::random_hex(12)).into(), user.as_str().into(), m.device.as_str().into(), sender.as_str().into(), input.from_device.as_str().into(), c.to_string().into(), now().into()],
+        )
+        .await?;
+        sent += 1;
+    }
+    Ok(ok(&json!({"sent": sent})))
+}
+
+/// What waits for one of my devices, oldest first.
+async fn inbox(
+    request: &Request,
+    params: &PathParams,
+    instance: &Arc<Instance>,
+) -> Result<Response, ApiError> {
+    let me = signed(request, instance).await?;
+    let device = params.get("device").unwrap_or_default();
+    let rows = instance
+        .store
+        .query("SELECT id, sender, sender_device, content FROM chat_to_device WHERE user_id = $1 AND device = $2 ORDER BY at, id LIMIT 100", &[me.id.as_str().into(), device.into()])
+        .await?;
+    let list: Vec<Value> = rows
+        .iter()
+        .map(|r| json!({"id": r.text(0), "sender": r.text(1), "senderDevice": r.text(2), "content": serde_json::from_str::<Value>(r.text(3).unwrap_or("null")).unwrap_or(Value::Null)}))
+        .collect();
+    Ok(ok(&json!({"messages": list})))
+}
+
+#[derive(Deserialize)]
+struct Done {
+    ids: Vec<String>,
+}
+
+/// Messages a device has taken in go.
+async fn inbox_done(
+    request: &Request,
+    params: &PathParams,
+    instance: &Arc<Instance>,
+) -> Result<Response, ApiError> {
+    let me = signed(request, instance).await?;
+    let device = params.get("device").unwrap_or_default();
+    let input: Done = body(request)?;
+    for id in input.ids.iter().take(500) {
+        instance
+            .store
+            .execute(
+                "DELETE FROM chat_to_device WHERE id = $1 AND user_id = $2 AND device = $3",
+                &[id.as_str().into(), me.id.as_str().into(), device.into()],
+            )
+            .await?;
+    }
+    Ok(ok(&json!({"done": input.ids.len().min(500)})))
 }
 
 #[derive(Deserialize)]
 struct Sealed {
-    version: i64,
-    device: String,
-    iv: String,
+    algorithm: String,
+    sender_key: String,
     ciphertext: String,
+    session_id: String,
+    device_id: String,
     thread: Option<String>,
 }
 
-/// A sealed message: the server keeps it as it is, with no text.
+/// A Megolm-sealed message: the server keeps it as it is, with no text.
 async fn say_sealed(
     request: &Request,
     params: &PathParams,
@@ -321,15 +485,16 @@ async fn say_sealed(
     let me = signed(request, instance).await?;
     let room = encrypted_room(instance, &me.id, params.get("room").unwrap_or_default()).await?;
     let input: Sealed = body(request)?;
-    if input.version < 1
-        || !valid_id(&input.device)
-        || !b64ish(&input.iv, 32)
+    if input.algorithm != MEGOLM
+        || key32(&json!(input.sender_key)).is_none()
+        || key32(&json!(input.session_id)).is_none()
         || !b64ish(&input.ciphertext, MAX_SEALED)
     {
         return Err(ApiError::bad_request(
-            "A sealed message is not in the expected form.",
+            "A sealed message is one Megolm message.",
         ));
     }
+    my_device(instance, &me.id, &input.device_id).await?;
     let s = instance.store.as_ref();
     let thread = match input.thread.as_deref() {
         Some(t) => {
@@ -345,10 +510,10 @@ async fn say_sealed(
         }
         None => None,
     };
-    let sender = store::mxid(&me.id, &store::server_name(instance));
+    let sender = me_mx(instance, &me.id);
     let content = json!({
         "msgtype": "m.text", "body": "",
-        "ortus.sealed": {"algorithm": ALGORITHM, "version": input.version, "device": input.device, "iv": input.iv, "ciphertext": input.ciphertext},
+        "ortus.sealed": {"algorithm": MEGOLM, "sender_key": input.sender_key, "ciphertext": input.ciphertext, "session_id": input.session_id, "device_id": input.device_id},
     });
     let mut tx = s.begin().await?;
     let (_, event_id) = store::add_event(
@@ -375,8 +540,10 @@ async fn say_sealed(
 
 crate::api::with_params!(h_put_device, put_device);
 crate::api::with_params!(h_devices, devices);
-crate::api::with_params!(h_give_keys, give_keys);
-crate::api::with_params!(h_my_keys, my_keys);
+crate::api::with_params!(h_claim, claim);
+crate::api::with_params!(h_send_to_device, send_to_device);
+crate::api::with_params!(h_inbox, inbox);
+crate::api::with_params!(h_inbox_done, inbox_done);
 crate::api::with_params!(h_say_sealed, say_sealed);
 
 pub fn routes() -> Vec<Route> {
@@ -391,10 +558,27 @@ pub fn routes() -> Vec<Route> {
         handler,
     };
     vec![
-        route(Method::Put, "/chat/devices/:device", "chatDevice", "A device of mine says its end-to-end public key: {publicKey: P-256 JWK}.", h_put_device),
-        route(Method::Get, "/chat/rooms/:room/devices", "chatRoomDevices", "An end-to-end room's members' devices and the room key versions each has.", h_devices),
-        route(Method::Post, "/chat/rooms/:room/keys", "chatGiveKeys", "Gives the room key, wrapped for each device: {fromDevice, keys: [{user, device, version, wrapped}]}.", h_give_keys),
-        route(Method::Get, "/chat/rooms/:room/keys/:device", "chatMyKeys", "The room keys given to one of my devices.", h_my_keys),
-        route(Method::Post, "/chat/rooms/:room/sealed", "chatSaySealed", "A sealed message in an end-to-end room: {version, device, iv, ciphertext, thread}.", h_say_sealed),
+        route(Method::Put, "/chat/devices/:device", "chatDevice", "A device of mine publishes its signed device keys and one-time keys: {deviceKeys, oneTimeKeys}.", h_put_device),
+        route(Method::Get, "/chat/devices/:device/inbox", "chatInbox", "Olm messages waiting for one of my devices.", h_inbox),
+        route(Method::Post, "/chat/devices/:device/inbox/done", "chatInboxDone", "Messages a device has taken in: {ids}.", h_inbox_done),
+        route(Method::Get, "/chat/rooms/:room/devices", "chatRoomDevices", "An end-to-end room's members' devices with their signed keys.", h_devices),
+        route(Method::Post, "/chat/rooms/:room/claim", "chatClaimKeys", "Takes one one-time key of each member device: {devices: [{user, device}]}.", h_claim),
+        route(Method::Post, "/chat/rooms/:room/to-device", "chatToDevice", "Olm messages to members' devices: {fromDevice, messages: [{user, device, content}]}.", h_send_to_device),
+        route(Method::Post, "/chat/rooms/:room/sealed", "chatSaySealed", "A Megolm-sealed message: {algorithm, sender_key, ciphertext, session_id, device_id, thread}.", h_say_sealed),
     ]
+}
+
+/// A forgotten person's devices, keys and waiting messages go.
+pub async fn forget(
+    tx: &mut dyn ortus_core::storage::AsyncTx,
+    user: &str,
+) -> ortus_core::storage::StoreResult<()> {
+    for sql in [
+        "DELETE FROM chat_devices WHERE user_id = $1",
+        "DELETE FROM chat_one_time_keys WHERE user_id = $1",
+        "DELETE FROM chat_to_device WHERE user_id = $1",
+    ] {
+        tx.execute(sql, &[user.into()]).await?;
+    }
+    Ok(())
 }

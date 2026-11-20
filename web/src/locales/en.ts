@@ -27,6 +27,7 @@ const en = {
   endToEnd: "End-to-end encrypted",
   cannotRead: "This message can't be opened on this device yet.",
   noRoomKey: "This device has no key for this room yet: a member's device gives it when they are online.",
+  notSealed: "This room was end-to-end encrypted, and the server now says it is not. Nothing was sent.",
   sharedWithPartners: "Shared with partners",
   shareWithPartners: "Share with partners",
   inviteButton: "Invite",

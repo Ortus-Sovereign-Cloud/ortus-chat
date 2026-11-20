@@ -31,6 +31,7 @@ static MIGRATIONS: std::sync::LazyLock<Vec<Migration>> = std::sync::LazyLock::ne
     all.extend_from_slice(live::MIGRATIONS);
     all.extend_from_slice(federation::MIGRATIONS);
     all.extend_from_slice(e2e::MIGRATIONS);
+    all.extend_from_slice(index::MIGRATIONS);
     all
 });
 

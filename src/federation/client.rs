@@ -43,6 +43,38 @@ fn http() -> Result<reqwest::Client, String> {
         .clone()
 }
 
+fn has_port(server: &str) -> bool {
+    match server.strip_prefix('[') {
+        Some(rest) => rest
+            .split_once(']')
+            .is_some_and(|(_, after)| after.starts_with(':')),
+        None => server.contains(':'),
+    }
+}
+
+/// Whether a server name is a loopback, private or link-local address.
+fn private_address(server: &str) -> bool {
+    let host = match server.strip_prefix('[') {
+        Some(rest) => rest.split_once(']').map_or(rest, |(h, _)| h),
+        None => server.split_once(':').map_or(server, |(h, _)| h),
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(a)) => {
+            a.is_private() || a.is_loopback() || a.is_link_local() || a.is_unspecified()
+        }
+        Ok(std::net::IpAddr::V6(a)) => {
+            a.is_loopback()
+                || a.is_unspecified()
+                || (a.segments()[0] & 0xfe00) == 0xfc00
+                || (a.segments()[0] & 0xffc0) == 0xfe80
+        }
+        Err(_) => false,
+    }
+}
+
 /// Where a server's federation API answers: "https://host:port".
 pub async fn base(server: &str) -> Result<String, String> {
     static CACHE: OnceLock<
@@ -54,10 +86,10 @@ pub async fn base(server: &str) -> Result<String, String> {
             return Ok(b.clone());
         }
     }
-    let found = if server
-        .rsplit_once(':')
-        .is_some_and(|(_, p)| p.chars().all(|c| c.is_ascii_digit()))
-    {
+    if !super::valid_server_name(server) {
+        return Err("not a server name".into());
+    }
+    let found = if has_port(server) {
         format!("https://{server}")
     } else {
         // Delegation, then the default port.
@@ -72,14 +104,22 @@ pub async fn base(server: &str) -> Result<String, String> {
                 .await
                 .ok()
                 .and_then(|v| v["m.server"].as_str().map(str::to_string))
+                // A delegation names a public server, never a private address.
+                .filter(|to| super::valid_server_name(to) && !private_address(to))
             {
-                Some(to) if to.contains(':') => format!("https://{to}"),
+                Some(to) if has_port(&to) => format!("https://{to}"),
                 Some(to) => format!("https://{to}:8448"),
                 None => format!("https://{server}:8448"),
             },
             _ => format!("https://{server}:8448"),
         }
     };
+    {
+        let mut c = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if c.len() > 1000 {
+            c.clear();
+        }
+    }
     cache.lock().unwrap_or_else(|e| e.into_inner()).insert(
         server.to_string(),
         (found.clone(), std::time::Instant::now()),

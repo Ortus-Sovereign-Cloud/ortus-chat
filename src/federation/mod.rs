@@ -73,8 +73,72 @@ pub fn enabled() -> bool {
     std::env::var("ORTUS_FEDERATION_TLS_CERT").is_ok_and(|v| !v.trim().is_empty())
 }
 
+/// Whether `name` is a Matrix server name: a DNS name, an IPv4 address or
+/// a bracketed IPv6 address, with an optional port. Checked before any
+/// partner check, request or comparison, so a name cannot smuggle a path,
+/// a fragment or another host.
+pub fn valid_server_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 255 {
+        return false;
+    }
+    let (host, port) = if let Some(rest) = name.strip_prefix('[') {
+        let Some((v6, after)) = rest.split_once(']') else {
+            return false;
+        };
+        if v6.is_empty()
+            || !v6
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() || c == ':' || c == '.')
+        {
+            return false;
+        }
+        (
+            None,
+            after
+                .strip_prefix(':')
+                .map(Some)
+                .unwrap_or(if after.is_empty() { None } else { return false }),
+        )
+    } else {
+        match name.split_once(':') {
+            Some((h, p)) => (Some(h), Some(p)),
+            None => (Some(name), None),
+        }
+    };
+    if let Some(h) = host {
+        if h.is_empty()
+            || !h
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+            || h.starts_with('.')
+            || h.ends_with('.')
+            || h.contains("..")
+        {
+            return false;
+        }
+    }
+    match port {
+        Some(p) => {
+            !p.is_empty()
+                && p.len() <= 5
+                && p.chars().all(|c| c.is_ascii_digit())
+                && p.parse::<u32>().is_ok_and(|n| (1..=65535).contains(&n))
+        }
+        None => true,
+    }
+}
+
+/// The server of a Matrix user id (`@local:server`), when it is valid.
+pub fn server_of(user_id: &str) -> Option<&str> {
+    let (_, server) = user_id.strip_prefix('@')?.split_once(':')?;
+    valid_server_name(server).then_some(server)
+}
+
 /// Whether `server` is a partner allowed chat.
 pub async fn partner(instance: &Instance, server: &str) -> bool {
+    if !valid_server_name(server) {
+        return false;
+    }
     let host = server.rsplit_once(':').map_or(server, |(h, p)| {
         if p.chars().all(|c| c.is_ascii_digit()) {
             h

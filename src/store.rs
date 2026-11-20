@@ -493,25 +493,36 @@ pub async fn purge(tx: &mut dyn AsyncTx, rules: &ortus_core::retention::Rules) -
         return Ok(0);
     };
     let before = rules.now - days * 86_400_000;
-    let rows = tx
-        .query("SELECT e.room, e.event_id, e.sender_user, e.origin_ts, r.encrypted FROM chat_events e JOIN chat_rooms r ON r.id = e.room WHERE e.origin_ts < $1 AND e.kind = 'm.room.message' LIMIT 5000", &[before.into()])
-        .await?;
+    let engine = crate::index::engine_of(tx).await;
     let mut n = 0;
-    for r in rows {
-        let (room, id, user, at) = (
-            r.text(0).unwrap_or_default().to_string(),
-            r.text(1).unwrap_or_default().to_string(),
-            r.text(2).map(str::to_string),
-            r.int(3).unwrap_or(0),
-        );
-        let people: Vec<&str> = user.iter().map(String::as_str).collect();
-        let sealed = r.int(4).unwrap_or(0) != 0;
-        let due = if sealed {
-            rules.may_purge("chat", at, &[], None)
-        } else {
-            rules.may_purge("chat", at, &people, Some(&format!("chat:room:{room}")))
-        };
-        if due {
+    // Oldest first, a page at a time; messages kept by a hold stay in
+    // place, so the next page starts after them.
+    let mut kept = 0i64;
+    for _ in 0..10 {
+        let rows = tx
+            .query("SELECT e.room, e.event_id, e.sender_user, e.origin_ts, r.encrypted FROM chat_events e JOIN chat_rooms r ON r.id = e.room WHERE e.origin_ts < $1 AND e.kind = 'm.room.message' ORDER BY e.origin_ts, e.event_id LIMIT 1000 OFFSET $2", &[before.into(), kept.into()])
+            .await?;
+        if rows.is_empty() {
+            break;
+        }
+        for r in rows {
+            let (room, id, user, at) = (
+                r.text(0).unwrap_or_default().to_string(),
+                r.text(1).unwrap_or_default().to_string(),
+                r.text(2).map(str::to_string),
+                r.int(3).unwrap_or(0),
+            );
+            let people: Vec<&str> = user.iter().map(String::as_str).collect();
+            let sealed = r.int(4).unwrap_or(0) != 0;
+            let due = if sealed {
+                rules.may_purge("chat", at, &[], None)
+            } else {
+                rules.may_purge("chat", at, &people, Some(&format!("chat:room:{room}")))
+            };
+            if !due {
+                kept += 1;
+                continue;
+            }
             tx.execute(
                 "DELETE FROM chat_reactions WHERE event_id = $1",
                 &[id.as_str().into()],
@@ -522,6 +533,8 @@ pub async fn purge(tx: &mut dyn AsyncTx, rules: &ortus_core::retention::Rules) -
                 &[id.as_str().into()],
             )
             .await?;
+            ortus_core::search::remove_in(tx, engine, "chat", &id).await?;
+            crate::federation::rooms::redact_copy(tx, &id).await?;
             n += 1;
         }
     }
@@ -559,6 +572,21 @@ pub async fn forget(
         if !sealed && rules.held_channels.contains(&format!("chat:room:{room}")) {
             continue;
         }
+        // Out of search and out of what partners can ask for.
+        let engine = crate::index::engine_of(tx).await;
+        let theirs: Vec<String> = tx
+            .query(
+                "SELECT event_id FROM chat_events WHERE room = $1 AND sender_user = $2",
+                &[room.as_str().into(), user.into()],
+            )
+            .await?
+            .iter()
+            .filter_map(|r| r.text(0).map(str::to_string))
+            .collect();
+        for id in &theirs {
+            ortus_core::search::remove_in(tx, engine, "chat", id).await?;
+            crate::federation::rooms::redact_copy(tx, id).await?;
+        }
         tx.execute(
             "UPDATE chat_events SET body = '', content = '{}', deleted_at = $1 WHERE room = $2 AND sender_user = $3",
             &[now().into(), room.as_str().into(), user.into()],
@@ -588,5 +616,6 @@ pub async fn forget(
     ] {
         tx.execute(sql, &[user.into()]).await?;
     }
+    crate::e2e::forget(tx, user).await?;
     Ok(())
 }

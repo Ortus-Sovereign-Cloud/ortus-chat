@@ -334,7 +334,12 @@ async fn change_room(
     let mut outside = Vec::new();
     for e in &input.invite {
         let e = e.trim();
-        if e.starts_with('@') && e.rsplit_once(':').is_some_and(|(_, host)| host != server) {
+        if e.starts_with('@') && e.split_once(':').is_some_and(|(_, host)| host != server) {
+            if crate::federation::server_of(e).is_none() {
+                return Err(ApiError::bad_request(
+                    "That is not a Matrix id (@name:server).",
+                ));
+            }
             outside.push(e.to_ascii_lowercase());
         } else {
             invited.push(colleague(instance, e).await?);
@@ -388,6 +393,17 @@ async fn change_room(
         }
     }
     tx.commit().await?;
+    // In a shared room a colleague's invitation is a Matrix event too (their
+    // later join rests on it).
+    for u in &invited {
+        let _ = crate::federation::rooms::invite_local(
+            instance,
+            &room,
+            &store::mxid(&me.id, &server),
+            &store::mxid(&u.id, &server),
+        )
+        .await;
+    }
     for target in &outside {
         if let Err(e) = crate::federation::rooms::invite_remote(
             instance,
@@ -477,6 +493,11 @@ async fn leave(
     store::room(s, id)
         .await?
         .ok_or_else(|| ApiError::not_found("There is no such room."))?;
+    // Only someone in the room (or invited to it) leaves it.
+    let state = store::membership(s, id, &me.id).await?.map(|m| m.0);
+    if !matches!(state.as_deref(), Some("join") | Some("invite")) {
+        return Err(ApiError::not_found("There is no such room."));
+    }
     let mut tx = s.begin().await?;
     tx.execute(
         "UPDATE chat_members SET state = 'leave' WHERE room = $1 AND user_id = $2",
@@ -835,6 +856,9 @@ async fn own_message(instance: &Instance, me: &User, id: &str) -> Result<store::
     if e.deleted_at.is_some() {
         return Err(ApiError::conflict("That message was deleted."));
     }
+    if e.kind != "m.room.message" {
+        return Err(ApiError::not_found("There is no such message."));
+    }
     Ok(e)
 }
 
@@ -850,7 +874,10 @@ async fn edit(
 ) -> Result<Response, ApiError> {
     let me = signed(request, instance).await?;
     let e = own_message(instance, &me, &message_param(params)).await?;
-    if e.content.get("ortus.sealed").is_some() {
+    let room = store::room(instance.store.as_ref(), &e.room)
+        .await?
+        .ok_or_else(ApiError::internal)?;
+    if room.encrypted {
         return Err(ApiError::bad_request(
             "A sealed message is not edited: delete it and send it again.",
         ));
@@ -877,9 +904,9 @@ async fn edit(
         )
         .await?;
     notice(instance, &e.room, "ortus.edited", &e.event_id, &me.id).await?;
-    if let Ok(Some(room)) = store::room(instance.store.as_ref(), &e.room).await {
-        crate::index::message(instance, &room, &e.event_id).await;
-    }
+    crate::index::message(instance, &room, &e.event_id).await;
+    let me_mx = store::mxid(&me.id, &store::server_name(instance));
+    let _ = crate::federation::rooms::edited(instance, &room, &me_mx, &e.event_id, &text).await;
     let e = store::event(instance.store.as_ref(), &e.event_id)
         .await?
         .ok_or_else(ApiError::internal)?;
@@ -907,6 +934,10 @@ async fn delete(
     .await?;
     ortus_core::search::remove_in(tx.as_mut(), s.engine(), "chat", &e.event_id).await?;
     tx.commit().await?;
+    if let Some(room) = store::room(s, &e.room).await? {
+        let me_mx = store::mxid(&me.id, &store::server_name(instance));
+        let _ = crate::federation::rooms::deleted(instance, &room, &me_mx, &e.event_id).await;
+    }
     notice(instance, &e.room, "m.room.redaction", &e.event_id, &me.id).await?;
     Ok(ok(&json!({ "deleted": e.event_id })))
 }

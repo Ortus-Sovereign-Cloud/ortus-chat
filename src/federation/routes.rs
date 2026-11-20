@@ -130,7 +130,7 @@ pub async fn answer(instance: &Arc<Instance>, request: Request) -> Response {
             return error(
                 STATUS_CODE_REASON_PHRASE.n401_unauthorized,
                 "M_UNAUTHORIZED",
-                &e,
+                "The request is not signed by a partner server.",
             );
         }
     };
@@ -173,7 +173,7 @@ pub async fn answer(instance: &Arc<Instance>, request: Request) -> Response {
             .await
         }
         ("GET", ["_matrix", "federation", "v1", "query", "profile"]) => {
-            profile(instance, &uri).await
+            profile(instance, &uri, &origin).await
         }
         _ => error(
             STATUS_CODE_REASON_PHRASE.n404_not_found,
@@ -184,7 +184,7 @@ pub async fn answer(instance: &Arc<Instance>, request: Request) -> Response {
 }
 
 async fn make_join(instance: &Instance, room_id: &str, user_id: &str, origin: &str) -> Response {
-    if user_id.rsplit_once(':').map(|(_, s)| s) != Some(origin) {
+    if super::server_of(user_id) != Some(origin) {
         return forbidden("That person is not of your server.");
     }
     let room = match room_for(instance, room_id, origin).await {
@@ -243,12 +243,20 @@ async fn send_join(
     {
         return forbidden("Only invited people join this room.");
     }
+    if store::members(instance.store.as_ref(), &room.id)
+        .await
+        .map(|m| m.len())
+        .unwrap_or(usize::MAX)
+        >= store::MAX_MEMBERS as usize
+    {
+        return forbidden("The room is full.");
+    }
     let sender = event["sender"].as_str().unwrap_or_default().to_string();
     let good = event["type"] == "m.room.member"
         && event["content"]["membership"] == "join"
         && event["state_key"].as_str() == Some(sender.as_str())
         && event["room_id"].as_str() == Some(room_id)
-        && sender.rsplit_once(':').map(|(_, s)| s) == Some(origin)
+        && super::server_of(&sender) == Some(origin)
         && matrix::event_id(&event) == event_id
         && keys::check_event_from(instance, &event, origin).await;
     if !good {
@@ -311,24 +319,27 @@ async fn joined(instance: &Instance, room: &Room, member: &str, state: &str) {
 /// A partner's transaction: each event checked and kept, once.
 async fn transaction(instance: &Instance, origin: &str, txn: &str, body: Value) -> Response {
     let s = instance.store.as_ref();
-    let fresh = s
-        .execute(
-            "INSERT INTO chat_fed_txns (origin, txn_id, at) VALUES ($1, $2, $3)",
-            &[origin.into(), txn.into(), now().into()],
+    let seen = s
+        .query(
+            "SELECT 1 FROM chat_fed_txns WHERE origin = $1 AND txn_id = $2",
+            &[origin.into(), txn.into()],
         )
         .await
-        .is_ok();
-    if !fresh {
+        .map(|r| !r.is_empty())
+        .unwrap_or(false);
+    if seen {
         return ok(&json!({"pdus": {}}));
     }
+    let pdus = body["pdus"].as_array().cloned().unwrap_or_default();
+    if pdus.len() > 50 || body["edus"].as_array().is_some_and(|e| e.len() > 100) {
+        return error(
+            STATUS_CODE_REASON_PHRASE.n400_bad_request,
+            "M_TOO_LARGE",
+            "At most 50 events and 100 notices a transaction.",
+        );
+    }
     let mut results = serde_json::Map::new();
-    for pdu in body["pdus"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .take(50)
-    {
+    for pdu in pdus {
         let id = matrix::event_id(&pdu);
         let outcome = match take(instance, origin, &id, &pdu).await {
             Ok(()) => json!({}),
@@ -336,6 +347,14 @@ async fn transaction(instance: &Instance, origin: &str, txn: &str, body: Value) 
         };
         results.insert(id, outcome);
     }
+    // Recorded once handled: a transaction that failed half way is taken
+    // again when it is sent again (each event is kept once by its id).
+    let _ = s
+        .execute(
+            "INSERT INTO chat_fed_txns (origin, txn_id, at) VALUES ($1, $2, $3)",
+            &[origin.into(), txn.into(), now().into()],
+        )
+        .await;
     ok(&json!({"pdus": results}))
 }
 
@@ -346,8 +365,18 @@ async fn take(instance: &Instance, origin: &str, id: &str, pdu: &Value) -> Resul
     let room = room_for(instance, room_id, origin)
         .await
         .map_err(|_| "this room is not shared with you".to_string())?;
+    // Matrix's limits: 64 KiB an event, integers within 2^53.
+    if pdu.to_string().len() > 65_536 {
+        return Err("the event is too big".into());
+    }
+    if !pdu["depth"]
+        .as_i64()
+        .is_some_and(|d| (0..=(1i64 << 53)).contains(&d))
+    {
+        return Err("the depth is not valid".into());
+    }
     let sender = pdu["sender"].as_str().ok_or("no sender")?.to_string();
-    if sender.rsplit_once(':').map(|(_, s)| s) != Some(origin) {
+    if super::server_of(&sender) != Some(origin) {
         return Err("the sender is not of your server".into());
     }
     if !keys::check_event_from(instance, pdu, origin).await {
@@ -368,16 +397,14 @@ async fn take(instance: &Instance, origin: &str, id: &str, pdu: &Value) -> Resul
         .map_err(|e| e.to_string())?
         .into_iter()
         .any(|(m, _, st, _)| m == sender && st == "join");
-    if kind == "m.room.member" {
-        if pdu["state_key"].as_str() != Some(sender.as_str()) {
-            return Err("one changes only one's own membership".into());
-        }
-    } else if !member {
+    if !member {
         return Err("the sender is not in the room".into());
     }
-    match kind {
-        "m.room.message" => {
-            rooms::store(instance, &room.id, id, pdu).await?;
+    // What a partner may send in a room Ortus hosts: messages, and leaving.
+    // Joins come only through send_join (which checks invitations), and
+    // partners change no other state (power levels, join rules, name).
+    match (kind, pdu.get("state_key")) {
+        ("m.room.message", None) => {
             let content = &pdu["content"];
             let body: String = content["body"]
                 .as_str()
@@ -385,17 +412,38 @@ async fn take(instance: &Instance, origin: &str, id: &str, pdu: &Value) -> Resul
                 .chars()
                 .take(store::MAX_TEXT)
                 .collect();
-            let thread = (content["m.relates_to"]["rel_type"] == "m.thread")
-                .then(|| {
-                    content["m.relates_to"]["event_id"]
-                        .as_str()
-                        .map(str::to_string)
-                })
-                .flatten();
+            // Only what Matrix says about a message: no Ortus fields
+            // (files, sealed text) from outside.
+            let mut kept = serde_json::Map::new();
+            for key in [
+                "msgtype",
+                "body",
+                "m.relates_to",
+                "m.mentions",
+                "format",
+                "formatted_body",
+            ] {
+                if let Some(v) = content.get(key) {
+                    kept.insert(key.to_string(), v.clone());
+                }
+            }
+            let content = Value::Object(kept);
+            // A thread root must be a message of this room.
+            let mut thread = None;
+            if content["m.relates_to"]["rel_type"] == "m.thread" {
+                if let Some(root) = content["m.relates_to"]["event_id"].as_str() {
+                    if let Ok(Some(e)) = store::event(s, root).await {
+                        if e.room == room.id && e.thread_root.is_none() {
+                            thread = Some(e.event_id);
+                        }
+                    }
+                }
+            }
             let ts = pdu["origin_server_ts"]
                 .as_i64()
                 .unwrap_or_else(now)
                 .min(now() + 60_000);
+            rooms::store(instance, &room.id, id, pdu).await?;
             let mut tx = s.begin().await.map_err(|e| e.to_string())?;
             store::add_event(
                 tx.as_mut(),
@@ -407,7 +455,7 @@ async fn take(instance: &Instance, origin: &str, id: &str, pdu: &Value) -> Resul
                     kind: "m.room.message",
                     thread_root: thread.as_deref(),
                     body: &body,
-                    content,
+                    content: &content,
                     origin_ts: ts,
                 },
             )
@@ -417,14 +465,14 @@ async fn take(instance: &Instance, origin: &str, id: &str, pdu: &Value) -> Resul
             crate::index::message(instance, &room, id).await;
             Ok(())
         }
-        "m.room.member" => {
+        ("m.room.member", Some(key))
+            if key.as_str() == Some(sender.as_str()) && pdu["content"]["membership"] == "leave" =>
+        {
             rooms::store(instance, &room.id, id, pdu).await?;
-            let state = pdu["content"]["membership"].as_str().unwrap_or("leave");
-            joined(instance, &room, &sender, state).await;
+            joined(instance, &room, &sender, "leave").await;
             Ok(())
         }
-        // Other kinds are kept as events of the room, not shown.
-        _ => rooms::store(instance, &room.id, id, pdu).await,
+        _ => Err("partners send messages and leave; nothing else is taken".into()),
     }
 }
 
@@ -526,6 +574,8 @@ async fn missing(instance: &Instance, room_id: &str, origin: &str, body: Value) 
         .as_array()
         .cloned()
         .unwrap_or_default()
+        .into_iter()
+        .take(20)
     {
         if let Some(d) = s
             .query(
@@ -553,7 +603,8 @@ async fn missing(instance: &Instance, room_id: &str, origin: &str, body: Value) 
     ok(&json!({"events": events}))
 }
 
-async fn profile(instance: &Instance, uri: &str) -> Response {
+/// A person's name, only for someone in a shared room with that server.
+async fn profile(instance: &Instance, uri: &str, origin: &str) -> Response {
     let user = query(uri, "user_id").unwrap_or_default();
     let server = server_name(instance);
     let Some(local) = user
@@ -562,7 +613,26 @@ async fn profile(instance: &Instance, uri: &str) -> Response {
     else {
         return not_found();
     };
-    match ortus_core::auth::accounts::by_id(instance.store.as_ref(), local).await {
+    let s = instance.store.as_ref();
+    let rooms = s
+        .query("SELECT r.id FROM chat_members m JOIN chat_rooms r ON r.id = m.room WHERE m.user_id = $1 AND m.state = 'join' AND r.federated = 1", &[local.into()])
+        .await
+        .unwrap_or_default();
+    let mut shared = false;
+    for r in rooms {
+        if rooms::servers(instance, r.text(0).unwrap_or_default())
+            .await
+            .iter()
+            .any(|s| s == origin)
+        {
+            shared = true;
+            break;
+        }
+    }
+    if !shared {
+        return not_found();
+    }
+    match ortus_core::auth::accounts::by_id(s, local).await {
         Ok(Some(u)) => ok(&json!({"displayname": u.name})),
         _ => not_found(),
     }

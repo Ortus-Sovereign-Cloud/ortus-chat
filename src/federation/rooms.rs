@@ -103,9 +103,104 @@ pub async fn build(
     if let Some(k) = state_key {
         event["state_key"] = json!(k);
     }
+    // A redaction names the event it removes (room version 10: at the top).
+    if let Some(r) = content_redacts(kind, &event) {
+        event["redacts"] = json!(r);
+        event["content"] = json!({});
+    }
     let key = super::keys::ours(instance).await?;
     let id = matrix::seal_event(&mut event, &server_name(instance), &key);
     Ok((id, event))
+}
+
+fn content_redacts(kind: &str, event: &Value) -> Option<String> {
+    (kind == "m.room.redaction")
+        .then(|| event["content"]["redacts"].as_str().map(str::to_string))
+        .flatten()
+}
+
+/// The kept copy of an event, redacted (after a deletion, retention or a
+/// person forgotten): partners asking for it get no text.
+pub async fn redact_copy(
+    tx: &mut dyn ortus_core::storage::AsyncTx,
+    event_id: &str,
+) -> ortus_core::storage::StoreResult<()> {
+    let rows = tx
+        .query(
+            "SELECT pdu FROM chat_pdus WHERE event_id = $1",
+            &[event_id.into()],
+        )
+        .await?;
+    if let Some(r) = rows.first() {
+        let pdu: Value = serde_json::from_str(r.text(0).unwrap_or("null")).unwrap_or(Value::Null);
+        tx.execute(
+            "UPDATE chat_pdus SET pdu = $1 WHERE event_id = $2",
+            &[matrix::redact(&pdu).to_string().into(), event_id.into()],
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// A local deletion in a shared room: the copy is redacted and a
+/// redaction goes to the other servers.
+pub async fn deleted(
+    instance: &Instance,
+    room: &Room,
+    sender: &str,
+    event_id: &str,
+) -> Result<(), String> {
+    if !super::enabled() || !room.federated {
+        return Ok(());
+    }
+    let s = instance.store.as_ref();
+    if s.query(
+        "SELECT 1 FROM chat_pdus WHERE event_id = $1",
+        &[event_id.into()],
+    )
+    .await
+    .map_err(|e| e.to_string())?
+    .is_empty()
+    {
+        return Ok(());
+    }
+    let mut tx = s.begin().await.map_err(|e| e.to_string())?;
+    redact_copy(tx.as_mut(), event_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    tx.commit().await.map_err(|e| e.to_string())?;
+    let (id, ev) = build(
+        instance,
+        room,
+        "m.room.redaction",
+        None,
+        sender,
+        json!({"redacts": event_id}),
+    )
+    .await?;
+    store(instance, &room.id, &id, &ev).await?;
+    queue(instance, &room.id, &id).await
+}
+
+/// A local edit in a shared room: a replacement event to the other servers.
+pub async fn edited(
+    instance: &Instance,
+    room: &Room,
+    sender: &str,
+    event_id: &str,
+    text: &str,
+) -> Result<(), String> {
+    if !super::enabled() || !room.federated {
+        return Ok(());
+    }
+    let content = json!({
+        "msgtype": "m.text", "body": format!("* {text}"),
+        "m.new_content": {"msgtype": "m.text", "body": text},
+        "m.relates_to": {"rel_type": "m.replace", "event_id": event_id},
+    });
+    let (id, ev) = build(instance, room, "m.room.message", None, sender, content).await?;
+    store(instance, &room.id, &id, &ev).await?;
+    queue(instance, &room.id, &id).await
 }
 
 /// Keeps an event (ours or a partner's) and, for state, the room's state.
@@ -118,9 +213,23 @@ pub async fn store(instance: &Instance, room: &str, id: &str, event: &Value) -> 
         .map_err(|e| e.to_string())?
         .is_empty();
     if !there {
+        // The depth kept orders the room: an event never lifts it more
+        // than one past what the room has (a partner's huge depth would
+        // otherwise carry into every later event of ours).
+        let top = tx
+            .query(
+                "SELECT MAX(depth) FROM chat_pdus WHERE room = $1",
+                &[room.into()],
+            )
+            .await
+            .map_err(|e| e.to_string())?
+            .first()
+            .and_then(|r| r.int(0))
+            .unwrap_or(0);
+        let depth = event["depth"].as_i64().unwrap_or(0).clamp(0, top + 1);
         tx.execute(
             "INSERT INTO chat_pdus (event_id, room, pdu, depth, kind, state_key, sender, received_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-            &[id.into(), room.into(), event.to_string().into(), event["depth"].as_i64().unwrap_or(0).into(), event["type"].as_str().unwrap_or_default().into(), store::opt(event["state_key"].as_str()), event["sender"].as_str().unwrap_or_default().into(), now().into()],
+            &[id.into(), room.into(), event.to_string().into(), depth.into(), event["type"].as_str().unwrap_or_default().into(), store::opt(event["state_key"].as_str()), event["sender"].as_str().unwrap_or_default().into(), now().into()],
         )
         .await
         .map_err(|e| e.to_string())?;
@@ -143,9 +252,22 @@ pub async fn store(instance: &Instance, room: &str, id: &str, event: &Value) -> 
 /// the local members joined).
 pub async fn share(instance: &Instance, room: &Room) -> Result<(), String> {
     let s = instance.store.as_ref();
-    if state_id(s, &room.id, "m.room.create", "").await.is_some() {
+    if room.federated {
         return Ok(());
     }
+    // A share that stopped half way is made again from the start.
+    s.execute(
+        "DELETE FROM chat_room_state WHERE room = $1",
+        &[room.id.as_str().into()],
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    s.execute(
+        "DELETE FROM chat_pdus WHERE room = $1",
+        &[room.id.as_str().into()],
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     let server = server_name(instance);
     let creator = store::mxid(&room.created_by, &server);
     let steps: Vec<(&str, Option<String>, Value)> = vec![
@@ -218,7 +340,7 @@ pub async fn servers(instance: &Instance, room: &str) -> Vec<String> {
         .unwrap_or_default()
         .into_iter()
         .filter(|(_, user, state, _)| user.is_none() && state == "join")
-        .filter_map(|(m, _, _, _)| m.split_once(':').map(|(_, s)| s.to_string()))
+        .filter_map(|(m, _, _, _)| super::server_of(&m).map(str::to_string))
         .filter(|s| *s != me)
         .collect();
     out.sort();
@@ -340,48 +462,88 @@ pub async fn drain(instance: &Instance) -> Result<(), String> {
             ));
     }
     for (server, items) in by_server {
-        let mut pdus = Vec::new();
-        for (_, event_id, _) in &items {
-            if let Some(r) = s
+        // The label decides at each send: what may no longer go to this
+        // partner is dropped, not sent.
+        let mut allowed: std::collections::HashMap<String, bool> = Default::default();
+        let mut ready = Vec::new();
+        for (id, event_id, attempts) in items {
+            let row = s
                 .query(
-                    "SELECT pdu FROM chat_pdus WHERE event_id = $1",
+                    "SELECT pdu, room FROM chat_pdus WHERE event_id = $1",
                     &[event_id.as_str().into()],
                 )
                 .await
-                .map_err(|e| e.to_string())?
-                .first()
-            {
-                pdus.push(
-                    serde_json::from_str::<Value>(r.text(0).unwrap_or("{}")).unwrap_or(Value::Null),
-                );
-            }
-        }
-        let txn = format!("{}{}", now(), ortus_core::auth::random_hex(4));
-        let body = json!({"origin": server_name(instance), "origin_server_ts": now(), "pdus": pdus, "edus": []});
-        let result = super::client::put_json(
-            instance,
-            &server,
-            &format!("/_matrix/federation/v1/send/{txn}"),
-            &body,
-        )
-        .await;
-        for (id, _, attempts) in items {
-            if result.is_ok() || attempts >= 20 {
+                .map_err(|e| e.to_string())?;
+            let Some(r) = row.first() else {
                 let _ = s
                     .execute(
                         "DELETE FROM chat_fed_outbox WHERE id = $1",
                         &[id.as_str().into()],
                     )
                     .await;
-            } else {
-                let wait = (5_000i64 << attempts.min(10)).min(3_600_000);
-                let _ = s.execute("UPDATE chat_fed_outbox SET attempts = attempts + 1, next_at = $1 WHERE id = $2", &[(now() + wait).into(), id.as_str().into()]).await;
+                continue;
+            };
+            let room_id = r.text(1).unwrap_or_default().to_string();
+            if !allowed.contains_key(&room_id) {
+                let ok = match store::room(s, &room_id).await.map_err(|e| e.to_string())? {
+                    Some(room) => {
+                        super::may_share(instance, &room.created_by, &room, &server).await
+                    }
+                    None => false,
+                };
+                allowed.insert(room_id.clone(), ok);
+            }
+            if !allowed[&room_id] {
+                let _ = s
+                    .execute(
+                        "DELETE FROM chat_fed_outbox WHERE id = $1",
+                        &[id.as_str().into()],
+                    )
+                    .await;
+                continue;
+            }
+            let pdu =
+                serde_json::from_str::<Value>(r.text(0).unwrap_or("{}")).unwrap_or(Value::Null);
+            ready.push((id, pdu, attempts));
+        }
+        // Matrix takes at most 50 events a transaction.
+        for chunk in ready.chunks(50) {
+            let txn = format!("{}{}", now(), ortus_core::auth::random_hex(4));
+            let pdus: Vec<&Value> = chunk.iter().map(|(_, p, _)| p).collect();
+            let body = json!({"origin": server_name(instance), "origin_server_ts": now(), "pdus": pdus, "edus": []});
+            let result = super::client::put_json(
+                instance,
+                &server,
+                &format!("/_matrix/federation/v1/send/{txn}"),
+                &body,
+            )
+            .await;
+            for (id, _, attempts) in chunk {
+                if result.is_ok() || *attempts >= 20 {
+                    let _ = s
+                        .execute(
+                            "DELETE FROM chat_fed_outbox WHERE id = $1",
+                            &[id.as_str().into()],
+                        )
+                        .await;
+                } else {
+                    let wait = (5_000i64 << (*attempts).min(10)).min(3_600_000);
+                    let _ = s.execute("UPDATE chat_fed_outbox SET attempts = attempts + 1, next_at = $1 WHERE id = $2", &[(now() + wait).into(), id.as_str().into()]).await;
+                }
+            }
+            if let Err(e) = result {
+                eprintln!("chat: federation to {server}: {e}");
+                break;
             }
         }
-        if let Err(e) = result {
-            eprintln!("chat: federation to {server}: {e}");
-        }
     }
+    // Transactions taken more than a day ago need no remembering.
+    let _ = s
+        .execute(
+            "DELETE FROM chat_fed_txns WHERE at < $1",
+            &[(now() - 86_400_000).into()],
+        )
+        .await;
     Ok(())
 }
 
@@ -437,6 +599,29 @@ pub async fn state_and_chain(
     Ok((state, chain))
 }
 
+/// A colleague invited into a shared room: the invitation as an event.
+pub async fn invite_local(
+    instance: &Instance,
+    room: &Room,
+    sender: &str,
+    target: &str,
+) -> Result<(), String> {
+    if !super::enabled() || !room.federated {
+        return Ok(());
+    }
+    let (id, ev) = build(
+        instance,
+        room,
+        "m.room.member",
+        Some(target),
+        sender,
+        json!({"membership": "invite"}),
+    )
+    .await?;
+    store(instance, &room.id, &id, &ev).await?;
+    queue(instance, &room.id, &id).await
+}
+
 /// Invites a partner's person into a shared room: the invitation, signed
 /// by us, is countersigned by their server, then kept and told to the
 /// room's other servers.
@@ -446,10 +631,9 @@ pub async fn invite_remote(
     sender: &str,
     target: &str,
 ) -> Result<(), String> {
-    let server = target
-        .rsplit_once(':')
-        .map(|(_, s)| s.to_string())
-        .ok_or("not a Matrix id")?;
+    let server = super::server_of(target)
+        .ok_or("not a Matrix id")?
+        .to_string();
     if !room.federated {
         return Err("the room is not shared".into());
     }

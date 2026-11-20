@@ -26,6 +26,7 @@ const messages: Record<ChatKey, ChatMessage> = {
   endToEnd: "Chiffré de bout en bout",
   cannotRead: "Ce message ne peut pas encore être ouvert sur cet appareil.",
   noRoomKey: "Cet appareil n'a pas encore de clé pour ce salon : l'appareil d'un membre la donnera dès qu'il sera en ligne.",
+  notSealed: "Ce salon était chiffré de bout en bout, et le serveur dit maintenant qu'il ne l'est plus. Rien n'a été envoyé.",
   sharedWithPartners: "Partagé avec les partenaires",
   shareWithPartners: "Partager avec les partenaires",
   inviteButton: "Inviter",

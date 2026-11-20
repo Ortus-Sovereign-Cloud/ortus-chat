@@ -777,7 +777,10 @@ export class OrtusChatMain extends LitElement {
 
   /** Room keys for this device, and for members' devices that lack them. */
   private async syncKeys(room: string): Promise<void> {
-    await this.sealer?.sync(room, this.isOwner()).catch(() => undefined);
+    const roomId = this.rooms.find((r) => r.id === room)?.roomId;
+    if (!roomId) return;
+    void this.sealer?.pin(room).catch(() => undefined);
+    await this.sealer?.sync(room, roomId).catch(() => undefined);
   }
 
   /** Sealed messages opened on this device (or marked as not readable). */
@@ -786,7 +789,8 @@ export class OrtusChatMain extends LitElement {
     return Promise.all(
       list.map(async (m) => {
         if (!m.sealed || m.deleted || !sealer) return m;
-        const text = await sealer.open(m.room, m.sealed);
+        const roomId = this.rooms.find((r) => r.id === m.room)?.roomId ?? "";
+        const text = await sealer.open(m.room, roomId, m.sealed, m.sender);
         return text === null ? { ...m, text: "", locked: true } : { ...m, text, locked: false };
       }),
     );
@@ -825,17 +829,24 @@ export class OrtusChatMain extends LitElement {
     const box = form.querySelector("textarea")!;
     const decision = (form.querySelector("input.decision") as HTMLInputElement | null)?.checked ?? false;
     const text = box.value.trim();
-    if (!text || !this.current) return;
+    // The room as it was when sending began (switching rooms meanwhile
+    // must not send it elsewhere).
+    const current = this.current;
+    const room = this.room();
+    if (!text || !current || !room) return;
     try {
-      if (this.room()?.encrypted) {
-        if (!this.sealer?.canSeal(this.current)) await this.syncKeys(this.current);
-        if (!this.sealer?.canSeal(this.current)) throw new Error(t(this.localize, "noRoomKey"));
-        await this.sealer.send(this.current, text, thread);
-      } else await call("POST", `/chat/rooms/${encodeURIComponent(this.current)}/messages`, { text, thread, mentions: this.mentions(text), decision });
+      if (room.encrypted) {
+        if (!this.sealer || !room.roomId) throw new Error(t(this.localize, "noRoomKey"));
+        await this.sealer.send(current, room.roomId, text, thread);
+      } else {
+        // A room this browser saw sealed is never written to in the clear.
+        if (await this.sealer?.pinned(current).catch(() => false)) throw new Error(t(this.localize, "notSealed"));
+        await call("POST", `/chat/rooms/${encodeURIComponent(current)}/messages`, { text, thread, mentions: this.mentions(text), decision });
+      }
       box.value = "";
       if (thread) await this.openThread(thread);
-      else {
-        await this.loadMessages(this.current);
+      else if (this.current === current) {
+        await this.loadMessages(current);
         await this.updateComplete;
         this.scrollDown();
       }
