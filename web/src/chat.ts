@@ -790,7 +790,7 @@ export class OrtusChatMain extends LitElement {
       list.map(async (m) => {
         if (!m.sealed || m.deleted || !sealer) return m;
         const roomId = this.rooms.find((r) => r.id === m.room)?.roomId ?? "";
-        const text = await sealer.open(m.room, roomId, m.sealed, m.sender);
+        const text = await sealer.open(m.room, roomId, m.sealed, m.sender, m.id, m.thread);
         return text === null ? { ...m, text: "", locked: true } : { ...m, text, locked: false };
       }),
     );
@@ -876,6 +876,10 @@ export class OrtusChatMain extends LitElement {
   private async edit(m: Message): Promise<void> {
     const text = prompt(t(this.localize, "editMessage"), m.text);
     if (text === null || !text.trim()) return;
+    if (await this.sealer?.pinned(m.room).catch(() => false)) {
+      this.error = t(this.localize, "notSealed");
+      return;
+    }
     await call("PATCH", `/chat/messages/${encodeURIComponent(m.id)}`, { text });
     await this.refresh(m.id);
   }
@@ -982,6 +986,11 @@ export class OrtusChatMain extends LitElement {
   private async sendFile(id: string): Promise<void> {
     if (!this.current) return;
     this.files = null;
+    // A link is plain text: never into a room this browser saw sealed.
+    if (this.room()?.encrypted || (await this.sealer?.pinned(this.current).catch(() => false))) {
+      this.error = t(this.localize, "notSealed");
+      return;
+    }
     await call("POST", `/chat/rooms/${encodeURIComponent(this.current)}/messages`, { text: "", file: id });
     await this.loadMessages(this.current);
   }

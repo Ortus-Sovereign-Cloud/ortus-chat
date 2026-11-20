@@ -1,9 +1,10 @@
 // End-to-end rooms in the browser, in Matrix's shapes (olm.ts does the
 // cryptography; docs/end-to-end.md has the wire format). This device has
-// Curve25519 and Ed25519 identity keys and one-time keys; it shares its
-// Megolm session for a room with every member's device over Olm, seals
-// messages with it, and opens what members' devices sealed. Everything is
-// kept in IndexedDB, private keys as CryptoKeys that cannot be read out.
+// Curve25519 and Ed25519 identity keys, one-time keys and a fallback key;
+// it shares its Megolm session for a room with every member's device over
+// Olm, seals messages with it, and opens what members' devices sealed.
+// Everything is kept in IndexedDB, private keys as CryptoKeys that cannot
+// be read out. One operation at a time per person, across tabs too.
 import { call } from "ortus-kit";
 import * as olm from "./olm.js";
 
@@ -23,6 +24,8 @@ interface Account {
   identity: olm.X25519;
   signing: olm.Ed25519;
   oneTimeKeys: Record<string, olm.X25519>;
+  /** The fallback keys still accepted (the newest first). */
+  fallback: olm.X25519[];
   next: number;
 }
 
@@ -45,7 +48,6 @@ interface Outbound {
 
 interface Inbound {
   session: olm.MegolmInbound;
-  senderKey: string;
   senderUser: string;
 }
 
@@ -87,11 +89,14 @@ function deviceId(): string {
   return Array.from(crypto.getRandomValues(new Uint8Array(10)), (b) => String.fromCharCode(65 + (b % 26))).join("");
 }
 
+function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+  return a.length === b.length && a.every((x, i) => x === b[i]);
+}
+
 /** End-to-end rooms for one person on this browser. */
 export class Sealer {
-  private account: Account | null = null;
   private published = false;
-  /** One operation at a time: sessions and ratchets are not shared state. */
+  /** One operation at a time in this tab (and across tabs: a lock). */
   private chain: Promise<unknown> = Promise.resolve();
   private opened = new Map<string, string>();
   private readonly me: string;
@@ -101,7 +106,8 @@ export class Sealer {
   }
 
   private run<T>(f: () => Promise<T>): Promise<T> {
-    const next = this.chain.catch(() => undefined).then(f);
+    const locked = (): Promise<T> => (navigator.locks ? navigator.locks.request(`ortus-olm:${this.me}`, f) : f());
+    const next = this.chain.catch(() => undefined).then(locked);
     this.chain = next;
     return next;
   }
@@ -113,26 +119,26 @@ export class Sealer {
   /** This device: made once, its keys published, one-time keys topped up. */
   ready(): Promise<void> {
     return this.run(async () => {
-      await this.readyNow();
+      await this.account();
     });
   }
 
-  private async readyNow(): Promise<Account> {
-    let a = this.account ?? (await get<Account>(this.key("account", "")));
+  /** The account, read afresh (another tab may have changed it). */
+  private async account(): Promise<Account> {
+    let a = await get<Account>(this.key("account", ""));
     if (!a) {
-      a = { device: deviceId(), identity: await olm.x25519(), signing: await olm.ed25519(), oneTimeKeys: {}, next: 0 };
+      a = { device: deviceId(), identity: await olm.x25519(), signing: await olm.ed25519(), oneTimeKeys: {}, fallback: [], next: 0 };
       await put(this.key("account", ""), a);
     }
-    this.account = a;
     if (!this.published) {
-      const r = await this.upload(a, {});
-      if (r < 20) await this.topUp(a, 25 - r);
+      const r = await this.upload(a, {}, null);
+      await this.topUp(a, r.oneTimeKeyCount, r.fallbackKey);
       this.published = true;
     }
     return a;
   }
 
-  private async upload(a: Account, oneTimeKeys: Record<string, unknown>): Promise<number> {
+  private async upload(a: Account, oneTimeKeys: Record<string, unknown>, fallback: Record<string, unknown> | null): Promise<{ oneTimeKeyCount: number; fallbackKey: boolean }> {
     const keys = await olm.signJson(
       {
         user_id: this.me,
@@ -144,20 +150,27 @@ export class Sealer {
       `ed25519:${a.device}`,
       a.signing.privateKey,
     );
-    const r = await call<{ oneTimeKeyCount: number }>("PUT", `/chat/devices/${a.device}`, { deviceKeys: keys, oneTimeKeys });
-    return r.oneTimeKeyCount;
+    return call<{ oneTimeKeyCount: number; fallbackKey: boolean }>("PUT", `/chat/devices/${a.device}`, { deviceKeys: keys, oneTimeKeys, fallbackKeys: fallback ?? {} });
   }
 
-  private async topUp(a: Account, n: number): Promise<void> {
+  /** Keeps about twenty-five one-time keys published, and a fallback key. */
+  private async topUp(a: Account, count: number, hasFallback: boolean): Promise<void> {
+    if (count >= 10 && hasFallback) return;
     const out: Record<string, unknown> = {};
-    for (let i = 0; i < n; i++) {
+    for (let i = count; i < 25; i++) {
       const k = await olm.x25519();
-      const id = `AAA${(a.next++).toString(36).toUpperCase()}`;
+      const id = `K${(a.next++).toString(36).toUpperCase()}`;
       a.oneTimeKeys[olm.b64(k.publicKey)] = k;
       out[`signed_curve25519:${id}`] = await olm.signJson({ key: olm.b64(k.publicKey) }, this.me, `ed25519:${a.device}`, a.signing.privateKey);
     }
+    let fallback: Record<string, unknown> | null = null;
+    if (!hasFallback) {
+      const k = await olm.x25519();
+      a.fallback = [k, ...a.fallback].slice(0, 2);
+      fallback = { [`signed_curve25519:F${(a.next++).toString(36).toUpperCase()}`]: await olm.signJson({ key: olm.b64(k.publicKey), fallback: true }, this.me, `ed25519:${a.device}`, a.signing.privateKey) };
+    }
     await put(this.key("account", ""), a);
-    await this.upload(a, out);
+    await this.upload(a, out, fallback);
   }
 
   /** Members' devices with keys that are signed by themselves and, once
@@ -177,25 +190,33 @@ export class Sealer {
       if (!before) await put(seen, `${curve}|${ed}`);
       out.push({ user: d.user, device: d.device, curve, ed });
     }
-    return out;
+    // A Curve25519 key belongs to one device: two naming it are both refused.
+    return out.filter((d) => out.filter((o) => o.curve === d.curve).length === 1);
   }
 
   /** Room keys sent to this device: opened, checked and kept. */
   private async inbox(a: Account): Promise<void> {
-    const r = await call<{ messages: { id: string; sender: string; senderDevice: string; content: { sender_key?: string; ciphertext?: Record<string, olm.OlmMessage> } }[] }>("GET", `/chat/devices/${a.device}/inbox`);
-    if (!r.messages.length) return;
+    const r = await call<{
+      messages: { id: string; sender: string; senderDevice: string; content: { sender_key?: string; ciphertext?: Record<string, olm.OlmMessage> } }[];
+      oneTimeKeyCount: number;
+      fallbackKey: boolean;
+    }>("GET", `/chat/devices/${a.device}/inbox`);
     const mine = olm.b64(a.identity.publicKey);
-    const roomDevices = new Map<string, Device[]>();
-    let usedOneTimeKeys = 0;
+    const roomDevices = new Map<string, Device[] | null>();
+    const done: string[] = [];
     for (const m of r.messages) {
+      let keep = true;
       try {
         const theirs = m.content.sender_key ?? "";
+        const theirKey = olm.unb64(theirs);
         const message = m.content.ciphertext?.[mine];
-        if (!message) continue;
-        const sessionsKey = this.key("olm", theirs);
-        const sessions = (await get<olm.OlmSession[]>(sessionsKey)) ?? [];
+        if (!message || theirKey.length !== 32) continue;
+        const sessionsKey = this.key("olm", `${m.sender}|${m.senderDevice}`);
+        const sessions = ((await get<olm.OlmSession[]>(sessionsKey)) ?? []).filter((s) => sameBytes(s.theirIdentity, theirKey));
         let plaintext: string | null = null;
-        for (const s of sessions) {
+        let used: olm.X25519 | null = null;
+        // The newest few sessions only (each try costs work).
+        for (const s of sessions.slice(0, 3)) {
           if (message.type === 0 && !olm.matchesPreKey(s, message.body)) continue;
           try {
             plaintext = await olm.olmDecrypt(s, message);
@@ -205,15 +226,17 @@ export class Sealer {
           }
         }
         if (plaintext === null && message.type === 0) {
-          const otk = a.oneTimeKeys[olm.b64(olm.preKeyFields(message.body).oneTimeKey)];
+          const pre = olm.preKeyFields(message.body);
+          // The session is the sender's own identity key's.
+          if (!sameBytes(pre.identityKey, theirKey)) continue;
+          const one = olm.b64(pre.oneTimeKey);
+          const otk = a.oneTimeKeys[one] ?? a.fallback.find((f) => olm.b64(f.publicKey) === one);
           if (!otk) continue;
           const created = await olm.inboundSession(a.identity, otk, message.body);
-          delete a.oneTimeKeys[olm.b64(otk.publicKey)];
-          usedOneTimeKeys++;
           sessions.unshift(created.session);
           plaintext = created.plaintext;
+          if (a.oneTimeKeys[one]) used = otk;
         }
-        await put(sessionsKey, sessions.slice(0, 10));
         if (plaintext === null) continue;
         const p = JSON.parse(plaintext) as {
           type?: string;
@@ -228,29 +251,44 @@ export class Sealer {
         // Meant for this device, from the device the server names, whose
         // published keys (checked by their signature) are the session's.
         if (p.type !== "m.room_key" || !room || p.recipient !== this.me || p.recipient_keys?.ed25519 !== olm.b64(a.signing.publicKey) || p.sender !== m.sender) continue;
-        if (!roomDevices.has(room)) roomDevices.set(room, await this.devices(room).catch(() => []));
-        const sender = roomDevices.get(room)!.find((d) => d.user === m.sender && d.device === m.senderDevice);
+        if (!roomDevices.has(room)) roomDevices.set(room, await this.devices(room).catch(() => null));
+        const known = roomDevices.get(room);
+        if (!known) {
+          // The room's devices could not be read: kept for the next time.
+          keep = false;
+          continue;
+        }
+        const sender = known.find((d) => d.user === m.sender && d.device === m.senderDevice);
         if (!sender || sender.curve !== theirs || sender.ed !== p.keys?.ed25519) continue;
+        // It holds: the one-time key goes, then the session is kept.
+        if (used) {
+          delete a.oneTimeKeys[olm.b64(used.publicKey)];
+          await put(this.key("account", ""), a);
+        }
+        await put(sessionsKey, sessions.slice(0, 5));
         if (c.algorithm !== MEGOLM || !c.session_key || !c.session_id) continue;
         const inbound = await olm.megolmInbound(c.session_key);
         if (olm.sessionId(inbound.signingKey) !== c.session_id) continue;
-        const where = this.key("in", `${room}|${c.session_id}`);
+        // A session is its sender's: stored under the sender's key, never
+        // overwritten by another sender.
+        const where = this.key("in", `${room}|${theirs}|${c.session_id}`);
         const had = await get<Inbound>(where);
-        if (!had || had.session.ratchet.index > inbound.ratchet.index) await put(where, { session: inbound, senderKey: theirs, senderUser: m.sender } satisfies Inbound);
+        if (!had || (had.senderUser === m.sender && had.session.ratchet.index > inbound.ratchet.index)) await put(where, { session: inbound, senderUser: m.sender } satisfies Inbound);
       } catch {
         // A message this device cannot open: dropped.
+      } finally {
+        if (keep) done.push(m.id);
       }
     }
-    await put(this.key("account", ""), a);
-    await call("POST", `/chat/devices/${a.device}/inbox/done`, { ids: r.messages.map((m) => m.id) });
-    if (usedOneTimeKeys) await this.topUp(a, usedOneTimeKeys);
+    if (done.length) await call("POST", `/chat/devices/${a.device}/inbox/done`, { ids: done });
+    await this.topUp(a, r.oneTimeKeyCount, r.fallbackKey);
   }
 
   /** Takes in room keys sent to this device, and gives this device's room
    * session to members' devices that lack it. */
   sync(room: string, roomId: string): Promise<void> {
     return this.run(async () => {
-      const a = await this.readyNow();
+      const a = await this.account();
       await this.inbox(a);
       await this.share(a, room, roomId);
     });
@@ -261,37 +299,42 @@ export class Sealer {
     const users = new Set(devices.map((d) => d.user));
     const where = this.key("out", room);
     let out = await get<Outbound>(where);
-    // A new session when someone left (they keep only what was before),
-    // and now and then.
-    const left = out?.sharedWith.some((k) => !users.has(k.split("|")[0]!));
-    if (!out || left || out.count >= 100 || Date.now() - out.created > 7 * 86_400_000) {
+    // A new session when someone left (they keep what was before), when
+    // someone new came (they read from now on), and now and then.
+    const sharedUsers = new Set(out?.sharedWith.map((k) => k.split("|")[0]!) ?? []);
+    const left = [...sharedUsers].some((u) => !users.has(u));
+    const came = !!out && out.count > 0 && [...users].some((u) => u !== this.me && !sharedUsers.has(u));
+    if (!out || left || came || out.count >= 100 || Date.now() - out.created > 7 * 86_400_000) {
       const session = await olm.megolmOutbound();
       const initialKey = await olm.sessionKey(session);
       out = { id: olm.sessionId(session.signing.publicKey), session, initialKey, sharedWith: [], created: Date.now(), count: 0 };
-      await put(this.key("in", `${room}|${out.id}`), { session: await olm.megolmInbound(initialKey), senderKey: olm.b64(a.identity.publicKey), senderUser: this.me } satisfies Inbound);
+      await put(this.key("in", `${room}|${olm.b64(a.identity.publicKey)}|${out.id}`), { session: await olm.megolmInbound(initialKey), senderUser: this.me } satisfies Inbound);
       await put(where, out);
     }
     const current = out;
     const targets = devices.filter((d) => !(d.user === this.me && d.device === a.device) && !current.sharedWith.includes(`${d.user}|${d.device}`));
     if (!targets.length) return current;
-    // An Olm session to each device: kept from before, or new from a
-    // one-time key of theirs.
+    // An Olm session to each device (to its identity key): kept from
+    // before, or new from a one-time key of theirs.
     const sessions = new Map<string, olm.OlmSession[]>();
-    for (const t of targets) sessions.set(t.curve, (await get<olm.OlmSession[]>(this.key("olm", t.curve))) ?? []);
-    const lacking = targets.filter((t) => !sessions.get(t.curve)!.length);
+    for (const t of targets) {
+      const list = (await get<olm.OlmSession[]>(this.key("olm", `${t.user}|${t.device}`))) ?? [];
+      sessions.set(`${t.user}|${t.device}`, list.filter((s) => sameBytes(s.theirIdentity, olm.unb64(t.curve))));
+    }
+    const lacking = targets.filter((t) => !sessions.get(`${t.user}|${t.device}`)!.length);
     if (lacking.length) {
       const claimed = await call<{ oneTimeKeys: Record<string, Record<string, Record<string, Record<string, unknown>>>> }>("POST", `/chat/rooms/${enc(room)}/claim`, { devices: lacking.map((t) => ({ user: t.user, device: t.device })) });
       for (const t of lacking) {
         const keys = claimed.oneTimeKeys[t.user]?.[t.device];
         const one = keys && Object.values(keys)[0];
         if (!one || typeof one.key !== "string" || !(await olm.verifyJson(one, t.user, `ed25519:${t.device}`, olm.unb64(t.ed)))) continue;
-        sessions.get(t.curve)!.unshift(await olm.outboundSession(a.identity, olm.unb64(t.curve), olm.unb64(one.key)));
+        sessions.get(`${t.user}|${t.device}`)!.unshift(await olm.outboundSession(a.identity, olm.unb64(t.curve), olm.unb64(one.key)));
       }
     }
     const messages = [];
-    const given: string[] = [];
+    const meant: string[] = [];
     for (const t of targets) {
-      const s = sessions.get(t.curve)![0];
+      const s = sessions.get(`${t.user}|${t.device}`)![0];
       if (!s) continue;
       const payload = {
         type: "m.room_key",
@@ -304,41 +347,56 @@ export class Sealer {
       };
       const sealed = await olm.olmEncrypt(s, JSON.stringify(payload));
       messages.push({ user: t.user, device: t.device, content: { algorithm: OLM, sender_key: olm.b64(a.identity.publicKey), ciphertext: { [t.curve]: sealed } } });
-      given.push(`${t.user}|${t.device}`);
+      meant.push(`${t.user}|${t.device}`);
     }
-    for (const [curve, list] of sessions) await put(this.key("olm", curve), list.slice(0, 10));
-    if (messages.length) await call("POST", `/chat/rooms/${enc(room)}/to-device`, { fromDevice: a.device, messages });
-    current.sharedWith = [...current.sharedWith, ...given];
-    await put(where, current);
+    for (const [target, list] of sessions) await put(this.key("olm", target), list.slice(0, 5));
+    if (messages.length) {
+      // Shared with a device only once the server has kept its message.
+      const r = await call<{ stored: number[] }>("POST", `/chat/rooms/${enc(room)}/to-device`, { fromDevice: a.device, messages });
+      current.sharedWith = [...current.sharedWith, ...r.stored.map((i) => meant[i]!).filter(Boolean)];
+      await put(where, current);
+    }
     return current;
   }
 
   /** Seals a message with this device's room session and sends it. */
   send(room: string, roomId: string, text: string, thread?: string): Promise<void> {
     return this.run(async () => {
-      const a = await this.readyNow();
+      const a = await this.account();
       const out = await this.share(a, room, roomId);
-      const ciphertext = await olm.megolmEncrypt(out.session, JSON.stringify({ type: "m.room.message", content: { msgtype: "m.text", body: text }, room_id: roomId }));
+      // The thread is inside the seal, so the server cannot move it.
+      const content: Record<string, unknown> = { msgtype: "m.text", body: text };
+      if (thread) content["m.relates_to"] = { rel_type: "m.thread", event_id: thread };
+      const ciphertext = await olm.megolmEncrypt(out.session, JSON.stringify({ type: "m.room.message", content, room_id: roomId }));
       out.count++;
       await put(this.key("out", room), out);
       await call("POST", `/chat/rooms/${enc(room)}/sealed`, { algorithm: MEGOLM, sender_key: olm.b64(a.identity.publicKey), ciphertext, session_id: out.id, device_id: a.device, thread });
     });
   }
 
-  /** A sealed message's text, or null when this device cannot open it. */
-  open(room: string, roomId: string, s: Sealed, sender: string): Promise<string | null> {
-    const cached = this.opened.get(s.ciphertext);
+  /** A sealed message's text, or null when this device cannot open it or
+   * it is not what it says (sender, room, thread, a replay). */
+  open(room: string, roomId: string, s: Sealed, sender: string, event: string, thread: string | null): Promise<string | null> {
+    const cacheKey = `${event}|${room}|${sender}|${s.sender_key}|${s.session_id}|${thread ?? ""}|${s.ciphertext}`;
+    const cached = this.opened.get(cacheKey);
     if (cached !== undefined) return Promise.resolve(cached);
     return this.run(async () => {
       if (s.algorithm !== MEGOLM) return null;
-      const rec = await get<Inbound>(this.key("in", `${room}|${s.session_id}`));
+      const rec = await get<Inbound>(this.key("in", `${room}|${s.sender_key}|${s.session_id}`));
       // The session must be the sender's own device's.
-      if (!rec || rec.senderKey !== s.sender_key || rec.senderUser !== sender) return null;
+      if (!rec || rec.senderUser !== sender) return null;
       try {
-        const { plaintext } = await olm.megolmDecrypt(rec.session, s.ciphertext);
-        const p = JSON.parse(plaintext) as { type?: string; room_id?: string; content?: { body?: unknown } };
+        const { plaintext, index } = await olm.megolmDecrypt(rec.session, s.ciphertext);
+        const p = JSON.parse(plaintext) as { type?: string; room_id?: string; content?: { body?: unknown; "m.relates_to"?: { rel_type?: string; event_id?: string } } };
         if (p.type !== "m.room.message" || p.room_id !== roomId || typeof p.content?.body !== "string") return null;
-        this.opened.set(s.ciphertext, p.content.body);
+        const rel = p.content["m.relates_to"];
+        if ((rel?.rel_type === "m.thread" ? rel.event_id : null) !== (thread ?? null)) return null;
+        // One message per index: the same ciphertext again is a replay.
+        const seenKey = this.key("idx", `${room}|${s.sender_key}|${s.session_id}|${index}`);
+        const seen = await get<string>(seenKey);
+        if (seen && seen !== event) return null;
+        if (!seen) await put(seenKey, event);
+        this.opened.set(cacheKey, p.content.body);
         return p.content.body;
       } catch {
         return null;
@@ -348,10 +406,12 @@ export class Sealer {
 
   /** Rooms this browser has seen end-to-end encrypted: never sent to in
    * the clear afterwards, whatever the server says. */
-  async pin(room: string): Promise<void> {
-    const key = this.key("pinned", "");
-    const rooms = (await get<string[]>(key)) ?? [];
-    if (!rooms.includes(room)) await put(key, [...rooms, room]);
+  pin(room: string): Promise<void> {
+    return this.run(async () => {
+      const key = this.key("pinned", "");
+      const rooms = (await get<string[]>(key)) ?? [];
+      if (!rooms.includes(room)) await put(key, [...rooms, room]);
+    });
   }
 
   async pinned(room: string): Promise<boolean> {

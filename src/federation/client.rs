@@ -25,6 +25,7 @@ fn http() -> Result<reqwest::Client, String> {
                 .tls_backend_preconfigured(tls)
                 .timeout(Duration::from_secs(30))
                 .redirect(reqwest::redirect::Policy::none())
+                .dns_resolver(std::sync::Arc::new(PublicOnly))
                 // No pooled connections: requests come from more than one
                 // runtime (the web role's and the jobs').
                 .pool_max_idle_per_host(0);
@@ -61,17 +62,53 @@ fn private_address(server: &str) -> bool {
     if host.eq_ignore_ascii_case("localhost") {
         return true;
     }
-    match host.parse::<std::net::IpAddr>() {
-        Ok(std::net::IpAddr::V4(a)) => {
-            a.is_private() || a.is_loopback() || a.is_link_local() || a.is_unspecified()
+    host.parse::<std::net::IpAddr>().is_ok_and(not_public)
+}
+
+/// Whether an address is loopback, private, link-local, shared (CGNAT),
+/// unspecified, or an IPv4 address of those inside IPv6.
+pub fn not_public(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(a) => {
+            let o = a.octets();
+            a.is_private()
+                || a.is_loopback()
+                || a.is_link_local()
+                || a.is_unspecified()
+                || a.is_broadcast()
+                || (o[0] == 100 && (o[1] & 0xc0) == 64)
+                || o[0] == 0
         }
-        Ok(std::net::IpAddr::V6(a)) => {
+        std::net::IpAddr::V6(a) => {
+            if let Some(v4) = a.to_ipv4_mapped() {
+                return not_public(std::net::IpAddr::V4(v4));
+            }
             a.is_loopback()
                 || a.is_unspecified()
                 || (a.segments()[0] & 0xfe00) == 0xfc00
                 || (a.segments()[0] & 0xffc0) == 0xfe80
         }
-        Err(_) => false,
+    }
+}
+
+/// Name resolution that never hands back an inside address: federation
+/// reaches only public servers (tests name theirs in
+/// ORTUS_FEDERATION_HOSTS, which comes first).
+struct PublicOnly;
+
+impl reqwest::dns::Resolve for PublicOnly {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            let found: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host.as_str(), 0))
+                .await?
+                .filter(|a| !not_public(a.ip()))
+                .collect();
+            if found.is_empty() {
+                return Err(format!("{host} has no public address").into());
+            }
+            Ok(Box::new(found.into_iter()) as reqwest::dns::Addrs)
+        })
     }
 }
 
@@ -86,8 +123,8 @@ pub async fn base(server: &str) -> Result<String, String> {
             return Ok(b.clone());
         }
     }
-    if !super::valid_server_name(server) {
-        return Err("not a server name".into());
+    if !super::valid_server_name(server) || private_address(server) {
+        return Err("not a public server name".into());
     }
     let found = if has_port(server) {
         format!("https://{server}")

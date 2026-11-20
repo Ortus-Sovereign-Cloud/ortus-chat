@@ -50,4 +50,53 @@ impl ortus_core::interfaces::Chat for Service {
             })
         })
     }
+
+    fn room<'a>(
+        &'a self,
+        user: &'a str,
+        room: &'a str,
+    ) -> BoxFuture<'a, Result<Option<ortus_core::interfaces::ChatRoom>, String>> {
+        Box::pin(async move {
+            let instance = self.instance.upgrade().ok_or("stopping")?;
+            let Ok(r) = crate::api::joined(&instance, user, room).await else {
+                return Ok(None);
+            };
+            let members = crate::store::members(instance.store.as_ref(), &r.id)
+                .await
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .filter(|(_, _, state, _)| state == "join")
+                .filter_map(|(_, u, _, _)| u)
+                .collect();
+            Ok(Some(ortus_core::interfaces::ChatRoom {
+                id: r.id,
+                name: r.name,
+                kind: r.kind,
+                encrypted: r.encrypted,
+                members,
+            }))
+        })
+    }
+
+    fn notice<'a>(
+        &'a self,
+        user: &'a str,
+        room: &'a str,
+        kind: &'a str,
+        about: &'a str,
+    ) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            // Other apps' notices only: never a message or a membership.
+            if !kind.starts_with("ortus.") || kind == "ortus.edited" {
+                return Err("an app notice is ortus.<something>".into());
+            }
+            let instance = self.instance.upgrade().ok_or("stopping")?;
+            crate::api::joined(&instance, user, room)
+                .await
+                .map_err(|e| e.message)?;
+            crate::api::notice(&instance, room, kind, about, user)
+                .await
+                .map_err(|e| e.message)
+        })
+    }
 }

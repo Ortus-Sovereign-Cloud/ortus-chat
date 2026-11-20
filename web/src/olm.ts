@@ -183,7 +183,9 @@ export async function verifyJson(value: Record<string, unknown>, entity: string,
 // ---- Olm -----------------------------------------------------------------
 
 const MAC_LENGTH = 8;
-const MAX_SKIP = 2000;
+// Messages skipped in one chain: bounded, so a forged message cannot make
+// the browser hash for long.
+const MAX_SKIP = 200;
 
 interface SenderChain {
   ratchet: X25519;

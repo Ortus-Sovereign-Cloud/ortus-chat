@@ -234,6 +234,17 @@ async fn send_join(
         Ok(r) => r,
         Err(r) => return r,
     };
+    if event.to_string().len() > 65_536 {
+        return forbidden("The event is too big.");
+    }
+    let already = store::members(instance.store.as_ref(), &room.id)
+        .await
+        .unwrap_or_default()
+        .iter()
+        .any(|(m, _, st, _)| Some(m.as_str()) == event["sender"].as_str() && st == "join");
+    if already {
+        return forbidden("Already in the room.");
+    }
     if !may_join(
         instance,
         &room,
@@ -439,12 +450,18 @@ async fn take(instance: &Instance, origin: &str, id: &str, pdu: &Value) -> Resul
                     }
                 }
             }
+            // A time within the last day (or just ahead), else when it came:
+            // a partner cannot date a message out of retention or to the top.
             let ts = pdu["origin_server_ts"]
                 .as_i64()
-                .unwrap_or_else(now)
-                .min(now() + 60_000);
-            rooms::store(instance, &room.id, id, pdu).await?;
+                .filter(|t| (now() - 86_400_000..=now() + 60_000).contains(t))
+                .unwrap_or_else(now);
+            // Its copy and the room's message together, or neither (a
+            // transaction sent again then takes it).
             let mut tx = s.begin().await.map_err(|e| e.to_string())?;
+            rooms::store_in(tx.as_mut(), &room.id, id, pdu)
+                .await
+                .map_err(|e| e.to_string())?;
             store::add_event(
                 tx.as_mut(),
                 &NewEvent {

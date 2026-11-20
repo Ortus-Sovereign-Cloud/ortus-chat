@@ -92,13 +92,16 @@ pub fn valid_server_name(name: &str) -> bool {
         {
             return false;
         }
-        (
-            None,
-            after
-                .strip_prefix(':')
-                .map(Some)
-                .unwrap_or(if after.is_empty() { None } else { return false }),
-        )
+        let port = match after.strip_prefix(':') {
+            Some(p) => Some(p),
+            None if after.is_empty() => None,
+            None => return false,
+        };
+        // A real IPv6 address, not just its characters.
+        if v6.parse::<std::net::Ipv6Addr>().is_err() {
+            return false;
+        }
+        (None, port)
     } else {
         match name.split_once(':') {
             Some((h, p)) => (Some(h), Some(p)),
@@ -114,6 +117,14 @@ pub fn valid_server_name(name: &str) -> bool {
             || h.ends_with('.')
             || h.contains("..")
         {
+            return false;
+        }
+        // A name is an IPv4 address in four parts, or a DNS name whose
+        // last label starts with a letter: never "127.1" or "0x7f000001",
+        // which address parsers read as addresses.
+        let last = h.rsplit('.').next().unwrap_or_default();
+        let dotted_quad = h.parse::<std::net::Ipv4Addr>().is_ok() && h.split('.').count() == 4;
+        if !dotted_quad && !last.starts_with(|c: char| c.is_ascii_alphabetic()) {
             return false;
         }
     }

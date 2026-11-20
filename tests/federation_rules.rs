@@ -286,3 +286,65 @@ fn partners_send_messages_and_leave_nothing_else() {
         );
     }
 }
+
+#[test]
+fn server_names_are_names() {
+    use ortus_chat::federation::valid_server_name as ok;
+    for good in [
+        "matrix.org",
+        "peer.test:8448",
+        "1.2.3.4",
+        "1.2.3.4:8448",
+        "[::1]:8448",
+        "a-b.example",
+    ] {
+        assert!(ok(good), "{good}");
+    }
+    for bad in [
+        "evil.tld/.partner.tld",
+        "evil.tld#.partner.tld",
+        "evil?.x",
+        "a@b.c",
+        "127.1",
+        "0x7f000001",
+        "2130706433",
+        "10.1",
+        "x..y",
+        ".x",
+        "x.",
+        "host:99999",
+        "host:",
+        "",
+    ] {
+        assert!(!ok(bad), "{bad}");
+    }
+}
+
+#[test]
+fn a_redacted_copy_takes_its_edits_with_it() {
+    for (name, instance, _keep) in common::installations() {
+        let s = instance.store.as_ref();
+        let original = json!({"type": "m.room.message", "room_id": "!r:x", "sender": "@a:x", "content": {"msgtype": "m.text", "body": "secret plan"}, "depth": 1});
+        let edit = json!({"type": "m.room.message", "room_id": "!r:x", "sender": "@a:x", "content": {"msgtype": "m.text", "body": "* new secret", "m.new_content": {"body": "new secret"}, "m.relates_to": {"rel_type": "m.replace", "event_id": "$orig_1"}}, "depth": 2});
+        block_on(async {
+            let mut tx = s.begin().await.unwrap();
+            ortus_chat::federation::rooms::store_in(tx.as_mut(), "room1", "$orig_1", &original)
+                .await
+                .unwrap();
+            ortus_chat::federation::rooms::store_in(tx.as_mut(), "room1", "$edit_1", &edit)
+                .await
+                .unwrap();
+            ortus_chat::federation::rooms::redact_copy(tx.as_mut(), "$orig_1")
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+        });
+        let rows =
+            block_on(s.query("SELECT pdu FROM chat_pdus WHERE room = 'room1'", &[])).unwrap();
+        let all: String = rows
+            .iter()
+            .map(|r| r.text(0).unwrap_or_default().to_string())
+            .collect();
+        assert!(!all.contains("secret"), "{name}: {all}");
+    }
+}

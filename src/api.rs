@@ -373,6 +373,8 @@ async fn change_room(
         )
         .await?;
     }
+    // Who is newly invited (someone already in or invited is not again).
+    let mut newly = Vec::new();
     for u in &invited {
         let current = tx
             .query(
@@ -380,7 +382,11 @@ async fn change_room(
                 &[room.id.as_str().into(), u.id.as_str().into()],
             )
             .await?;
-        if current.first().and_then(|r| r.text(0)) != Some("join") {
+        if !matches!(
+            current.first().and_then(|r| r.text(0)),
+            Some("join") | Some("invite")
+        ) {
+            newly.push(u.id.clone());
             store::set_member(
                 tx.as_mut(),
                 &room.id,
@@ -395,12 +401,12 @@ async fn change_room(
     tx.commit().await?;
     // In a shared room a colleague's invitation is a Matrix event too (their
     // later join rests on it).
-    for u in &invited {
+    for u in &newly {
         let _ = crate::federation::rooms::invite_local(
             instance,
             &room,
             &store::mxid(&me.id, &server),
-            &store::mxid(&u.id, &server),
+            &store::mxid(u, &server),
         )
         .await;
     }
@@ -527,7 +533,7 @@ async fn leave(
 
 /// A change to a message, as an event of the room, so that everyone's
 /// open screens hear of it (the live stream sends the room's events).
-async fn notice(
+pub(crate) async fn notice(
     instance: &Instance,
     room: &str,
     kind: &str,

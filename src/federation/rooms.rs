@@ -125,19 +125,23 @@ pub async fn redact_copy(
     tx: &mut dyn ortus_core::storage::AsyncTx,
     event_id: &str,
 ) -> ortus_core::storage::StoreResult<()> {
+    // The event, and the edits that replaced its text.
+    let like = format!("%{event_id}%");
     let rows = tx
-        .query(
-            "SELECT pdu FROM chat_pdus WHERE event_id = $1",
-            &[event_id.into()],
-        )
+        .query("SELECT event_id, pdu FROM chat_pdus WHERE event_id = $1 OR (kind = 'm.room.message' AND pdu LIKE $2)", &[event_id.into(), like.as_str().into()])
         .await?;
-    if let Some(r) = rows.first() {
-        let pdu: Value = serde_json::from_str(r.text(0).unwrap_or("null")).unwrap_or(Value::Null);
-        tx.execute(
-            "UPDATE chat_pdus SET pdu = $1 WHERE event_id = $2",
-            &[matrix::redact(&pdu).to_string().into(), event_id.into()],
-        )
-        .await?;
+    for r in rows {
+        let id = r.text(0).unwrap_or_default().to_string();
+        let pdu: Value = serde_json::from_str(r.text(1).unwrap_or("null")).unwrap_or(Value::Null);
+        let edit_of_it = pdu["content"]["m.relates_to"]["rel_type"] == "m.replace"
+            && pdu["content"]["m.relates_to"]["event_id"] == event_id;
+        if id == event_id || edit_of_it {
+            tx.execute(
+                "UPDATE chat_pdus SET pdu = $1 WHERE event_id = $2",
+                &[matrix::redact(&pdu).to_string().into(), id.as_str().into()],
+            )
+            .await?;
+        }
     }
     Ok(())
 }
@@ -205,12 +209,23 @@ pub async fn edited(
 
 /// Keeps an event (ours or a partner's) and, for state, the room's state.
 pub async fn store(instance: &Instance, room: &str, id: &str, event: &Value) -> Result<(), String> {
-    let s = instance.store.as_ref();
-    let mut tx = s.begin().await.map_err(|e| e.to_string())?;
+    let mut tx = instance.store.begin().await.map_err(|e| e.to_string())?;
+    store_in(tx.as_mut(), room, id, event)
+        .await
+        .map_err(|e| e.to_string())?;
+    tx.commit().await.map_err(|e| e.to_string())
+}
+
+/// Keeps an event inside a transaction (with what else it belongs with).
+pub async fn store_in(
+    tx: &mut dyn ortus_core::storage::AsyncTx,
+    room: &str,
+    id: &str,
+    event: &Value,
+) -> ortus_core::storage::StoreResult<()> {
     let there = !tx
         .query("SELECT 1 FROM chat_pdus WHERE event_id = $1", &[id.into()])
-        .await
-        .map_err(|e| e.to_string())?
+        .await?
         .is_empty();
     if !there {
         // The depth kept orders the room: an event never lifts it more
@@ -221,8 +236,7 @@ pub async fn store(instance: &Instance, room: &str, id: &str, event: &Value) -> 
                 "SELECT MAX(depth) FROM chat_pdus WHERE room = $1",
                 &[room.into()],
             )
-            .await
-            .map_err(|e| e.to_string())?
+            .await?
             .first()
             .and_then(|r| r.int(0))
             .unwrap_or(0);
@@ -232,19 +246,18 @@ pub async fn store(instance: &Instance, room: &str, id: &str, event: &Value) -> 
             &[id.into(), room.into(), event.to_string().into(), depth.into(), event["type"].as_str().unwrap_or_default().into(), store::opt(event["state_key"].as_str()), event["sender"].as_str().unwrap_or_default().into(), now().into()],
         )
         .await
-        .map_err(|e| e.to_string())?;
+        ?;
         if let Some(key) = event["state_key"].as_str() {
             let kind = event["type"].as_str().unwrap_or_default();
             tx.execute(
                 "DELETE FROM chat_room_state WHERE room = $1 AND kind = $2 AND state_key = $3",
                 &[room.into(), kind.into(), key.into()],
             )
-            .await
-            .map_err(|e| e.to_string())?;
-            tx.execute("INSERT INTO chat_room_state (room, kind, state_key, event_id) VALUES ($1, $2, $3, $4)", &[room.into(), kind.into(), key.into(), id.into()]).await.map_err(|e| e.to_string())?;
+            .await?;
+            tx.execute("INSERT INTO chat_room_state (room, kind, state_key, event_id) VALUES ($1, $2, $3, $4)", &[room.into(), kind.into(), key.into(), id.into()]).await?;
         }
     }
-    tx.commit().await.map_err(|e| e.to_string())
+    Ok(())
 }
 
 /// Shares a room: its Matrix state is made once (create, the creator

@@ -296,6 +296,101 @@ fn sealed_rooms_keep_nothing_readable() {
         assert_ne!(key_of(&first), key_of(&second), "{name}");
         assert!(first["oneTimeKeys"].get(&anna_mx).is_none(), "{name}");
 
+        // A Curve25519 key is one device's: another device naming it is refused.
+        let thief = Account::new();
+        let mut stolen = json!({"user_id": anna_mx, "device_id": "THIEF", "algorithms": ["m.olm.v1.curve25519-aes-sha2", "m.megolm.v1.aes-sha2"],
+            "keys": {"curve25519:THIEF": phone.curve25519_key().to_base64(), "ed25519:THIEF": thief.ed25519_key().to_base64()}});
+        stolen["signatures"] = json!({ anna_mx.clone(): { "ed25519:THIEF": thief.sign(canonical(&stolen)).to_base64() } });
+        assert_eq!(
+            409,
+            call(
+                &client,
+                &anna,
+                "PUT",
+                "/chat/devices/THIEF",
+                Some(json!({"deviceKeys": stolen}))
+            )
+            .0,
+            "{name}: someone else's curve key"
+        );
+
+        // When the one-time keys run out, the fallback key is given (and stays).
+        let fallback_key = Account::new().curve25519_key().to_base64();
+        let fallback = signed(
+            &phone,
+            json!({"key": fallback_key, "fallback": true}),
+            &marek_mx,
+            "PHONE",
+        );
+        let (_, up) = call(
+            &client,
+            &marek,
+            "PUT",
+            "/chat/devices/PHONE",
+            Some(
+                json!({"deviceKeys": device_keys(&phone, &marek_mx, "PHONE"), "fallbackKeys": {"signed_curve25519:FB1": fallback}}),
+            ),
+        );
+        assert_eq!(true, up["fallbackKey"], "{name}");
+        let one_more = json!({"devices": [{"user": marek_mx, "device": "PHONE"}, {"user": marek_mx, "device": "PHONE"}]});
+        let (_, third) = call(
+            &client,
+            &olena,
+            "POST",
+            &format!("/chat/rooms/{room}/claim"),
+            Some(one_more.clone()),
+        );
+        assert_eq!(
+            1,
+            third["oneTimeKeys"][&marek_mx].as_object().unwrap().len(),
+            "{name}: the same device once"
+        );
+        let (_, after) = call(
+            &client,
+            &olena,
+            "POST",
+            &format!("/chat/rooms/{room}/claim"),
+            Some(one_more),
+        );
+        let given = after["oneTimeKeys"][&marek_mx]["PHONE"]
+            .as_object()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            (json!(fallback_key), json!(true)),
+            (given["key"].clone(), given["fallback"].clone()),
+            "{name}: {after}"
+        );
+
+        // Someone invited reads the devices (to check who sends them keys).
+        assert_eq!(
+            200,
+            call(
+                &client,
+                &olena,
+                "PATCH",
+                &format!("/chat/rooms/{room}"),
+                Some(json!({"invite": ["anna@ministry.example"]}))
+            )
+            .0,
+            "{name}"
+        );
+        assert_eq!(
+            200,
+            call(
+                &client,
+                &anna,
+                "GET",
+                &format!("/chat/rooms/{room}/devices"),
+                None
+            )
+            .0,
+            "{name}: invited"
+        );
+
         // An Olm message to Marek's phone waits there until taken in.
         let otk = Curve25519PublicKey::from_base64(&key_of(&first)).unwrap();
         let mut olm = laptop
@@ -314,7 +409,11 @@ fn sealed_rooms_keep_nothing_readable() {
                 json!({"fromDevice": "LAPTOP", "messages": [{"user": marek_mx, "device": "PHONE", "content": content}, {"user": anna_mx, "device": "DESK", "content": content}]}),
             ),
         );
-        assert_eq!(1, sent["sent"], "{name}: only to members");
+        assert_eq!(
+            json!([0, 1]),
+            sent["stored"],
+            "{name}: kept for members and invited people: {sent}"
+        );
         let (_, inbox) = call(&client, &marek, "GET", "/chat/devices/PHONE/inbox", None);
         let waiting = inbox["messages"].as_array().unwrap();
         assert_eq!(1, waiting.len(), "{name}");
