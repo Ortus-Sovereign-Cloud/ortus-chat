@@ -611,6 +611,17 @@ export class OrtusChatMain extends LitElement {
     }
   }
 
+  /** Loads of a room's messages: only the newest is shown. */
+  private loads = 0;
+
+  private async loadMessages(room: string): Promise<void> {
+    const n = ++this.loads;
+    const list = await call<{ messages: Message[]; people: Record<string, Person> }>("GET", `/chat/rooms/${encodeURIComponent(room)}/messages`).catch(() => null);
+    if (!list || n !== this.loads || room !== this.current) return;
+    this.people = { ...this.people, ...list.people };
+    this.messages = list.messages;
+  }
+
   /** The room's last event this screen has taken in. */
   private shown = 0;
 
@@ -626,11 +637,7 @@ export class OrtusChatMain extends LitElement {
     const room = this.current;
     if (!room) return;
     this.shown = Math.max(this.shown, this.room()?.lastSeq ?? 0);
-    const list = await call<{ messages: Message[]; people: Record<string, Person> }>("GET", `/chat/rooms/${encodeURIComponent(room)}/messages`).catch(() => null);
-    if (list && room === this.current) {
-      this.people = { ...this.people, ...list.people };
-      this.messages = list.messages;
-    }
+    await this.loadMessages(room);
     if (this.thread) await this.openThread(this.thread);
   }
 
@@ -662,13 +669,12 @@ export class OrtusChatMain extends LitElement {
     url.searchParams.delete("thread");
     url.searchParams.delete("message");
     history.replaceState(null, "", url);
-    const [info, list] = await Promise.all([
+    const [info] = await Promise.all([
       call<{ members: Member[]; people: Record<string, Person>; state: string }>("GET", `/chat/rooms/${encodeURIComponent(id)}`),
-      call<{ messages: Message[]; people: Record<string, Person> }>("GET", `/chat/rooms/${encodeURIComponent(id)}/messages`),
+      this.loadMessages(id),
     ]);
     this.members = info.members;
-    this.people = { ...this.people, ...info.people, ...list.people };
-    this.messages = list.messages;
+    this.people = { ...this.people, ...info.people };
     this.shown = this.room()?.lastSeq ?? 0;
     if (thread) await this.openThread(thread);
     const last = this.room()?.lastSeq;
@@ -729,8 +735,7 @@ export class OrtusChatMain extends LitElement {
       box.value = "";
       if (thread) await this.openThread(thread);
       else {
-        const list = await call<{ messages: Message[]; people: Record<string, Person> }>("GET", `/chat/rooms/${encodeURIComponent(this.current)}/messages`);
-        this.messages = list.messages;
+        await this.loadMessages(this.current);
         await this.updateComplete;
         this.scrollDown();
       }
@@ -838,8 +843,7 @@ export class OrtusChatMain extends LitElement {
     if (!this.current) return;
     this.files = null;
     await call("POST", `/chat/rooms/${encodeURIComponent(this.current)}/messages`, { text: "", file: id });
-    const list = await call<{ messages: Message[] }>("GET", `/chat/rooms/${encodeURIComponent(this.current)}/messages`);
-    this.messages = list.messages;
+    await this.loadMessages(this.current);
   }
 
   private avatar(id: string, big = false): TemplateResult {
