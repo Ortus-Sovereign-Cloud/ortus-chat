@@ -167,7 +167,7 @@ pub async fn share(instance: &Instance, room: &Room) -> Result<(), String> {
         (
             "m.room.join_rules",
             Some(String::new()),
-            json!({"join_rule": "public"}),
+            json!({"join_rule": if room.kind == "channel" { "public" } else { "invite" }}),
         ),
         (
             "m.room.history_visibility",
@@ -435,4 +435,84 @@ pub async fn state_and_chain(
         }
     }
     Ok((state, chain))
+}
+
+/// Invites a partner's person into a shared room: the invitation, signed
+/// by us, is countersigned by their server, then kept and told to the
+/// room's other servers.
+pub async fn invite_remote(
+    instance: &Instance,
+    room: &Room,
+    sender: &str,
+    target: &str,
+) -> Result<(), String> {
+    let server = target
+        .rsplit_once(':')
+        .map(|(_, s)| s.to_string())
+        .ok_or("not a Matrix id")?;
+    if !room.federated {
+        return Err("the room is not shared".into());
+    }
+    if !super::may_share(instance, &room.created_by, room, &server).await {
+        return Err(format!("this room may not be shared with {server}"));
+    }
+    let (id, event) = build(
+        instance,
+        room,
+        "m.room.member",
+        Some(target),
+        sender,
+        json!({"membership": "invite"}),
+    )
+    .await?;
+    let s = instance.store.as_ref();
+    let mut stripped = Vec::new();
+    for kind in ["m.room.create", "m.room.join_rules", "m.room.name"] {
+        if let Some(sid) = state_id(s, &room.id, kind, "").await {
+            if let Some(r) = s
+                .query(
+                    "SELECT pdu FROM chat_pdus WHERE event_id = $1",
+                    &[sid.as_str().into()],
+                )
+                .await
+                .map_err(|e| e.to_string())?
+                .first()
+            {
+                let ev: Value =
+                    serde_json::from_str(r.text(0).unwrap_or("null")).unwrap_or(Value::Null);
+                stripped.push(json!({"type": ev["type"], "state_key": ev["state_key"], "sender": ev["sender"], "content": ev["content"]}));
+            }
+        }
+    }
+    let path = format!(
+        "/_matrix/federation/v2/invite/{}/{}",
+        enc(&room.room_id),
+        enc(&id)
+    );
+    let answer = super::client::put_json(instance, &server, &path, &json!({"event": event, "room_version": matrix::ROOM_VERSION, "invite_room_state": stripped})).await?;
+    let signed = answer["event"].clone();
+    if matrix::event_id(&signed) != id
+        || !super::keys::check_event_from(instance, &signed, &server).await
+    {
+        return Err("the invitation came back changed or unsigned".into());
+    }
+    store(instance, &room.id, &id, &signed).await?;
+    let mut tx = s.begin().await.map_err(|e| e.to_string())?;
+    store::set_member(tx.as_mut(), &room.id, target, None, "invite", "member")
+        .await
+        .map_err(|e| e.to_string())?;
+    tx.commit().await.map_err(|e| e.to_string())?;
+    queue(instance, &room.id, &id).await
+}
+
+/// Percent-encodes a path segment.
+pub fn enc(part: &str) -> String {
+    part.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
 }

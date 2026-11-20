@@ -191,6 +191,9 @@ async fn make_join(instance: &Instance, room_id: &str, user_id: &str, origin: &s
         Ok(r) => r,
         Err(r) => return r,
     };
+    if !may_join(instance, &room, user_id).await {
+        return forbidden("Only invited people join this room.");
+    }
     let s = instance.store.as_ref();
     let auth = rooms::auth_for(
         s,
@@ -231,6 +234,15 @@ async fn send_join(
         Ok(r) => r,
         Err(r) => return r,
     };
+    if !may_join(
+        instance,
+        &room,
+        event["sender"].as_str().unwrap_or_default(),
+    )
+    .await
+    {
+        return forbidden("Only invited people join this room.");
+    }
     let sender = event["sender"].as_str().unwrap_or_default().to_string();
     let good = event["type"] == "m.room.member"
         && event["content"]["membership"] == "join"
@@ -250,6 +262,14 @@ async fn send_join(
         );
     }
     joined(instance, &room, &sender, "join").await;
+    ortus_core::auth::audit(
+        instance,
+        ortus_core::audit::Event::new("chat.partner_joined", ortus_core::audit::Outcome::Done)
+            .by(&sender)
+            .on(&room.id)
+            .with(json!({"server": origin})),
+    )
+    .await;
     let _ = rooms::queue(instance, &room.id, event_id).await;
     let (state, chain) = rooms::state_and_chain(instance, &room.id)
         .await
@@ -546,4 +566,15 @@ async fn profile(instance: &Instance, uri: &str) -> Response {
         Ok(Some(u)) => ok(&json!({"displayname": u.name})),
         _ => not_found(),
     }
+}
+
+/// A channel is open to partners' people; a private channel only to
+/// those invited.
+async fn may_join(instance: &Instance, room: &Room, user: &str) -> bool {
+    room.kind == "channel"
+        || store::members(instance.store.as_ref(), &room.id)
+            .await
+            .unwrap_or_default()
+            .iter()
+            .any(|(m, _, state, _)| m == user && (state == "invite" || state == "join"))
 }

@@ -330,10 +330,22 @@ async fn change_room(
     let s = instance.store.as_ref();
     let server = store::server_name(instance);
     let mut invited = Vec::new();
+    // People of partner servers, by their Matrix ids ("@bob:partner.example").
+    let mut outside = Vec::new();
     for e in &input.invite {
-        invited.push(colleague(instance, e).await?);
+        let e = e.trim();
+        if e.starts_with('@') && e.rsplit_once(':').is_some_and(|(_, host)| host != server) {
+            outside.push(e.to_ascii_lowercase());
+        } else {
+            invited.push(colleague(instance, e).await?);
+        }
     }
-    if store::members(s, &room.id).await?.len() + invited.len() > store::MAX_MEMBERS as usize {
+    if !outside.is_empty() && !room.federated {
+        return Err(ApiError::bad_request("Share the room with partners first."));
+    }
+    if store::members(s, &room.id).await?.len() + invited.len() + outside.len()
+        > store::MAX_MEMBERS as usize
+    {
         return Err(ApiError::bad_request("Too many people."));
     }
     let mut tx = s.begin().await?;
@@ -376,6 +388,30 @@ async fn change_room(
         }
     }
     tx.commit().await?;
+    for target in &outside {
+        if let Err(e) = crate::federation::rooms::invite_remote(
+            instance,
+            &room,
+            &store::mxid(&me.id, &server),
+            target,
+        )
+        .await
+        {
+            return Err(ApiError {
+                status: 409,
+                code: "invite_refused",
+                message: format!("{target} could not be invited: {e}"),
+            });
+        }
+        ortus_core::auth::audit(
+            instance,
+            ortus_core::audit::Event::new("chat.partner_invited", ortus_core::audit::Outcome::Done)
+                .by(&me.id)
+                .on(&room.id)
+                .with(json!({"who": target})),
+        )
+        .await;
+    }
     get_room_of(instance, &me, &room.id).await
 }
 

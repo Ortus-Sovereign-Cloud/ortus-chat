@@ -1,4 +1,14 @@
+import { execSync } from "node:child_process";
+import { existsSync, mkdirSync } from "node:fs";
 import { defineConfig } from "@playwright/test";
+
+// A throwaway certificate, so the program federates (Matrix) and the
+// screens offer sharing with partners; nothing connects to it.
+const federation = "test-results/federation";
+if (!existsSync(`${federation}/cert.pem`)) {
+  mkdirSync(federation, { recursive: true });
+  execSync(`openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj /CN=localhost -keyout ${federation}/key.pem -out ${federation}/cert.pem`, { stdio: "ignore" });
+}
 
 // The tests drive a real program with the core and this crate's apps
 // (examples/dev.rs), on SQLite in a throwaway directory.
@@ -21,6 +31,9 @@ export default defineConfig({
         ORTUS_ROLES: "web,worker",
         ORTUS_WEB_PORT: String(port),
         ORTUS_DATA_DIR: "test-results/data",
+        ORTUS_FEDERATION_TLS_CERT: `${federation}/cert.pem`,
+        ORTUS_FEDERATION_TLS_KEY: `${federation}/key.pem`,
+        ORTUS_FEDERATION_LISTEN: "127.0.0.1:0",
         ORTUS_SETUP_TOKEN: "e2e-setup-token",
         ORTUS_PUBLIC_URL: `http://localhost:${port}`,
       },

@@ -15,6 +15,7 @@ interface RoomItem {
   lastSeq: number;
   encrypted: boolean;
   federated: boolean;
+  roomId?: string;
   with?: string[];
 }
 
@@ -177,6 +178,9 @@ export class OrtusChatMain extends LitElement {
         grid-template-rows: auto minmax(0, 1fr) auto;
         min-inline-size: 0;
       }
+      main.inviting {
+        grid-template-rows: auto auto minmax(0, 1fr) auto;
+      }
       main > header {
         display: flex;
         align-items: center;
@@ -200,6 +204,34 @@ export class OrtusChatMain extends LitElement {
       }
       .muted {
         color: var(--ortus-text-3);
+        font-size: 14px;
+      }
+      .shared {
+        color: var(--ortus-teal);
+        font-size: 14px;
+      }
+      .shared code {
+        font-family: var(--ortus-mono, monospace);
+        font-size: 12px;
+        color: var(--ortus-text-3);
+        user-select: all;
+      }
+      main > header .button:first-of-type {
+        margin-inline-start: auto;
+      }
+      form.invite {
+        display: flex;
+        align-items: end;
+        flex-wrap: wrap;
+        gap: 12px;
+        padding-block: 12px;
+        padding-inline: 28px;
+        border-block-end: 1px solid var(--ortus-line);
+      }
+      form.invite label {
+        display: grid;
+        gap: 4px;
+        flex: 1;
         font-size: 14px;
       }
       .e2e {
@@ -520,6 +552,9 @@ export class OrtusChatMain extends LitElement {
   @state() private taskMade = "";
   @state() private files: { id: string; name: string; mime: string; kind?: string }[] | null = null;
   @state() private tasksInstalled = false;
+  /** Whether this installation federates (Matrix). */
+  @state() private federation = false;
+  @state() private inviting = false;
   private events: EventSource | null = null;
   private lastTyping = 0;
 
@@ -553,6 +588,9 @@ export class OrtusChatMain extends LitElement {
     const p = new URLSearchParams(location.search);
     const room = p.get("room") ?? this.rooms.find((r) => r.state === "join")?.id ?? null;
     if (room) await this.open(room, p.get("thread") ?? undefined);
+    call<{ federation?: boolean }>("GET", "/chat/policy")
+      .then((r) => (this.federation = !!r.federation))
+      .catch(() => undefined);
     call<{ apps: { id: string }[] }>("GET", "/apps")
       .then((r) => (this.tasksInstalled = r.apps.some((a) => a.id === "tasks")))
       .catch(() => undefined);
@@ -804,6 +842,35 @@ export class OrtusChatMain extends LitElement {
     this.directory = (await call<{ rooms: RoomItem[] }>("GET", "/chat/directory")).rooms;
   }
 
+  private isOwner(): boolean {
+    return this.members.some((m) => m.id === this.me && m.role === "owner");
+  }
+
+  private async share(id: string): Promise<void> {
+    this.error = "";
+    try {
+      await call("POST", `/chat/rooms/${encodeURIComponent(id)}/share`);
+      await this.loadRooms();
+    } catch (e) {
+      this.error = (e as Error).message;
+    }
+  }
+
+  private async invite(e: Event, id: string): Promise<void> {
+    e.preventDefault();
+    const field = (e.target as HTMLFormElement).elements.namedItem("people") as HTMLInputElement;
+    const people = field.value.split(",").map((a) => a.trim()).filter(Boolean);
+    if (!people.length) return;
+    this.error = "";
+    try {
+      await call("PATCH", `/chat/rooms/${encodeURIComponent(id)}`, { invite: people });
+      this.inviting = false;
+      await this.open(id);
+    } catch (err) {
+      this.error = (err as Error).message;
+    }
+  }
+
   private async join(id: string): Promise<void> {
     await call("POST", `/chat/rooms/${encodeURIComponent(id)}/join`);
     this.directory = null;
@@ -966,14 +1033,29 @@ export class OrtusChatMain extends LitElement {
         ${directs.map(roomItem)}
         <button class="room" @click=${() => (this.creating = "direct")}><span class="hash">+</span>${t(this.localize, "newDirect")}</button>
       </aside>
-      <main>
+      <main class=${this.inviting && room && room.kind !== "direct" ? "inviting" : ""}>
         ${room
           ? html`<header>
                 <h1>${room.kind === "direct" ? this.roomName(room) : `# ${room.name}`}</h1>
                 ${room.label ? html`<span class="label">${room.label.toUpperCase()}</span>` : nothing}
                 <span class="muted">${t(this.localize, "members", { count: this.members.filter((m) => m.state === "join").length })}</span>
                 ${room.encrypted ? html`<span class="e2e">🔒 ${t(this.localize, "endToEnd")}</span>` : nothing}
+                ${room.federated
+                  ? html`<span class="shared">${t(this.localize, "sharedWithPartners")} <code>${room.roomId ?? ""}</code></span>`
+                  : this.federation && room.kind !== "direct" && !room.encrypted && this.isOwner()
+                    ? html`<button class="button" @click=${() => this.share(room.id)}>${t(this.localize, "shareWithPartners")}</button>`
+                    : nothing}
+                ${room.kind !== "direct" && room.state === "join"
+                  ? html`<button class="button" @click=${() => (this.inviting = !this.inviting)}>${t(this.localize, "inviteButton")}</button>`
+                  : nothing}
               </header>
+              ${this.inviting && room.kind !== "direct"
+                ? html`<form class="invite" @submit=${(e: Event) => this.invite(e, room.id)}>
+                    <label>${t(this.localize, "invite")}<input class="input" name="people" required placeholder=${room.federated ? t(this.localize, "addressesOrPartners") : t(this.localize, "addresses")} /></label>
+                    <button class="button primary">${t(this.localize, "inviteButton")}</button>
+                    ${this.error ? html`<p class="error" role="alert">${this.error}</p>` : nothing}
+                  </form>`
+                : nothing}
               <section class="feed" aria-label=${t(this.localize, "messages")}>
                 ${room.state === "invite"
                   ? html`<div class="empty"><p>${t(this.localize, "youAreInvited")}</p><button class="button primary" @click=${() => this.join(room.id)}>${t(this.localize, "join")}</button></div>`

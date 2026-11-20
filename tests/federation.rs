@@ -300,7 +300,80 @@ fn a_partner_joins_a_shared_room_and_messages_travel_both_ways() {
                 .contains(&format!("Hello from Ortus {name}"))
         });
 
+        // A private channel: only invited people join.
+        let (_, private) = call(
+            &client,
+            &olena,
+            "POST",
+            "/chat/rooms",
+            Some(json!({"kind": "private", "name": format!("Private {name}")})),
+        );
+        let private_id = private["id"].as_str().unwrap().to_string();
+        let (status, _) = call(
+            &client,
+            &olena,
+            "POST",
+            &format!("/chat/rooms/{private_id}/share"),
+            None,
+        );
+        assert_eq!(200, status, "{name}");
+        let private_room = ortus_core::runtime::block_on(ortus_chat::store::room(
+            instance.store.as_ref(),
+            &private_id,
+        ))
+        .unwrap()
+        .unwrap()
+        .room_id;
+        let private_join = format!(
+            "/_matrix/client/v3/join/{}?server_name={server}",
+            enc(&private_room)
+        );
+        let (status, refused) = peer("POST", &private_join, Some(&bob_token), Some(json!({})));
+        assert!(
+            status >= 400,
+            "{name}: joined a private channel uninvited: {refused}"
+        );
+        let (status, invited) = call(
+            &client,
+            &olena,
+            "PATCH",
+            &format!("/chat/rooms/{private_id}"),
+            Some(json!({"invite": [bob]})),
+        );
+        assert_eq!(200, status, "{name}: {invited}");
+        wait_for("the invitation at the peer", || {
+            let (_, sync) = peer(
+                "GET",
+                "/_matrix/client/v3/sync?timeout=0",
+                Some(&bob_token),
+                None,
+            );
+            sync["rooms"]["invite"].get(&private_room).is_some()
+        });
+        let (status, joined) = peer("POST", &private_join, Some(&bob_token), Some(json!({})));
+        assert_eq!(200, status, "{name}: {joined}");
+        wait_for("the invited member in Ortus", || {
+            let members = ortus_core::runtime::block_on(ortus_chat::store::members(
+                instance.store.as_ref(),
+                &private_id,
+            ))
+            .unwrap();
+            members
+                .iter()
+                .any(|(m, _, state, _)| *m == bob && state == "join")
+        });
+        let audited = ortus_core::runtime::block_on(instance.store.query(
+            "SELECT COUNT(*) FROM core_audit WHERE action = $1",
+            &["chat.partner_joined".into()],
+        ))
+        .unwrap();
+        assert!(
+            audited[0].int(0).unwrap_or(0) >= 2,
+            "{name}: partner joins are audited"
+        );
+
         // Relabelled SECRET: nothing more goes to the partner.
+        ortus_core::runtime::block_on(ortus_chat::federation::rooms::drain(&instance)).unwrap();
         ortus_core::runtime::block_on(instance.store.execute(
             "UPDATE chat_rooms SET label = 'secret' WHERE id = $1",
             &[id.as_str().into()],
