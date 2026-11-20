@@ -31,6 +31,7 @@ const messages: Record<ChatKey, ChatMessage> = {
   shareWithPartners: "Partager avec les partenaires",
   inviteButton: "Inviter",
   callButton: "Appel",
+  alert: "Alerte",
   joinCall: "Rejoindre l'appel ({count})",
   addressesOrPartners: "Adresses, ou identifiants Matrix des partenaires (@nom:serveur)",
   messages: "Messages",

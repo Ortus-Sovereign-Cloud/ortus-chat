@@ -52,6 +52,8 @@ interface Message {
   sealed?: Sealed | null;
   /** A sealed message this device cannot open. */
   locked?: boolean;
+  /** Posted by an incoming hook (an alert source). */
+  hook?: { name: string; alert: boolean } | null;
 }
 
 const TONES = ["#a5b4ff", "#f9b77a", "#6ee0d0", "#d4f27a", "#ffa39a", "#eceef3"];
@@ -210,6 +212,16 @@ export class OrtusChatMain extends LitElement {
       .muted {
         color: var(--ortus-text-3);
         font-size: 14px;
+      }
+      .alert-chip {
+        padding-block: 2px;
+        padding-inline: 8px;
+        margin-inline-end: 6px;
+        border-radius: 6px;
+        font-size: 12px;
+        font-weight: 600;
+        background: rgb(255 122 110 / 0.15);
+        color: #ff9a92;
       }
       .shared {
         color: var(--ortus-teal);
@@ -1026,6 +1038,7 @@ export class OrtusChatMain extends LitElement {
   private body(m: Message): TemplateResult {
     if (m.deleted) return html`<p class="gone">${t(this.localize, "deleted")}</p>`;
     if (m.locked) return html`<p class="gone">🔒 ${t(this.localize, "cannotRead")}</p>`;
+    if (m.hook?.alert) return html`<p><span class="alert-chip">${t(this.localize, "alert")}</span> ${m.text}</p>`;
     // @Name of a mentioned person stands out.
     const names = (m.mentions ?? []).map((id) => `@${this.name(id).split(" ")[0]}`);
     const parts = names.length ? m.text.split(new RegExp(`(${names.map((n) => n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})`)) : [m.text];

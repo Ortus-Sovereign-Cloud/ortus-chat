@@ -6,6 +6,7 @@
 pub mod api;
 pub mod e2e;
 pub mod federation;
+pub mod hooks;
 pub mod index;
 pub mod live;
 pub mod matrix;
@@ -32,6 +33,7 @@ static MIGRATIONS: std::sync::LazyLock<Vec<Migration>> = std::sync::LazyLock::ne
     all.extend_from_slice(federation::MIGRATIONS);
     all.extend_from_slice(e2e::MIGRATIONS);
     all.extend_from_slice(index::MIGRATIONS);
+    all.extend_from_slice(hooks::MIGRATIONS);
     all
 });
 
@@ -60,6 +62,7 @@ impl App for Chat {
         all.extend(live::routes());
         all.extend(policy::routes());
         all.extend(e2e::routes());
+        all.extend(hooks::routes());
         all
     }
 

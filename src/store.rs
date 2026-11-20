@@ -480,6 +480,7 @@ pub fn event_json(
         "decision": e.decision,
         "file": if e.deleted_at.is_some() { Json::Null } else { e.content["ortus.file"].clone() },
         "sealed": if e.deleted_at.is_some() { Json::Null } else { e.content["ortus.sealed"].clone() },
+        "hook": e.content["ortus.hook"].clone(),
         "replies": threads.map(|t| t.0), "lastReply": threads.map(|t| t.1),
         "reactions": reactions.iter().map(|(k, who)| json!({"key": k, "who": who})).collect::<Vec<_>>(),
     })

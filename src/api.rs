@@ -70,6 +70,13 @@ pub(crate) async fn people(instance: &Instance, ids: impl IntoIterator<Item = St
                 .map(|u| json!({"name": u.name, "email": u.email, "local": true})),
             None => None,
         };
+        // A hook's messages show its name.
+        let found = match found {
+            Some(f) => Some(f),
+            None => crate::hooks::name_of(instance, &id)
+                .await
+                .map(|name| json!({"name": name, "local": true, "hook": true})),
+        };
         out.insert(
             id.clone(),
             found.unwrap_or_else(|| json!({"name": id, "local": false})),
@@ -706,9 +713,11 @@ pub(crate) async fn send(
     }
     let server = store::server_name(instance);
     let mut mentioned = Vec::new();
+    let mut to_tell = Vec::new();
     for m in mentions.iter().take(50) {
         if let Ok(u) = colleague(instance, m).await {
             mentioned.push(store::mxid(&u.id, &server));
+            to_tell.push(u.id);
         }
     }
     let sender = store::mxid(&me.id, &server);
@@ -750,6 +759,31 @@ pub(crate) async fn send(
     )
     .await?;
     tx.commit().await?;
+    // The people mentioned hear of it (if they are in the room).
+    let members = store::members(s, &room.id).await.unwrap_or_default();
+    for user in to_tell.iter().filter(|u| **u != me.id) {
+        if !members
+            .iter()
+            .any(|(_, u, st, _)| u.as_deref() == Some(user.as_str()) && st == "join")
+        {
+            continue;
+        }
+        let place = if room.kind == "direct" {
+            me.name.clone()
+        } else {
+            format!("#{}", room.name)
+        };
+        let notice = ortus_core::notify::Notice {
+            app: "chat",
+            kind: ortus_core::notify::Kind::Mention,
+            title: &format!("{} mentioned you in {place}", me.name),
+            detail: "",
+            path: &format!("/chat?room={}&message={event_id}", room.id),
+            key: Some("mention"),
+            args: json!({"who": me.name, "where": place}),
+        };
+        let _ = ortus_core::notify::add(s, user, &notice).await;
+    }
     crate::index::message(instance, room, &event_id).await;
     if let Some((id, pdu)) = &federated {
         let _ = crate::federation::rooms::store(instance, &room.id, id, pdu).await;

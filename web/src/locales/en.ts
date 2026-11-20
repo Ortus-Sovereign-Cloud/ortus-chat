@@ -32,6 +32,7 @@ const en = {
   shareWithPartners: "Share with partners",
   inviteButton: "Invite",
   callButton: "Call",
+  alert: "Alert",
   joinCall: "Join the call ({count})",
   addressesOrPartners: "Addresses, or partners' Matrix ids (@name:server)",
   messages: "Messages",
