@@ -30,6 +30,8 @@ const messages: Record<ChatKey, ChatMessage> = {
   sharedWithPartners: "Udostępniony partnerom",
   shareWithPartners: "Udostępnij partnerom",
   inviteButton: "Zaproś",
+  callButton: "Rozmowa",
+  joinCall: "Dołącz do rozmowy ({count})",
   addressesOrPartners: "Adresy lub identyfikatory Matrix partnerów (@nazwa:serwer)",
   messages: "Wiadomości",
   youAreInvited: "Zaproszono Cię do tego pokoju.",

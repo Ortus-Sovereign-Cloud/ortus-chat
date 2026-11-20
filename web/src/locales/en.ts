@@ -31,6 +31,8 @@ const en = {
   sharedWithPartners: "Shared with partners",
   shareWithPartners: "Share with partners",
   inviteButton: "Invite",
+  callButton: "Call",
+  joinCall: "Join the call ({count})",
   addressesOrPartners: "Addresses, or partners' Matrix ids (@name:server)",
   messages: "Messages",
   youAreInvited: "You are invited to this room.",

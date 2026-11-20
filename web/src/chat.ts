@@ -221,6 +221,11 @@ export class OrtusChatMain extends LitElement {
         color: var(--ortus-text-3);
         user-select: all;
       }
+      main > header a.button {
+        text-decoration: none;
+        display: inline-flex;
+        align-items: center;
+      }
       main > header .button:first-of-type {
         margin-inline-start: auto;
       }
@@ -560,6 +565,9 @@ export class OrtusChatMain extends LitElement {
   /** Whether this installation federates (Matrix). */
   @state() private federation = false;
   @state() private inviting = false;
+  /** Whether calls are installed, and how many are in the open room's call. */
+  @state() private callsInstalled = false;
+  @state() private inCall = 0;
   /** End-to-end rooms on this browser. */
   private sealer: Sealer | null = null;
   private events: EventSource | null = null;
@@ -603,7 +611,11 @@ export class OrtusChatMain extends LitElement {
       })
       .catch(() => undefined);
     call<{ apps: { id: string }[] }>("GET", "/apps")
-      .then((r) => (this.tasksInstalled = r.apps.some((a) => a.id === "tasks")))
+      .then((r) => {
+        this.tasksInstalled = r.apps.some((a) => a.id === "tasks");
+        this.callsInstalled = r.apps.some((a) => a.id === "calls");
+        if (this.callsInstalled && this.current) void this.loadCall(this.current);
+      })
       .catch(() => undefined);
     this.listen();
   }
@@ -664,9 +676,18 @@ export class OrtusChatMain extends LitElement {
         // A new member's devices get the room key; a key may have come.
         if (this.room()?.encrypted) await this.syncKeys(m.room);
       }
+    } else if (m.kind === "ortus.call") {
+      // A call started or ended in this room.
+      await this.loadCall(m.room);
     } else if (m.about) {
       await this.refresh(m.about);
     }
+  }
+
+  private async loadCall(room: string): Promise<void> {
+    if (!this.callsInstalled) return;
+    const r = await call<{ call: { sessions: unknown[] } | null }>("GET", `/calls/rooms/${encodeURIComponent(room)}`).catch(() => null);
+    if (room === this.current) this.inCall = r?.call?.sessions.length ?? 0;
   }
 
   /** Loads of a room's messages: only the newest is shown. */
@@ -732,6 +753,8 @@ export class OrtusChatMain extends LitElement {
   private async open(id: string, thread?: string): Promise<void> {
     this.error = "";
     this.current = id;
+    this.inCall = 0;
+    void this.loadCall(id);
     this.thread = null;
     const url = new URL(location.href);
     url.searchParams.set("room", id);
@@ -1123,6 +1146,9 @@ export class OrtusChatMain extends LitElement {
                   : this.federation && room.kind !== "direct" && !room.encrypted && this.isOwner()
                     ? html`<button class="button" @click=${() => this.share(room.id)}>${t(this.localize, "shareWithPartners")}</button>`
                     : nothing}
+                ${this.callsInstalled && room.state === "join" && !room.encrypted
+                  ? html`<a class="button ${this.inCall ? "primary" : ""}" href=${`/calls?room=${encodeURIComponent(room.id)}`}>${this.inCall ? t(this.localize, "joinCall", { count: this.inCall }) : t(this.localize, "callButton")}</a>`
+                  : nothing}
                 ${room.kind !== "direct" && room.state === "join"
                   ? html`<button class="button" @click=${() => (this.inviting = !this.inviting)}>${t(this.localize, "inviteButton")}</button>`
                   : nothing}
