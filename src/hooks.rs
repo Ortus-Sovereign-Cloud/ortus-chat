@@ -42,8 +42,19 @@ pub fn sender(id: &str, server: &str) -> String {
     format!("@hook-{id}:{server}")
 }
 
-/// A hook's name, by its sender id (for the screens).
+/// Whether a sender id is one of this server's hooks (a partner's
+/// "@hook-…" is not).
+pub fn is_local_hook(instance: &Instance, mx: &str) -> bool {
+    mx.strip_prefix("@hook-")
+        .and_then(|rest| rest.split_once(':'))
+        .is_some_and(|(_, server)| server == store::server_name(instance))
+}
+
+/// A hook's name, by its sender id (for the screens); only this server's.
 pub async fn name_of(instance: &Instance, mx: &str) -> Option<String> {
+    if !is_local_hook(instance, mx) {
+        return None;
+    }
     let id = mx.strip_prefix("@hook-")?.split_once(':')?.0;
     instance
         .store

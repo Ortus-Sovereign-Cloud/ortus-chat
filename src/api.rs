@@ -716,6 +716,10 @@ pub(crate) async fn send(
     let mut to_tell = Vec::new();
     for m in mentions.iter().take(50) {
         if let Ok(u) = colleague(instance, m).await {
+            // Each person once, however often named.
+            if to_tell.contains(&u.id) {
+                continue;
+            }
             mentioned.push(store::mxid(&u.id, &server));
             to_tell.push(u.id);
         }
