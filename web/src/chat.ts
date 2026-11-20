@@ -589,6 +589,7 @@ export class OrtusChatMain extends LitElement {
       await this.loadRooms();
       return;
     }
+    this.shown = Math.max(this.shown, m.seq);
     if (m.kind === "m.room.message") {
       const one = await call<Message>("GET", `/chat/messages/${encodeURIComponent(m.id)}`).catch(() => null);
       if (!one) return;
@@ -610,19 +611,21 @@ export class OrtusChatMain extends LitElement {
     }
   }
 
+  /** The room's last event this screen has taken in. */
+  private shown = 0;
+
   private async poll(): Promise<void> {
-    if (!this.isConnected || document.hidden) return;
-    const before = new Map(this.rooms.map((r) => [r.id, r.lastSeq]));
-    const shown = this.room()?.lastSeq ?? 0;
+    if (!this.isConnected) return;
     await this.loadRooms().catch(() => undefined);
     const now = this.room()?.lastSeq ?? 0;
-    if (this.current && now > shown && now > (before.get(this.current) ?? 0)) await this.catchUp();
+    if (this.current && now > this.shown) await this.catchUp();
   }
 
   private async catchUp(): Promise<void> {
     await this.loadRooms();
     const room = this.current;
     if (!room) return;
+    this.shown = Math.max(this.shown, this.room()?.lastSeq ?? 0);
     const list = await call<{ messages: Message[]; people: Record<string, Person> }>("GET", `/chat/rooms/${encodeURIComponent(room)}/messages`).catch(() => null);
     if (list && room === this.current) {
       this.people = { ...this.people, ...list.people };
@@ -666,6 +669,7 @@ export class OrtusChatMain extends LitElement {
     this.members = info.members;
     this.people = { ...this.people, ...info.people, ...list.people };
     this.messages = list.messages;
+    this.shown = this.room()?.lastSeq ?? 0;
     if (thread) await this.openThread(thread);
     const last = this.room()?.lastSeq;
     if (last) this.markRead(last);
