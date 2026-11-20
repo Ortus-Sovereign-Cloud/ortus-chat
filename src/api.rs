@@ -30,6 +30,12 @@ pub(crate) fn clean(text: &str, max: usize) -> String {
         .collect()
 }
 
+/// A message's id from the path (event ids start with `$`, which
+/// clients write as %24).
+pub(crate) fn message_param(params: &PathParams) -> String {
+    ortus_core::form::decode(params.get("message").unwrap_or_default())
+}
+
 pub(crate) fn query(request: &Request, name: &str) -> Option<String> {
     let q = request.request_uri.split_once('?')?.1;
     q.split('&').find_map(|p| {
@@ -404,6 +410,14 @@ async fn join(
     )
     .await?;
     tx.commit().await?;
+    notice(
+        instance,
+        id,
+        "m.room.member",
+        &store::mxid(&me.id, &server),
+        &me.id,
+    )
+    .await?;
     get_room_of(instance, &me, id).await
 }
 
@@ -425,6 +439,14 @@ async fn leave(
     )
     .await?;
     tx.commit().await?;
+    notice(
+        instance,
+        id,
+        "m.room.member",
+        &store::mxid(&me.id, &store::server_name(instance)),
+        &me.id,
+    )
+    .await?;
     Ok(ok(&json!({ "left": id })))
 }
 
@@ -467,7 +489,7 @@ async fn message(
 ) -> Result<Response, ApiError> {
     let me = signed(request, instance).await?;
     let s = instance.store.as_ref();
-    let e = store::event(s, params.get("message").unwrap_or_default())
+    let e = store::event(s, &message_param(params))
         .await?
         .filter(|e| e.kind == "m.room.message")
         .ok_or_else(|| ApiError::not_found("There is no such message."))?;
@@ -524,6 +546,11 @@ struct Say {
     /// Addresses of people mentioned.
     #[serde(default)]
     mentions: Vec<String>,
+    /// The message records the thread's decision.
+    #[serde(default)]
+    decision: bool,
+    /// A Drive file the message points to (by its id).
+    file: Option<String>,
 }
 
 /// Sends a message as a person; also used by other apps (the Chat service).
@@ -610,15 +637,78 @@ async fn say(
             "This room is end-to-end encrypted: send through its encrypted route.",
         ));
     }
-    let v = send(
+    if input.decision && input.thread.is_none() {
+        return Err(ApiError::bad_request("A decision is recorded in a thread."));
+    }
+    // A Drive file goes as a link the sender can open (the drive decides
+    // who else may).
+    let file = match input.file.as_deref() {
+        Some(id) => {
+            let drive = instance
+                .services
+                .get::<dyn ortus_core::interfaces::Drive>(&instance.switches)
+                .await
+                .map_err(|_| ApiError::not_installed("drive"))?;
+            let item = drive
+                .describe(&me.id, id)
+                .await
+                .map_err(|_| ApiError::internal())?
+                .ok_or_else(|| ApiError::not_found("There is no such file."))?;
+            Some(json!({"id": item.id, "name": item.name, "mime": item.mime}))
+        }
+        None => None,
+    };
+    let text = if input.text.trim().is_empty() {
+        file.as_ref()
+            .map(|f| f["name"].as_str().unwrap_or_default().to_string())
+            .unwrap_or_default()
+    } else {
+        input.text.clone()
+    };
+    let mut v = send(
         instance,
         &me,
         &room,
-        &input.text,
+        &text,
         input.thread.as_deref(),
         &input.mentions,
     )
     .await?;
+    if let Some(f) = file {
+        let id = v["id"].as_str().unwrap_or_default().to_string();
+        let s = instance.store.as_ref();
+        if let Some(e) = store::event(s, &id).await? {
+            let mut content = e.content.clone();
+            content["ortus.file"] = f.clone();
+            s.execute(
+                "UPDATE chat_events SET content = $1 WHERE event_id = $2",
+                &[content.to_string().into(), id.as_str().into()],
+            )
+            .await?;
+        }
+        v["file"] = f;
+    }
+    if input.decision {
+        // Recorded: who and when, audited, and found in search.
+        let id = v["id"].as_str().unwrap_or_default().to_string();
+        let at = now();
+        instance
+            .store
+            .execute(
+                "UPDATE chat_events SET decision = $1 WHERE event_id = $2",
+                &[at.into(), id.as_str().into()],
+            )
+            .await?;
+        ortus_core::auth::audit(
+            instance,
+            ortus_core::audit::Event::new("chat.decision_recorded", ortus_core::audit::Outcome::Done)
+                .by(&me.id)
+                .on(&room.id)
+                .with(json!({"message": id, "thread": input.thread, "text": input.text.chars().take(300).collect::<String>()})),
+        )
+        .await;
+        v["decision"] = json!(at);
+    }
     Ok(ok(&v))
 }
 
@@ -649,7 +739,7 @@ async fn edit(
     instance: &Arc<Instance>,
 ) -> Result<Response, ApiError> {
     let me = signed(request, instance).await?;
-    let e = own_message(instance, &me, params.get("message").unwrap_or_default()).await?;
+    let e = own_message(instance, &me, &message_param(params)).await?;
     let input: Edit = body(request)?;
     let text = clean(&input.text, store::MAX_TEXT);
     if text.is_empty() {
@@ -687,7 +777,7 @@ async fn delete(
     instance: &Arc<Instance>,
 ) -> Result<Response, ApiError> {
     let me = signed(request, instance).await?;
-    let e = own_message(instance, &me, params.get("message").unwrap_or_default()).await?;
+    let e = own_message(instance, &me, &message_param(params)).await?;
     let s = instance.store.as_ref();
     let mut tx = s.begin().await?;
     tx.execute(
@@ -718,7 +808,7 @@ async fn react(
 ) -> Result<Response, ApiError> {
     let me = signed(request, instance).await?;
     let s = instance.store.as_ref();
-    let e = store::event(s, params.get("message").unwrap_or_default())
+    let e = store::event(s, &message_param(params))
         .await?
         .ok_or_else(|| ApiError::not_found("There is no such message."))?;
     joined(instance, &me.id, &e.room).await?;
@@ -886,7 +976,7 @@ pub fn routes() -> Vec<Route> {
         route(Method::Post, "/chat/rooms/:room/join", "chatJoin", "Joins a channel, or accepts an invitation.", h_join),
         route(Method::Post, "/chat/rooms/:room/leave", "chatLeave", "Leaves a room.", h_leave),
         route(Method::Get, "/chat/rooms/:room/messages", "chatMessages", "A page of messages (?before=seq), or one thread's (?thread=event).", h_messages),
-        route(Method::Post, "/chat/rooms/:room/messages", "chatSend", "Sends a message: {text, thread, mentions: [address]}.", h_say),
+        route(Method::Post, "/chat/rooms/:room/messages", "chatSend", "Sends a message: {text, thread, mentions: [address], decision (records the thread's decision)}.", h_say),
         route(Method::Get, "/chat/messages/:message", "chatMessage", "One message with its reactions and replies.", h_message),
         route(Method::Patch, "/chat/messages/:message", "chatEdit", "Edits one's message: {text}.", h_edit),
         route(Method::Delete, "/chat/messages/:message", "chatDelete", "Deletes one's message.", h_delete),

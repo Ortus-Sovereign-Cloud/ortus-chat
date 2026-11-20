@@ -457,6 +457,7 @@ pub fn event_json(
         "mentions": e.content["m.mentions"]["user_ids"],
         "at": e.origin_ts, "editedAt": e.edited_at, "deleted": e.deleted_at.is_some(),
         "decision": e.decision,
+        "file": if e.deleted_at.is_some() { Json::Null } else { e.content["ortus.file"].clone() },
         "replies": threads.map(|t| t.0), "lastReply": threads.map(|t| t.1),
         "reactions": reactions.iter().map(|(k, who)| json!({"key": k, "who": who})).collect::<Vec<_>>(),
     })
