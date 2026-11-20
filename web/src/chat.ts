@@ -543,6 +543,8 @@ export class OrtusChatMain extends LitElement {
       if (this.isConnected) return;
       this.events?.close();
       this.events = null;
+      window.clearInterval(this.poller);
+      this.poller = 0;
     }, 0);
   }
 
@@ -557,7 +559,14 @@ export class OrtusChatMain extends LitElement {
     this.listen();
   }
 
+  private poller = 0;
+
   private listen(): void {
+    // Besides the stream, a look every few seconds: nothing is missed
+    // even when a proxy or a network holds the stream back.
+    if (!this.poller) {
+      this.poller = window.setInterval(() => void this.poll(), 4000);
+    }
     if (!this.isConnected || this.events) return;
     this.events = new EventSource("/api/v1/chat/events");
     // After a break the stream starts afresh: read again what may have
@@ -599,6 +608,15 @@ export class OrtusChatMain extends LitElement {
     } else if (m.about) {
       await this.refresh(m.about);
     }
+  }
+
+  private async poll(): Promise<void> {
+    if (!this.isConnected || document.hidden) return;
+    const before = new Map(this.rooms.map((r) => [r.id, r.lastSeq]));
+    const shown = this.room()?.lastSeq ?? 0;
+    await this.loadRooms().catch(() => undefined);
+    const now = this.room()?.lastSeq ?? 0;
+    if (this.current && now > shown && now > (before.get(this.current) ?? 0)) await this.catchUp();
   }
 
   private async catchUp(): Promise<void> {

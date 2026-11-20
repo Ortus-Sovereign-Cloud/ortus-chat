@@ -75,7 +75,15 @@ fn events(request: &Request, instance: Arc<Instance>, user: String) -> Response 
         let mut pinged = started;
         loop {
             let s = instance.store.as_ref();
-            let Ok(rooms) = store::rooms_of(s, &user).await else { return };
+            let rooms = match store::rooms_of(s, &user).await {
+                Ok(r) => r,
+                Err(e) => {
+                    // A busy moment of the database: try again shortly.
+                    eprintln!("chat: events of {user}: {e}");
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    continue;
+                }
+            };
             for (room, state, _) in &rooms {
                 let was = known.get(&room.id).copied();
                 if was.is_none() {
@@ -87,7 +95,13 @@ fn events(request: &Request, instance: Arc<Instance>, user: String) -> Response 
                 }
                 let from = was.unwrap_or(0);
                 if state == "join" && room.last_seq > from {
-                    let Ok(list) = store::since(s, &user, &room.id, from).await else { return };
+                    let list = match store::since(s, &user, &room.id, from).await {
+                        Ok(l) => l,
+                        Err(e) => {
+                            eprintln!("chat: events of {user} in {}: {e}", room.id);
+                            continue;
+                        }
+                    };
                     for e in &list {
                         let data = json!({"room": room.id, "seq": e.seq, "id": e.event_id, "kind": e.kind, "thread": e.thread_root, "about": e.content["about"], "sender": e.sender});
                         if sender.send_async(SseEvent::data(data.to_string()).event_type("event")).await.is_err() {
