@@ -523,14 +523,27 @@ export class OrtusChatMain extends LitElement {
   private events: EventSource | null = null;
   private lastTyping = 0;
 
+  private started = false;
+
   override connectedCallback(): void {
     super.connectedCallback();
+    // The shell may move the element: it carries on as it was.
+    if (this.started) {
+      if (!this.events) this.listen();
+      return;
+    }
+    this.started = true;
     void this.start();
   }
 
   override disconnectedCallback(): void {
     super.disconnectedCallback();
-    this.events?.close();
+    // Only a real departure closes the stream.
+    window.setTimeout(() => {
+      if (this.isConnected) return;
+      this.events?.close();
+      this.events = null;
+    }, 0);
   }
 
   private async start(): Promise<void> {
@@ -545,6 +558,7 @@ export class OrtusChatMain extends LitElement {
   }
 
   private listen(): void {
+    if (!this.isConnected || this.events) return;
     this.events = new EventSource("/api/v1/chat/events");
     // After a break the stream starts afresh: read again what may have
     // been missed in between.
