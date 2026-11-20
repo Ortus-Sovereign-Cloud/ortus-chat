@@ -37,7 +37,7 @@ pub async fn encrypted_rooms_allowed(instance: &Instance) -> bool {
 async fn get(request: &Request, instance: &Arc<Instance>) -> Result<Response, ApiError> {
     crate::api::signed(request, instance).await?;
     Ok(ok(
-        &json!({ "encryptedRooms": encrypted_rooms_allowed(instance).await }),
+        &json!({ "encryptedRooms": encrypted_rooms_allowed(instance).await, "federation": crate::federation::enabled(), "server": crate::store::server_name(instance) }),
     ))
 }
 

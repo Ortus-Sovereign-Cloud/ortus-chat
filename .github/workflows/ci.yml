@@ -67,4 +67,12 @@ jobs:
           exit 1
       - name: The browser
         run: cd web && npm ci && npx playwright install --with-deps chromium
+      - name: An independent Matrix server (Dendrite) for federation
+        run: |
+          ci/matrix-peer.sh "$RUNNER_TEMP/matrix-peer" > "$RUNNER_TEMP/matrix-peer.env"
+          sed 's/^export //' "$RUNNER_TEMP/matrix-peer.env" >> "$GITHUB_ENV"
+          echo "ORTUS_REQUIRE_MATRIX=1" >> "$GITHUB_ENV"
       - run: ci/check.sh
+      - name: The Matrix server's log
+        if: failure()
+        run: docker logs ortus-matrix-peer 2>&1 | tail -200

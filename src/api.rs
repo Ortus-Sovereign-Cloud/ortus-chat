@@ -418,6 +418,15 @@ async fn join(
         &me.id,
     )
     .await?;
+    if let Ok(Some(r)) = store::room(s, id).await {
+        let _ = crate::federation::rooms::membership(
+            instance,
+            &r,
+            &store::mxid(&me.id, &server),
+            "join",
+        )
+        .await;
+    }
     get_room_of(instance, &me, id).await
 }
 
@@ -447,6 +456,15 @@ async fn leave(
         &me.id,
     )
     .await?;
+    if let Ok(Some(r)) = store::room(s, id).await {
+        let _ = crate::federation::rooms::membership(
+            instance,
+            &r,
+            &store::mxid(&me.id, &store::server_name(instance)),
+            "leave",
+        )
+        .await;
+    }
     Ok(ok(&json!({ "left": id })))
 }
 
@@ -479,6 +497,48 @@ async fn notice(
     .await?;
     tx.commit().await?;
     Ok(())
+}
+
+/// Shares a room with partner organisations (Matrix federation): its
+/// owner or an administrator. Partners' people may then join it; the
+/// room's label still decides, for each partner, whether it may.
+async fn share(
+    request: &Request,
+    params: &PathParams,
+    instance: &Arc<Instance>,
+) -> Result<Response, ApiError> {
+    let me = signed(request, instance).await?;
+    let room = joined(instance, &me.id, params.get("room").unwrap_or_default()).await?;
+    let owner = store::membership(instance.store.as_ref(), &room.id, &me.id)
+        .await?
+        .is_some_and(|m| m.1 == "owner");
+    if !owner && me.role < ortus_core::auth::accounts::Role::Admin {
+        return Err(ApiError::forbidden());
+    }
+    if !crate::federation::enabled() {
+        return Err(ApiError {
+            status: 409,
+            code: "federation_off",
+            message: "Federation is not set up on this installation.".into(),
+        });
+    }
+    if room.kind == "direct" || room.encrypted {
+        return Err(ApiError::bad_request(
+            "Direct and end-to-end rooms stay inside.",
+        ));
+    }
+    crate::federation::rooms::share(instance, &room)
+        .await
+        .map_err(|_| ApiError::internal())?;
+    ortus_core::auth::audit(
+        instance,
+        ortus_core::audit::Event::new("chat.room_shared", ortus_core::audit::Outcome::Done)
+            .by(&me.id)
+            .on(&room.id)
+            .with(json!({"roomId": room.room_id})),
+    )
+    .await;
+    get_room_of(instance, &me, &room.id).await
 }
 
 /// One message as the room shows it (after a change).
@@ -588,12 +648,17 @@ pub(crate) async fn send(
     if let Some(root) = thread {
         content["m.relates_to"] = json!({"rel_type": "m.thread", "event_id": root});
     }
+    // In a shared room the message is a Matrix event first: both carry
+    // its id.
+    let federated = crate::federation::rooms::message_event(instance, room, &sender, &content)
+        .await
+        .map_err(|_| ApiError::internal())?;
     let mut tx = s.begin().await?;
     let (seq, event_id) = store::add_event(
         tx.as_mut(),
         &NewEvent {
             room: &room.id,
-            event_id: None,
+            event_id: federated.as_ref().map(|(id, _)| id.as_str()),
             sender: &sender,
             sender_user: Some(&me.id),
             kind: "m.room.message",
@@ -617,6 +682,9 @@ pub(crate) async fn send(
     .await?;
     tx.commit().await?;
     crate::index::message(instance, room, &event_id).await;
+    if let Some((id, pdu)) = &federated {
+        let _ = crate::federation::rooms::store(instance, &room.id, id, pdu).await;
+    }
     crate::federation::outbound(instance, &room.id, &event_id).await;
     let e = store::event(s, &event_id)
         .await?
@@ -951,6 +1019,7 @@ with_params!(h_delete, delete);
 with_params!(h_react, react);
 with_params!(h_read, read);
 with_params!(h_message, message);
+with_params!(h_share, share);
 
 pub(crate) fn object() -> Value {
     json!({"type": "object"})
@@ -974,6 +1043,7 @@ pub fn routes() -> Vec<Route> {
         route(Method::Get, "/chat/rooms/:room", "chatRoom", "A room with its members.", h_room),
         route(Method::Patch, "/chat/rooms/:room", "chatRoomChange", "Renames a room, changes its topic, invites people by address.", h_change_room),
         route(Method::Post, "/chat/rooms/:room/join", "chatJoin", "Joins a channel, or accepts an invitation.", h_join),
+        route(Method::Post, "/chat/rooms/:room/share", "chatShare", "Shares a room with partner organisations over Matrix (its owner or an administrator); partners' people may then join it by its room id.", h_share),
         route(Method::Post, "/chat/rooms/:room/leave", "chatLeave", "Leaves a room.", h_leave),
         route(Method::Get, "/chat/rooms/:room/messages", "chatMessages", "A page of messages (?before=seq), or one thread's (?thread=event).", h_messages),
         route(Method::Post, "/chat/rooms/:room/messages", "chatSend", "Sends a message: {text, thread, mentions: [address], decision (records the thread's decision)}.", h_say),

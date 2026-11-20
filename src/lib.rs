@@ -7,6 +7,7 @@ pub mod api;
 pub mod federation;
 pub mod index;
 pub mod live;
+pub mod matrix;
 pub mod policy;
 pub mod service;
 pub mod store;
@@ -27,8 +28,12 @@ static MIGRATIONS: std::sync::LazyLock<Vec<Migration>> = std::sync::LazyLock::ne
     let mut all = store::MIGRATIONS.to_vec();
     all.extend_from_slice(policy::MIGRATIONS);
     all.extend_from_slice(live::MIGRATIONS);
+    all.extend_from_slice(federation::MIGRATIONS);
     all
 });
+
+/// Sends what waits in the federation outbox.
+pub const OUTBOX_JOB: &str = "chat.federation";
 
 /// The chat app.
 pub struct Chat;
@@ -59,6 +64,40 @@ impl App for Chat {
             instance: Arc::downgrade(instance),
         });
         services.provide("chat", chat);
+    }
+
+    // Matrix federation's listener, when a certificate is set.
+    fn role_tasks(&self) -> Vec<ortus_core::app::RoleTask> {
+        vec![ortus_core::app::RoleTask {
+            role: ortus_core::config::Role::Web,
+            name: "federation",
+            run: federation::listener::run,
+        }]
+    }
+
+    fn periodic(&self) -> Vec<(&'static str, i64)> {
+        vec![(OUTBOX_JOB, 5_000)]
+    }
+
+    fn outside_jobs(&self, instance: &Arc<Instance>) -> Vec<ortus_core::app::OutsideJobKind> {
+        let instance = Arc::clone(instance);
+        vec![ortus_core::app::OutsideJobKind {
+            kind: OUTBOX_JOB.into(),
+            handler: Box::new(move |_| {
+                let instance = Arc::clone(&instance);
+                Box::pin(async move { federation::rooms::drain(&instance).await })
+            }),
+        }]
+    }
+
+    // The federation signing key is sealed: a key rotation re-seals it.
+    fn sealed(&self) -> Vec<ortus_core::secrets::Place> {
+        vec![ortus_core::secrets::Place {
+            table: "chat_fed_keys",
+            id: "key_id",
+            column: "seed_sealed",
+            fields: &[],
+        }]
     }
 
     fn search_owners<'a>(

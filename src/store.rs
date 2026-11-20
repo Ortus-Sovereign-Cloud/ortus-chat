@@ -81,6 +81,14 @@ fn random(n: usize) -> String {
 
 /// This server's name (the host people's and rooms' ids end in).
 pub fn server_name(instance: &ortus_core::instance::Instance) -> String {
+    // Set once, before the first room: every id carries it.
+    if let Ok(name) = std::env::var("ORTUS_MATRIX_SERVER_NAME") {
+        if !name.trim().is_empty() {
+            return name.trim().to_ascii_lowercase();
+        }
+    }
+    // The public host without its port (a port in the name would pin
+    // federation to that port).
     let url = &instance.config.public_url;
     let host = url
         .split("://")
@@ -89,10 +97,23 @@ pub fn server_name(instance: &ortus_core::instance::Instance) -> String {
         .split('/')
         .next()
         .unwrap_or_default();
+    let host: String = match host.strip_prefix('[') {
+        // An IPv6 address keeps its brackets.
+        Some(rest) => rest
+            .split_once(']')
+            .map(|(ip, _)| format!("[{ip}]"))
+            .unwrap_or_else(|| host.to_string()),
+        None => match host.rsplit_once(':') {
+            Some((h, port)) if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) => {
+                h.to_string()
+            }
+            _ => host.to_string(),
+        },
+    };
     if host.is_empty() {
         "localhost".into()
     } else {
-        host.to_string()
+        host.to_ascii_lowercase()
     }
 }
 

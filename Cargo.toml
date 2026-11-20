@@ -8,6 +8,8 @@ repository = "https://github.com/Ortus-Sovereign-Cloud/ortus-chat"
 publish = false
 
 [dependencies]
+aws-lc-rs = "1.19"
+base64 = "0.22"
 # Built from the commit in pins.toml (checked out by ci/fetch.sh), never
 # from the branch: see the patch below.
 ortus-core = { git = "https://github.com/Ortus-Sovereign-Cloud/ortus-core" }
@@ -15,7 +17,10 @@ rust-embed = "8.14.0"
 rust-web-server = "18.34"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1.54.1", features = ["time", "sync", "macros", "rt"] }
+sha2 = "0.10"
+tokio = { version = "1.54.1", features = ["net", "io-util", "time", "sync", "macros", "rt"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "tls12"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json"] }
 
 [dev-dependencies]
 rust-web-server = "18.34"
