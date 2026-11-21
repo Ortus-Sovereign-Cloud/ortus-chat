@@ -3,6 +3,8 @@ import type { Message } from "ortus-kit";
 // The chat app's texts in English: the keys every other catalog has.
 const en = {
   chat: "Chat",
+  todayAllRead: "No unread messages.",
+  todayOpen: "Open Chat",
   rooms: "Rooms",
   channels: "Channels",
   directMessages: "Direct messages",

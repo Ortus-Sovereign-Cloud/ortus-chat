@@ -65,10 +65,6 @@ function tone(text: string): string {
   return TONES[h % TONES.length]!;
 }
 
-function initials(name: string): string {
-  const w = name.replace(/^@/, "").split(/[\s@.:]+/).filter(Boolean);
-  return ((w[0]?.[0] ?? "?") + (w.length > 1 ? (w[1]?.[0] ?? "") : "")).toUpperCase();
-}
 
 function lang(): string {
   return document.documentElement.lang || "en";
@@ -1032,7 +1028,8 @@ export class OrtusChatMain extends LitElement {
 
   private avatar(id: string, big = false): TemplateResult {
     const n = this.name(id);
-    return html`<span class="avatar ${big ? "big" : ""}" aria-hidden="true" .style=${`background: ${tone(n)}`}>${initials(n)}</span>`;
+    const person = this.people[id];
+    return html`<ortus-avatar class="avatar ${big ? "big" : ""}" aria-hidden="true" .style=${`background: ${tone(n)}`} .name=${n} .user=${person?.local ? id : ""} .email=${person?.local ? (person.email ?? "") : ""}></ortus-avatar>`;
   }
 
   private body(m: Message): TemplateResult {

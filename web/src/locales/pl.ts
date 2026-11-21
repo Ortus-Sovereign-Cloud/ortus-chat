@@ -2,6 +2,8 @@ import type { ChatKey, ChatMessage } from "./en.js";
 
 const messages: Record<ChatKey, ChatMessage> = {
   chat: "Czat",
+  todayAllRead: "Brak nieprzeczytanych wiadomości.",
+  todayOpen: "Otwórz czat",
   rooms: "Pokoje",
   channels: "Kanały",
   directMessages: "Wiadomości bezpośrednie",

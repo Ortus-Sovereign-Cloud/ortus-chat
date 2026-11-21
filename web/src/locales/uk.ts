@@ -2,6 +2,8 @@ import type { ChatKey, ChatMessage } from "./en.js";
 
 const messages: Record<ChatKey, ChatMessage> = {
   chat: "Чат",
+  todayAllRead: "Немає непрочитаних повідомлень.",
+  todayOpen: "Відкрити чат",
   rooms: "Кімнати",
   channels: "Канали",
   directMessages: "Особисті повідомлення",
