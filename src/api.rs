@@ -681,6 +681,10 @@ struct Say {
     decision: bool,
     /// A Drive file the message points to (by its id).
     file: Option<String>,
+    /// The client's own id for this message: sent again (a phone's outbox
+    /// after a lost answer), it is still one message.
+    #[serde(default)]
+    client_id: Option<String>,
 }
 
 /// Sends a message as a person; also used by other apps (the Chat service).
@@ -807,6 +811,24 @@ async fn say(
     let me = signed(request, instance).await?;
     let room = joined(instance, &me.id, params.get("room").unwrap_or_default()).await?;
     let input: Say = body(request)?;
+    let client_id = input
+        .client_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty() && c.len() <= 64)
+        .map(str::to_string);
+    if let Some(cid) = &client_id {
+        let sent = instance
+            .store
+            .query(
+                "SELECT event_id FROM chat_client_ids WHERE user_id = $1 AND client_id = $2",
+                &[me.id.as_str().into(), cid.as_str().into()],
+            )
+            .await?;
+        if let Some(id) = sent.first().and_then(|r| r.text(0)) {
+            return Ok(ortus_core::api::ok(&json!({"id": id, "again": true})));
+        }
+    }
     if room.encrypted {
         return Err(ApiError::bad_request(
             "This room is end-to-end encrypted: send through its encrypted route.",
@@ -849,6 +871,22 @@ async fn say(
         &input.mentions,
     )
     .await?;
+    if let Some(cid) = &client_id {
+        // Kept a day: long enough for any outbox; then forgotten.
+        let s = instance.store.as_ref();
+        let _ = s
+            .execute(
+                "DELETE FROM chat_client_ids WHERE at < $1",
+                &[(now() - 86_400_000).into()],
+            )
+            .await;
+        let _ = s
+            .execute(
+                "INSERT INTO chat_client_ids (user_id, client_id, event_id, at) VALUES ($1, $2, $3, $4)",
+                &[me.id.as_str().into(), cid.as_str().into(), v["id"].as_str().unwrap_or_default().into(), now().into()],
+            )
+            .await;
+    }
     if let Some(f) = file {
         let id = v["id"].as_str().unwrap_or_default().to_string();
         let s = instance.store.as_ref();

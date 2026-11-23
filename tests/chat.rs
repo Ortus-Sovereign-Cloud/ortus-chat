@@ -490,5 +490,25 @@ fn channels_threads_reactions_and_unread() {
             kept["messages"].as_array().unwrap().len(),
             "{name}: the held channel keeps its messages"
         );
+        // A phone's outbox sends a message twice (its first answer was
+        // lost): with the same client id it is one message.
+        let once = json!({"text": "Sandbags at the north gate.", "client_id": "phone-outbox-1"});
+        let (_, first) = call(
+            &client,
+            &olena,
+            "POST",
+            &format!("/chat/rooms/{room}/messages"),
+            Some(once.clone()),
+        );
+        let (status, again) = call(
+            &client,
+            &olena,
+            "POST",
+            &format!("/chat/rooms/{room}/messages"),
+            Some(once),
+        );
+        assert_eq!(200, status, "{name}: {again}");
+        assert_eq!(first["id"], again["id"], "{name}: one message");
+        assert_eq!(true, again["again"], "{name}");
     }
 }

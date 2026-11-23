@@ -27,6 +27,27 @@ pub const MIGRATIONS: &[Migration] = &[Migration {
     )",
 }];
 
+/// With PostgreSQL, every program's live streams hear of a new event or
+/// someone typing (`ortus_core::changes`), delivered when it commits.
+pub const WAKE_MIGRATIONS: &[Migration] = &[Migration {
+    version: 8,
+    name: "wake live streams",
+    sql: "{{postgres}} CREATE OR REPLACE FUNCTION chat_wake() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN PERFORM pg_notify(''ortus_changes'', ''chat''); RETURN NULL; END';
+    {{postgres}} CREATE TRIGGER chat_events_wake AFTER INSERT OR UPDATE ON chat_events FOR EACH STATEMENT EXECUTE FUNCTION chat_wake();
+    {{postgres}} CREATE TRIGGER chat_typing_wake AFTER INSERT OR DELETE ON chat_typing FOR EACH STATEMENT EXECUTE FUNCTION chat_wake();
+    {{postgres}} CREATE TRIGGER chat_members_wake AFTER INSERT OR UPDATE ON chat_members FOR EACH STATEMENT EXECUTE FUNCTION chat_wake()",
+}, Migration {
+    version: 9,
+    name: "messages sent again by their client id",
+    sql: "CREATE TABLE chat_client_ids (
+        user_id TEXT NOT NULL,
+        client_id TEXT NOT NULL,
+        event_id TEXT NOT NULL,
+        at BIGINT NOT NULL,
+        PRIMARY KEY (user_id, client_id)
+    )",
+}];
+
 /// Streams open per person at most.
 const MAX_STREAMS: usize = 10;
 
@@ -169,7 +190,9 @@ fn events(request: &Request, instance: Arc<Instance>, user: String) -> Response 
             if store::now() - started > 600_000 {
                 return;
             }
-            tokio::time::sleep(Duration::from_millis(400)).await;
+            // Until something changes in chat (or a few seconds, for typing
+            // that runs out on its own).
+            ortus_core::changes::wait("chat", Duration::from_secs(3)).await;
         }
     });
     response
@@ -217,6 +240,7 @@ async fn typing(
     )
     .await?;
     tx.commit().await?;
+    ortus_core::changes::wake_soon("chat");
     Ok(ortus_core::api::ok(&json!({})))
 }
 

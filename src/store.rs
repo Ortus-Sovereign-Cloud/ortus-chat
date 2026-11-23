@@ -316,6 +316,9 @@ pub async fn add_event(tx: &mut dyn AsyncTx, e: &NewEvent<'_>) -> StoreResult<(i
         &[e.room.into(), seq.into(), event_id.as_str().into(), e.sender.into(), opt(e.sender_user), e.kind.into(), opt(e.thread_root), e.body.into(), e.content.to_string().into(), e.origin_ts.into()],
     )
     .await?;
+    // This program's streams look a moment later, once it has committed
+    // (with PostgreSQL the trigger tells every program on commit).
+    ortus_core::changes::wake_soon("chat");
     Ok((seq, event_id))
 }
 
