@@ -64,6 +64,7 @@ const en = {
   replyInThread: "Reply in thread",
   edit: "Edit",
   delete: "Delete",
+  save: "Save",
   editMessage: "Edit the message",
   deleteSure: "Delete this message for everyone?",
   taskTitle: "Task",

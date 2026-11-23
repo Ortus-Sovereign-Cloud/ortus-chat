@@ -427,6 +427,37 @@ export class OrtusChatMain extends LitElement {
         resize: none;
         outline: none;
       }
+      .compose:focus-within {
+        outline: 2px solid var(--ortus-accent, #8c9eff);
+        outline-offset: 2px;
+      }
+      dialog.ask {
+        inline-size: min(440px, calc(100vw - 32px));
+        padding: 20px;
+        border-radius: 16px;
+        border: 1px solid var(--ortus-line-strong);
+        background: var(--ortus-surface);
+        color: var(--ortus-text);
+      }
+      dialog.ask::backdrop {
+        background: rgba(0, 0, 0, 0.6);
+      }
+      dialog.ask h2 {
+        margin: 0 0 12px;
+        font-size: 18px;
+      }
+      dialog.ask textarea {
+        inline-size: 100%;
+        min-block-size: 96px;
+        box-sizing: border-box;
+        font: inherit;
+      }
+      .ask-actions {
+        display: flex;
+        gap: 8px;
+        justify-content: end;
+        margin-block-start: 12px;
+      }
       .compose .row {
         display: flex;
         gap: 6px;
@@ -926,20 +957,63 @@ export class OrtusChatMain extends LitElement {
     this.threadMessages = this.threadMessages.map((x) => (x.id === m.id ? { ...x, reactions: one.reactions } : x));
   }
 
+  /** Editing or deleting a message asks in a dialog of its own. */
+  @state() private asking: { kind: "edit" | "delete"; m: Message; text: string } | null = null;
+
   private async edit(m: Message): Promise<void> {
-    const text = prompt(t(this.localize, "editMessage"), m.text);
-    if (text === null || !text.trim()) return;
+    this.asking = { kind: "edit", m, text: m.text };
+    await this.updateComplete;
+    this.renderRoot.querySelector<HTMLDialogElement>("dialog.ask")?.showModal();
+  }
+
+  private async deleteMessage(m: Message): Promise<void> {
+    this.asking = { kind: "delete", m, text: "" };
+    await this.updateComplete;
+    this.renderRoot.querySelector<HTMLDialogElement>("dialog.ask")?.showModal();
+  }
+
+  private closeAsk(): void {
+    this.renderRoot.querySelector<HTMLDialogElement>("dialog.ask")?.close();
+    this.asking = null;
+  }
+
+  private async answerAsk(e: SubmitEvent): Promise<void> {
+    e.preventDefault();
+    const asked = this.asking;
+    if (!asked) return;
+    this.closeAsk();
+    if (asked.kind === "delete") {
+      await call("DELETE", `/chat/messages/${encodeURIComponent(asked.m.id)}`);
+      await this.refresh(asked.m.id);
+      return;
+    }
+    if (!asked.text.trim() || asked.text === asked.m.text) return;
+    await this.saveEdit(asked.m, asked.text);
+  }
+
+  private askDialog() {
+    const a = this.asking;
+    if (!a) return nothing;
+    return html`<dialog class="ask" aria-labelledby="ask-title" @cancel=${() => (this.asking = null)}>
+      <form method="dialog" @submit=${this.answerAsk}>
+        <h2 id="ask-title">${t(this.localize, a.kind === "edit" ? "editMessage" : "deleteSure")}</h2>
+        ${a.kind === "edit"
+          ? html`<textarea aria-label=${t(this.localize, "editMessage")} .value=${a.text} @input=${(e: InputEvent) => (this.asking = { ...a, text: (e.target as HTMLTextAreaElement).value })}></textarea>`
+          : nothing}
+        <div class="ask-actions">
+          <button type="button" @click=${() => this.closeAsk()}>${t(this.localize, "cancel")}</button>
+          <button type="submit" class=${a.kind === "delete" ? "danger" : "primary"}>${t(this.localize, a.kind === "edit" ? "save" : "delete")}</button>
+        </div>
+      </form>
+    </dialog>`;
+  }
+
+  private async saveEdit(m: Message, text: string): Promise<void> {
     if (await this.sealer?.pinned(m.room).catch(() => false)) {
       this.error = t(this.localize, "notSealed");
       return;
     }
     await call("PATCH", `/chat/messages/${encodeURIComponent(m.id)}`, { text });
-    await this.refresh(m.id);
-  }
-
-  private async deleteMessage(m: Message): Promise<void> {
-    if (!confirm(t(this.localize, "deleteSure"))) return;
-    await call("DELETE", `/chat/messages/${encodeURIComponent(m.id)}`);
     await this.refresh(m.id);
   }
 
@@ -1066,7 +1140,8 @@ export class OrtusChatMain extends LitElement {
 
   private message(m: Message, inThread = false): TemplateResult {
     const mine = m.sender === this.me;
-    return html`<article class=${inThread ? "post" : "msg"} aria-label=${t(this.localize, "messageFrom", { who: this.name(m.sender) })}>
+    // Focusable, so its actions (shown on hover) are reached from the keyboard too.
+    return html`<article class=${inThread ? "post" : "msg"} tabindex="0" aria-label=${t(this.localize, "messageFrom", { who: this.name(m.sender) })}>
       ${inThread ? nothing : this.avatar(m.sender, true)}
       <div>
         <div class="who"><strong>${mine && inThread ? t(this.localize, "you") : this.name(m.sender)}</strong><span class="muted">${hm(m.at)}</span></div>
@@ -1146,6 +1221,10 @@ export class OrtusChatMain extends LitElement {
   }
 
   override render() {
+    return html`${this.page()}${this.askDialog()}`;
+  }
+
+  private page() {
     const room = this.room();
     const channels = this.rooms.filter((r) => r.kind !== "direct");
     const directs = this.rooms.filter((r) => r.kind === "direct");

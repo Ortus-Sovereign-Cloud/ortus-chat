@@ -63,6 +63,7 @@ const messages: Record<ChatKey, ChatMessage> = {
   replyInThread: "رد في السلسلة",
   edit: "تعديل",
   delete: "حذف",
+  save: "حفظ",
   editMessage: "عدّل الرسالة",
   deleteSure: "حذف هذه الرسالة للجميع؟",
   taskTitle: "المهمة",

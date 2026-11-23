@@ -63,6 +63,7 @@ const messages: Record<ChatKey, ChatMessage> = {
   replyInThread: "Відповісти в гілці",
   edit: "Змінити",
   delete: "Видалити",
+  save: "Зберегти",
   editMessage: "Змінити повідомлення",
   deleteSure: "Видалити це повідомлення для всіх?",
   taskTitle: "Завдання",

@@ -81,3 +81,29 @@ test("rooms that could not be loaded say so and can be loaded again", async ({ p
   await chat.getByRole("button", { name: en.tryAgain }).click();
   await expect(chat.getByRole("alert")).toHaveCount(0);
 });
+
+test("a message is edited and deleted in a dialog of the page", async ({ page }) => {
+  await page.goto("/chat");
+  const chat = page.locator("ortus-chat-main");
+  await chat.getByRole("button", { name: en.newChannel }).first().click();
+  const made = chat.getByRole("dialog", { name: en.newChannel });
+  const name = `edits-${Date.now()}`;
+  await made.getByLabel(en.channelName).fill(name);
+  await made.getByRole("button", { name: en.create }).click();
+  await expect(chat.getByRole("heading", { level: 1 })).toHaveText(`# ${name}`);
+  await chat.getByRole("textbox", { name: /Message/ }).fill("Gauge at 4.1 m");
+  await chat.getByRole("textbox", { name: /Message/ }).press("Enter");
+  const message = chat.locator("article, li").filter({ hasText: "Gauge at 4.1 m" }).first();
+  await expect(message).toBeVisible();
+  // The message's actions show on hover; the click goes to the button itself.
+  await message.locator(".actions button", { hasText: new RegExp(`^${en.edit}$`) }).dispatchEvent("click");
+  const editing = chat.getByRole("dialog", { name: en.editMessage });
+  await editing.getByRole("textbox").fill("Gauge at 4.2 m");
+  await editing.getByRole("button", { name: en.save }).click();
+  await expect(chat.getByText("Gauge at 4.2 m")).toBeVisible();
+  const edited = chat.locator("article, li").filter({ hasText: "Gauge at 4.2 m" }).first();
+  await edited.locator(".actions button", { hasText: new RegExp(`^${en.delete}$`) }).dispatchEvent("click");
+  const deleting = chat.getByRole("dialog", { name: en.deleteSure });
+  await deleting.getByRole("button", { name: en.delete }).click();
+  await expect(chat.getByText("Gauge at 4.2 m")).toBeHidden();
+});
