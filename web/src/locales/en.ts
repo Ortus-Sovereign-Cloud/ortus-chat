@@ -44,6 +44,8 @@ const en = {
   fromDrive: "A file from Drive",
   send: "Send",
   noRoom: "No rooms yet.",
+  roomsFailed: "The rooms could not be loaded. Check the connection and try again.",
+  tryAgain: "Try again",
   thread: "Thread",
   replyToThread: "Reply",
   recordAsDecision: "Record this as the decision",

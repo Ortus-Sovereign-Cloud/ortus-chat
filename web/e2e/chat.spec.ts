@@ -68,3 +68,16 @@ test("two people talk in a channel and record a decision", async ({ page, browse
   expect(errors).toEqual([]);
   await marek.context().close();
 });
+
+test("rooms that could not be loaded say so and can be loaded again", async ({ page }) => {
+  // The rooms fail to load: the screen says so, not "no rooms yet".
+  await page.route("**/api/v1/chat/rooms", (route) => route.fulfill({ status: 503, contentType: "application/json", body: "{}" }));
+  await page.goto("/chat");
+  const chat = page.locator("ortus-chat-main");
+  await expect(chat.getByRole("alert")).toHaveText(en.roomsFailed);
+  await expect(chat.getByText(en.noRoom)).toHaveCount(0);
+  // Back again: trying again shows the rooms.
+  await page.unroute("**/api/v1/chat/rooms");
+  await chat.getByRole("button", { name: en.tryAgain }).click();
+  await expect(chat.getByRole("alert")).toHaveCount(0);
+});

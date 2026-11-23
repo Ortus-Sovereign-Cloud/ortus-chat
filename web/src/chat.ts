@@ -563,6 +563,8 @@ export class OrtusChatMain extends LitElement {
   @state() private threadMessages: Message[] = [];
   @state() private typing: Record<string, string[]> = {};
   @state() private error = "";
+  /** Why the rooms could not be loaded (shown only while none are on screen). */
+  @state() private roomsFailed = "";
   @state() private creating: "channel" | "private" | "direct" | null = null;
   @state() private directory: RoomItem[] | null = null;
   @state() private taskFor: Message | null = null;
@@ -607,10 +609,7 @@ export class OrtusChatMain extends LitElement {
   }
 
   private async start(): Promise<void> {
-    await this.loadRooms();
-    const p = new URLSearchParams(location.search);
-    const room = p.get("room") ?? this.rooms.find((r) => r.state === "join")?.id ?? null;
-    if (room) await this.open(room, p.get("thread") ?? undefined);
+    await this.openFirst();
     call<{ federation?: boolean; encryptedRooms?: boolean }>("GET", "/chat/policy")
       .then((r) => {
         this.federation = !!r.federation;
@@ -716,7 +715,9 @@ export class OrtusChatMain extends LitElement {
 
   private async poll(): Promise<void> {
     if (!this.isConnected) return;
-    await this.loadRooms().catch(() => undefined);
+    // A list that never loaded: the rooms and the room to open, as at the start.
+    if (this.roomsFailed) await this.openFirst();
+    else await this.loadRooms().catch(() => undefined);
     const now = this.room()?.lastSeq ?? 0;
     if (this.current && now > this.shown) await this.catchUp();
     if (this.current && this.room()?.encrypted && this.room()?.state === "join") {
@@ -746,8 +747,29 @@ export class OrtusChatMain extends LitElement {
     this.threadMessages = this.threadMessages.map((x) => (x.id === id ? one : x));
   }
 
+  /** The rooms, then the room the address names (or the first one joined). */
+  private async openFirst(): Promise<void> {
+    try {
+      await this.loadRooms();
+    } catch {
+      return;
+    }
+    const p = new URLSearchParams(location.search);
+    const room = p.get("room") ?? this.rooms.find((r) => r.state === "join")?.id ?? null;
+    if (room) await this.open(room, p.get("thread") ?? undefined);
+  }
+
   private async loadRooms(): Promise<void> {
-    const r = await call<{ rooms: RoomItem[]; people: Record<string, Person>; me: string }>("GET", "/chat/rooms");
+    let r: { rooms: RoomItem[]; people: Record<string, Person>; me: string };
+    try {
+      r = await call<{ rooms: RoomItem[]; people: Record<string, Person>; me: string }>("GET", "/chat/rooms");
+    } catch (err) {
+      // Rooms already on screen stay; a list never loaded says it failed,
+      // so a failure never looks like having no rooms.
+      if (!this.rooms.length) this.roomsFailed = t(this.localize, "roomsFailed");
+      throw err;
+    }
+    this.roomsFailed = "";
     this.rooms = r.rooms;
     this.people = { ...this.people, ...r.people };
     if (r.me !== this.me || !this.sealer) this.sealer = new Sealer(r.me);
@@ -1190,7 +1212,9 @@ export class OrtusChatMain extends LitElement {
                     </form>`
                   : nothing}
               </div>`
-          : html`<div class="empty"><p>${t(this.localize, "noRoom")}</p><button class="button primary" @click=${() => (this.creating = "channel")}>${t(this.localize, "newChannel")}</button></div>`}
+          : this.roomsFailed
+            ? html`<div class="empty"><p class="error" role="alert">${this.roomsFailed}</p><button class="button primary" @click=${() => void this.openFirst()}>${t(this.localize, "tryAgain")}</button></div>`
+            : html`<div class="empty"><p>${t(this.localize, "noRoom")}</p><button class="button primary" @click=${() => (this.creating = "channel")}>${t(this.localize, "newChannel")}</button></div>`}
       </main>
       ${this.thread
         ? html`<aside class="thread" aria-label=${t(this.localize, "thread")}>

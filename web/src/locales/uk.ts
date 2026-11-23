@@ -43,6 +43,8 @@ const messages: Record<ChatKey, ChatMessage> = {
   fromDrive: "Файл з Диска",
   send: "Надіслати",
   noRoom: "Кімнат ще немає.",
+  roomsFailed: "Не вдалося завантажити кімнати. Перевірте з’єднання і спробуйте ще раз.",
+  tryAgain: "Спробувати ще раз",
   thread: "Гілка",
   replyToThread: "Відповісти",
   recordAsDecision: "Записати це як рішення",
