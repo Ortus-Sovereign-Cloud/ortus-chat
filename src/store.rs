@@ -422,18 +422,23 @@ pub async fn thread_counts(
     roots: &[String],
 ) -> StoreResult<std::collections::HashMap<String, (i64, i64)>> {
     let mut out = std::collections::HashMap::new();
-    for root in roots {
-        if let Some(r) = s
+    // One query for the whole page, not one per message.
+    for chunk in roots.chunks(256) {
+        let (list, mut values) = ortus_core::storage::any_of(2, chunk);
+        values.insert(0, room.into());
+        for r in s
             .query(
-                "SELECT CAST(COUNT(*) AS BIGINT), CAST(COALESCE(MAX(origin_ts), 0) AS BIGINT) FROM chat_events WHERE room = $1 AND thread_root = $2 AND deleted_at IS NULL",
-                &[room.into(), root.as_str().into()],
+                &format!("SELECT thread_root, CAST(COUNT(*) AS BIGINT), CAST(COALESCE(MAX(origin_ts), 0) AS BIGINT) FROM chat_events WHERE room = $1 AND thread_root IN ({list}) AND deleted_at IS NULL GROUP BY thread_root"),
+                &values,
             )
             .await?
-            .first()
         {
-            let n = r.int(0).unwrap_or(0);
+            let n = r.int(1).unwrap_or(0);
             if n > 0 {
-                out.insert(root.clone(), (n, r.int(1).unwrap_or(0)));
+                out.insert(
+                    r.text(0).unwrap_or_default().to_string(),
+                    (n, r.int(2).unwrap_or(0)),
+                );
             }
         }
     }
@@ -447,19 +452,21 @@ pub async fn reactions(
 ) -> StoreResult<std::collections::HashMap<String, Vec<(String, Vec<String>)>>> {
     let mut out: std::collections::HashMap<String, Vec<(String, Vec<String>)>> =
         std::collections::HashMap::new();
-    for id in ids {
+    for chunk in ids.chunks(256) {
+        let (list, values) = ortus_core::storage::any_of(1, chunk);
         for r in s
             .query(
-                "SELECT reaction, member FROM chat_reactions WHERE event_id = $1 ORDER BY at",
-                &[id.as_str().into()],
+                &format!("SELECT event_id, reaction, member FROM chat_reactions WHERE event_id IN ({list}) ORDER BY at"),
+                &values,
             )
             .await?
         {
-            let (k, m) = (
+            let (id, k, m) = (
                 r.text(0).unwrap_or_default().to_string(),
                 r.text(1).unwrap_or_default().to_string(),
+                r.text(2).unwrap_or_default().to_string(),
             );
-            let list = out.entry(id.clone()).or_default();
+            let list = out.entry(id).or_default();
             match list.iter_mut().find(|(x, _)| *x == k) {
                 Some((_, who)) => who.push(m),
                 None => list.push((k, vec![m])),

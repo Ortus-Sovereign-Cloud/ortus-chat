@@ -54,24 +54,34 @@ async fn colleague(instance: &Instance, email: &str) -> Result<User, ApiError> {
 /// Names of the people a screen shows, by Matrix id.
 pub(crate) async fn people(instance: &Instance, ids: impl IntoIterator<Item = String>) -> Value {
     let server = store::server_name(instance);
+    let suffix = format!(":{server}");
+    let mut seen = std::collections::HashSet::new();
+    let wanted: Vec<String> = ids
+        .into_iter()
+        .filter(|id| seen.insert(id.clone()))
+        .collect();
+    // The people of this installation in one query, not one each.
+    let locals: Vec<String> = wanted
+        .iter()
+        .filter_map(|id| id.strip_prefix('@')?.strip_suffix(&suffix))
+        .map(str::to_string)
+        .collect();
+    let found: std::collections::HashMap<String, accounts::User> =
+        accounts::by_ids(instance.store.as_ref(), &locals)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|u| (u.id.clone(), u))
+            .collect();
     let mut out = serde_json::Map::new();
-    for id in ids {
-        if out.contains_key(&id) {
-            continue;
-        }
+    for id in wanted {
         let local = id
             .strip_prefix('@')
-            .and_then(|x| x.strip_suffix(&format!(":{server}")));
-        let found = match local {
-            Some(uid) => accounts::by_id(instance.store.as_ref(), uid)
-                .await
-                .ok()
-                .flatten()
-                .map(|u| json!({"name": u.name, "email": u.email, "local": true})),
-            None => None,
-        };
+            .and_then(|x| x.strip_suffix(&suffix))
+            .and_then(|uid| found.get(uid))
+            .map(|u| json!({"name": u.name, "email": u.email, "local": true}));
         // A hook's messages show its name.
-        let found = match found {
+        let shown = match local {
             Some(f) => Some(f),
             None => crate::hooks::name_of(instance, &id)
                 .await
@@ -79,7 +89,7 @@ pub(crate) async fn people(instance: &Instance, ids: impl IntoIterator<Item = St
         };
         out.insert(
             id.clone(),
-            found.unwrap_or_else(|| json!({"name": id, "local": false})),
+            shown.unwrap_or_else(|| json!({"name": id, "local": false})),
         );
     }
     Value::Object(out)
