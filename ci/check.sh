@@ -20,11 +20,10 @@ cargo deny check
 ci/licence-gate-selftest.sh
 # The phones' end-to-end crate (its own workspace: see phones/e2e/Cargo.toml),
 # tested against the chat app (examples/e2e_host.rs) and the browser's
-# e2e.ts. Its licence check fails until the owner rules on MPL-2.0
-# (matrix-sdk-crypto's own dependencies and UniFFI) and on RUSTSEC-2026-0459
-# (the SQLite matrix-sdk-sqlite 0.19 bundles): docs/phones-end-to-end.md.
+# e2e.ts. Its MPL-2.0 dependencies are allowed by name in deny.toml (the
+# owner's decision of 2026-11-25); everything else is held to the same rules.
 (cd phones/e2e && cargo fmt --all --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo test --locked -p ortus-e2e)
-cargo deny --manifest-path phones/e2e/Cargo.toml check
+cargo deny --manifest-path phones/e2e/Cargo.toml --workspace check
 # The screens in a real browser, against the core with this app.
 cargo build --examples
 (cd web && npx playwright test)

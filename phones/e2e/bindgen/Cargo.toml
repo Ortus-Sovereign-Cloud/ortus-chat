@@ -1,0 +1,15 @@
+[package]
+name = "ortus-e2e-bindgen"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "UniFFI's binding generator, run by CI to write ortus-e2e-ffi's Swift and Kotlin."
+publish = false
+
+# A build tool, not shipped: its own workspace and lock, outside the phones
+# library's graph and its `cargo deny` check (its template engine needs
+# basic-toml, unmaintained: RUSTSEC-2026-0374). The version is ffi's exactly.
+[workspace]
+
+[dependencies]
+uniffi = { version = "=0.32.2", features = ["cli"] }

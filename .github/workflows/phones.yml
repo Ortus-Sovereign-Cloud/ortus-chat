@@ -41,8 +41,8 @@ jobs:
           done
       - name: The Swift bindings
         run: |
-          cargo build --locked -p ortus-e2e-ffi --features bindgen
-          target/debug/uniffi-bindgen generate --library target/debug/libortus_e2e_ffi.dylib --language swift --out-dir out/swift
+          cargo build --locked -p ortus-e2e-ffi --lib
+          cargo run --locked --quiet --manifest-path bindgen/Cargo.toml -- generate --no-format --library target/debug/libortus_e2e_ffi.dylib --language swift --out-dir out/swift
       - name: The XCFramework
         run: |
           mkdir -p out/headers out/sim
@@ -91,8 +91,8 @@ jobs:
           cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 -o out/jniLibs build --locked --release -p ortus-e2e-ffi --lib
       - name: The Kotlin bindings
         run: |
-          cargo build --locked -p ortus-e2e-ffi --features bindgen
-          target/debug/uniffi-bindgen generate --library target/debug/libortus_e2e_ffi.so --language kotlin --out-dir out/kotlin
+          cargo build --locked -p ortus-e2e-ffi --lib
+          cargo run --locked --quiet --manifest-path bindgen/Cargo.toml -- generate --no-format --library target/debug/libortus_e2e_ffi.so --language kotlin --out-dir out/kotlin
       - name: Package
         run: |
           cd out

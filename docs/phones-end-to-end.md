@@ -66,8 +66,9 @@ browser already uses (`org.ortus.room` in the room key carries Ortus's id).
 
 ## Stage 1, as built (2026-11-25)
 
-`phones/e2e` (`ortus-e2e`, its own Cargo workspace and lock) and
-`phones/e2e/ffi` (`ortus-e2e-ffi`, the UniFFI layer). CI's `phones`
+`phones/e2e` (`ortus-e2e`, its own Cargo workspace and lock),
+`phones/e2e/ffi` (`ortus-e2e-ffi`, the UniFFI layer) and `phones/e2e/bindgen`
+(UniFFI's generator, a build tool). CI's `phones`
 workflow builds `OrtusE2EFFI.xcframework.zip` (aarch64-apple-ios, and
 aarch64-apple-ios-sim with x86_64-apple-ios in one simulator library),
 `OrtusE2E-swift.zip`, `ortus-e2e-jniLibs.zip` (arm64-v8a, armeabi-v7a,
@@ -162,36 +163,36 @@ Errors: `Transport`, `Server {status, body}`, `Store`, `Invalid`,
   for it when a newcomer brings a new session; what it seals is refused for
   not being the sender's device).
 
-## Open: the owner's ruling (stage 1 is not pushed until then)
+## Licences: the owner's decision
 
-`cargo deny check` of `phones/e2e` fails, and `ci/check.sh` with it:
+**2026-11-25: the owner allows MPL-2.0 for unmodified dependencies of the
+phone encryption library (phones/e2e) only; the server stays Apache/MIT.**
 
-1. **MPL-2.0.** matrix-sdk-crypto 0.19.1 is Apache-2.0, but needs, not
-   optionally, `as_variant`, `eyeball` (with `readlock`, `readlock-tokio`),
-   and through matrix-sdk-common `eyeball-im` and `imbl` (with
-   `imbl-sized-chunks`), all MPL-2.0 (`imbl` "MPL-2.0+"). UniFFI (`uniffi`
-   and its crates, 0.32.2) is MPL-2.0 too. deny.toml takes no MPL.
-2. **RUSTSEC-2026-0459.** matrix-sdk-sqlite 0.19.1 pins rusqlite 0.40, whose
-   `libsqlite3-sys` 0.38.2 bundles SQLite 3.53.2: "SQLite versions before
-   3.54.0 can return uninitialized page-cache memory when a process opens a
-   database file together with a sibling write-ahead-log (-wal) file whose
-   page size differs from the database's … The attack vector is local and
-   needs the victim to open the files." matrix-rust-sdk's main moved to
-   rusqlite 0.41.1 on 2026-11-09 (18757f7e08ec), not released yet; that
-   release would also end the `links` clash, so the tests could run the app
-   in their own process.
+`deny.toml` names each crate (`[[licenses.exceptions]]`), with no blanket
+allow, so MPL stays refused everywhere else (`ci/licence-gate-selftest.sh`
+still proves it; the server's own dependency tree has no MPL crate):
 
-The ways on:
+- matrix-sdk-crypto 0.19.1 (itself Apache-2.0) needs, not optionally,
+  `as_variant`, `eyeball`, `readlock`, `readlock-tokio`, and through
+  matrix-sdk-common `eyeball-im`, `imbl`, `imbl-sized-chunks`;
+- UniFFI 0.32.2: `uniffi`, `uniffi_core`, `uniffi_macros`,
+  `uniffi_internal_macros`, `uniffi_meta`, `uniffi_pipeline`, `uniffi_udl`,
+  `uniffi_bindgen`.
 
-- **A. Keep the SDK:** allow MPL-2.0 for the phones' graph (the SDK's seven
-  crates and UniFFI), and ignore the advisory until a matrix-sdk-sqlite on
-  rusqlite 0.41 is released (or take that release when it comes).
-- **B. vodozemac alone** (Apache-2.0, already the browser interop test's
-  reference): the crate's own account, Olm sessions and store on rusqlite
-  0.41, which removes the SDK's MPL and the advisory and lets the tests run
-  in process; it reverses the 2026-11-24 decision and is the code the SDK
-  was chosen to avoid. UniFFI's MPL stays a choice of its own: accept it, or
-  a hand-written C ABI with Swift and JNI wrappers.
+**RUSTSEC-2026-0459 is ignored** in `deny.toml`: matrix-sdk-sqlite 0.19.1
+pins rusqlite 0.40, whose `libsqlite3-sys` 0.38.2 bundles SQLite 3.53.2,
+which "can return uninitialized page-cache memory when a process opens a
+database file together with a sibling write-ahead-log (-wal) file whose page
+size differs from the database's". Local only: the crafted file would have
+to be inside the app's own storage. matrix-rust-sdk's main moved to
+rusqlite 0.41.1 on 2026-11-09 (18757f7e08ec), not released yet; revisit
+when it is (that release would also end the `links` clash, so the tests
+could run the app in their own process).
+
+The binding generator (`phones/e2e/bindgen`, UniFFI's CLI) is a build tool,
+not shipped: it is its own workspace outside the library's graph and its
+`cargo deny` check, because its template engine needs `basic-toml`,
+unmaintained (RUSTSEC-2026-0374).
 
 ## Stage 2
 

@@ -7,22 +7,14 @@ description = "UniFFI bindings of ortus-e2e for the iOS and Android apps."
 repository = "https://github.com/Ortus-Sovereign-Cloud/ortus-chat"
 publish = false
 
-# UniFFI is MPL-2.0, which deny.toml does not allow (nor does it allow the
-# MPL-2.0 crates matrix-sdk-crypto itself needs): the owner's ruling is
-# open, docs/phones-end-to-end.md. ortus-e2e itself has no UniFFI in it.
+# UniFFI is MPL-2.0, allowed by name in deny.toml for this library only
+# (the owner, 2026-11-25). The binding generator is ../bindgen.
 
 [lib]
 name = "ortus_e2e_ffi"
 crate-type = ["lib", "staticlib", "cdylib"]
 
-[[bin]]
-name = "uniffi-bindgen"
-path = "src/bin/uniffi-bindgen.rs"
-required-features = ["bindgen"]
-
-[features]
-bindgen = ["uniffi/cli"]
-
 [dependencies]
 ortus-e2e = { path = ".." }
-uniffi = "0.32.2"
+# The same version as ../bindgen, exactly.
+uniffi = "=0.32.2"

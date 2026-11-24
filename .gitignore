@@ -2,3 +2,4 @@
 /.deps
 /phones/e2e/target
 /phones/e2e/out
+/phones/e2e/bindgen/target

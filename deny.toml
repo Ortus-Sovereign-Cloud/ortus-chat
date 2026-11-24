@@ -1,13 +1,21 @@
 # Licence and source rules for every Ortus dependency, checked by CI with
 # `cargo deny check`. Ortus is MIT OR Apache-2.0 and takes permissive
-# dependencies only: no GPL, AGPL, LGPL or MPL. Do not add a licence or an
-# exception here without the owner's agreement.
+# dependencies only: no GPL, AGPL, LGPL or MPL (save the named exceptions
+# below for the phones' library). Do not add a licence or an exception here
+# without the owner's agreement.
 
 [graph]
 all-features = true
 
 [advisories]
-ignore = []
+ignore = [
+    # The SQLite matrix-sdk-sqlite 0.19 bundles (phones/e2e only): uninitialized
+    # page-cache memory when a database is opened with a crafted -wal file of
+    # another page size. Local only: the file would have to be planted inside
+    # the app's own storage. Fixed when matrix-sdk-sqlite releases on
+    # rusqlite >= 0.41 (its main moved on 2026-11-09); revisit then.
+    "RUSTSEC-2026-0459",
+]
 
 [licenses]
 allow = [
@@ -28,6 +36,70 @@ allow = [
     "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.9
+
+# 2026-11-25: the owner allows MPL-2.0 for unmodified dependencies of the
+# phone encryption library (phones/e2e) only; the server stays Apache/MIT.
+# These crates, by name, and nothing else: matrix-sdk-crypto's own
+# dependencies, and UniFFI for its Swift and Kotlin bindings.
+[[licenses.exceptions]]
+crate = "as_variant"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+crate = "eyeball"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+crate = "eyeball-im"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+crate = "readlock"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+crate = "readlock-tokio"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+crate = "imbl"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+crate = "imbl-sized-chunks"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+crate = "uniffi"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+crate = "uniffi_bindgen"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+crate = "uniffi_core"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+crate = "uniffi_internal_macros"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+crate = "uniffi_macros"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+crate = "uniffi_meta"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+crate = "uniffi_pipeline"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+crate = "uniffi_udl"
+allow = ["MPL-2.0"]
 
 [bans]
 multiple-versions = "warn"
