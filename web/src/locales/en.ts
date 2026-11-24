@@ -22,6 +22,7 @@ const en = {
   cancel: "Cancel",
   create: "Create",
   close: "Close",
+  back: "Back",
   join: "Join",
   invited: "invited",
   unread: {"one": "{count} unread", "other": "{count} unread"},

@@ -21,6 +21,7 @@ const messages: Record<ChatKey, ChatMessage> = {
   cancel: "Скасувати",
   create: "Створити",
   close: "Закрити",
+  back: "Назад",
   join: "Приєднатися",
   invited: "запрошення",
   unread: {"one": "{count} непрочитане", "few": "{count} непрочитані", "many": "{count} непрочитаних", "other": "{count} непрочитаного"},

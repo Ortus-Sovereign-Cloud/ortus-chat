@@ -21,6 +21,7 @@ const messages: Record<ChatKey, ChatMessage> = {
   cancel: "Anuluj",
   create: "Utwórz",
   close: "Zamknij",
+  back: "Wstecz",
   join: "Dołącz",
   invited: "zaproszenie",
   unread: {"one": "{count} nieprzeczytana", "few": "{count} nieprzeczytane", "many": "{count} nieprzeczytanych", "other": "{count} nieprzeczytanej"},

@@ -59,6 +59,9 @@ interface Message {
 const TONES = ["#a5b4ff", "#f9b77a", "#6ee0d0", "#d4f27a", "#ffa39a", "#eceef3"];
 const REACTIONS = ["👍", "❤️", "🎉", "✅"];
 
+/** The back button's arrow; it points the other way right to left. */
+const backArrow = html`<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M15 18l-6-6 6-6" /></svg>`;
+
 function tone(text: string): string {
   let h = 0;
   for (const c of text) h = (h * 31 + c.charCodeAt(0)) >>> 0;
@@ -82,7 +85,7 @@ export class OrtusChatMain extends LitElement {
       :host {
         display: grid;
         grid-template-columns: 250px minmax(0, 1fr) auto;
-        block-size: 100vh;
+        block-size: var(--ortus-screen, 100vh);
         color: var(--ortus-text);
       }
       aside.rooms {
@@ -234,7 +237,7 @@ export class OrtusChatMain extends LitElement {
         display: inline-flex;
         align-items: center;
       }
-      main > header .button:first-of-type {
+      main > header > :nth-child(1 of .button) {
         margin-inline-start: auto;
       }
       form.invite {
@@ -580,6 +583,101 @@ export class OrtusChatMain extends LitElement {
         color: var(--ortus-red);
         font-size: 14px;
       }
+      .back {
+        display: none;
+      }
+      .back svg:dir(rtl) {
+        transform: scaleX(-1);
+      }
+      /* A phone-sized screen: one pane at a time, the room list first; a
+         room replaces it (with a back button), a thread replaces the room. */
+      @media (max-width: 720px) {
+        :host {
+          grid-template-columns: minmax(0, 1fr);
+        }
+        :host([detail]) aside.rooms,
+        :host([threaded]) main,
+        :host(:not([detail])) main,
+        :host(:not([detail])) aside.thread {
+          display: none;
+        }
+        .back {
+          display: grid;
+          flex: none;
+        }
+        .icon {
+          inline-size: 44px;
+          block-size: 44px;
+        }
+        .button {
+          block-size: 44px;
+        }
+        .room {
+          min-block-size: 44px;
+        }
+        main > header {
+          flex-wrap: wrap;
+          gap: 8px;
+          padding-block: 10px;
+          padding-inline: 12px;
+        }
+        main > header h1 {
+          flex: 1;
+          min-inline-size: 0;
+          overflow-wrap: anywhere;
+        }
+        main > header > :nth-child(1 of .button) {
+          margin-inline-start: 0;
+        }
+        .e2e {
+          margin-inline-start: 0;
+        }
+        form.invite {
+          padding-inline: 12px;
+        }
+        .feed {
+          padding-inline: 8px;
+        }
+        .avatar.big {
+          inline-size: 32px;
+          block-size: 32px;
+        }
+        .msg {
+          grid-template-columns: 32px minmax(0, 1fr);
+          gap: 10px;
+        }
+        /* A tapped message shows its actions under it, not over the one above. */
+        .actions {
+          position: static;
+          grid-column: 2;
+          flex-wrap: wrap;
+        }
+        .actions button {
+          min-block-size: 44px;
+          min-inline-size: 44px;
+        }
+        form.compose {
+          margin-block: 0 12px;
+          margin-inline: 12px;
+        }
+        .typing,
+        .label {
+          margin-inline: 16px;
+        }
+        aside.thread {
+          inline-size: auto;
+          border-inline-start: 0;
+        }
+        aside.thread header {
+          justify-content: start;
+          gap: 12px;
+          padding-block: 10px;
+          padding-inline: 12px;
+        }
+        aside.thread .close {
+          display: none;
+        }
+      }
     `,
   ];
 
@@ -606,6 +704,8 @@ export class OrtusChatMain extends LitElement {
   /** Whether this installation federates (Matrix). */
   @state() private federation = false;
   @state() private inviting = false;
+  /** On a phone: the open room (or its thread) instead of the room list. */
+  @state() private detail = false;
   /** Whether calls are installed, and how many are in the open room's call. */
   @state() private callsInstalled = false;
   @state() private inCall = 0;
@@ -787,7 +887,8 @@ export class OrtusChatMain extends LitElement {
     }
     const p = new URLSearchParams(location.search);
     const room = p.get("room") ?? this.rooms.find((r) => r.state === "join")?.id ?? null;
-    if (room) await this.open(room, p.get("thread") ?? undefined);
+    // On a phone the list comes first, unless the address names a room.
+    if (room) await this.open(room, p.get("thread") ?? undefined, p.has("room"));
   }
 
   private async loadRooms(): Promise<void> {
@@ -811,9 +912,10 @@ export class OrtusChatMain extends LitElement {
     return this.rooms.find((r) => r.id === this.current);
   }
 
-  private async open(id: string, thread?: string): Promise<void> {
+  private async open(id: string, thread?: string, show = true): Promise<void> {
     this.error = "";
     this.current = id;
+    this.detail = show;
     this.inCall = 0;
     void this.loadCall(id);
     this.thread = null;
@@ -1220,6 +1322,18 @@ export class OrtusChatMain extends LitElement {
         : nothing}`;
   }
 
+  override willUpdate(): void {
+    // Phone-sized screens show one pane: the attribute says which (CSS).
+    this.toggleAttribute("detail", this.detail && !!this.current);
+    this.toggleAttribute("threaded", !!this.thread);
+  }
+
+  /** On a phone: back from the room to the list. */
+  private back(): void {
+    this.detail = false;
+    this.thread = null;
+  }
+
   override render() {
     return html`${this.page()}${this.askDialog()}`;
   }
@@ -1248,6 +1362,7 @@ export class OrtusChatMain extends LitElement {
       <main class=${this.inviting && room && room.kind !== "direct" ? "inviting" : ""}>
         ${room
           ? html`<header>
+                <button class="icon back" aria-label=${t(this.localize, "back")} @click=${this.back}>${backArrow}</button>
                 <h1>${room.kind === "direct" ? this.roomName(room) : `# ${room.name}`}</h1>
                 ${room.label ? html`<span class="label">${room.label.toUpperCase()}</span>` : nothing}
                 <span class="muted">${t(this.localize, "members", { count: this.members.filter((m) => m.state === "join").length })}</span>
@@ -1297,7 +1412,11 @@ export class OrtusChatMain extends LitElement {
       </main>
       ${this.thread
         ? html`<aside class="thread" aria-label=${t(this.localize, "thread")}>
-            <header><h2>${t(this.localize, "thread")}</h2><button class="icon" aria-label=${t(this.localize, "close")} @click=${() => (this.thread = null)}>×</button></header>
+            <header>
+              <button class="icon back" aria-label=${t(this.localize, "back")} @click=${() => (this.thread = null)}>${backArrow}</button>
+              <h2>${t(this.localize, "thread")}</h2>
+              <button class="icon close" aria-label=${t(this.localize, "close")} @click=${() => (this.thread = null)}>×</button>
+            </header>
             <div class="list">${root ? this.message(root, true) : nothing}${this.threadMessages.filter((m) => m.id !== this.thread).map((m) => this.message(m, true))}</div>
             ${room?.state === "join"
               ? html`<form @submit=${(e: Event) => this.send(e, this.thread!)}>
