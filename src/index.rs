@@ -80,13 +80,41 @@ pub async fn engine_of(tx: &mut dyn ortus_core::storage::AsyncTx) -> ortus_core:
 /// Of these messages, those in rooms the person is in (or public channels).
 pub async fn visible(instance: &Instance, user: &str, ids: Vec<String>) -> Vec<String> {
     let s = instance.store.as_ref();
+    // The messages in one query, and each room's answer once.
+    let mut events = std::collections::HashMap::new();
+    for chunk in ids.chunks(256) {
+        let (list, values) = ortus_core::storage::any_of(1, chunk);
+        let Ok(rows) = s
+            .query(
+                &format!("{} WHERE event_id IN ({list})", store::EVENT),
+                &values,
+            )
+            .await
+        else {
+            return Vec::new();
+        };
+        for r in &rows {
+            let e = store::event_of(r);
+            events.insert(e.event_id.clone(), e);
+        }
+    }
+    let mut rooms: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
     let mut out = Vec::new();
     for id in ids {
-        if let Ok(Some(e)) = store::event(s, &id).await {
-            if e.deleted_at.is_none() && crate::api::readable(instance, user, &e.room).await.is_ok()
-            {
-                out.push(id);
+        let Some(e) = events.get(&id) else { continue };
+        if e.deleted_at.is_some() {
+            continue;
+        }
+        let readable = match rooms.get(&e.room) {
+            Some(r) => *r,
+            None => {
+                let r = crate::api::readable(instance, user, &e.room).await.is_ok();
+                rooms.insert(e.room.clone(), r);
+                r
             }
+        };
+        if readable {
+            out.push(id);
         }
     }
     out

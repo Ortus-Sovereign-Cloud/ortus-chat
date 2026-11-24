@@ -777,8 +777,13 @@ pub(crate) async fn send(
     )
     .await?;
     tx.commit().await?;
-    // The people mentioned hear of it (if they are in the room).
-    let members = store::members(s, &room.id).await.unwrap_or_default();
+    // The people mentioned hear of it (if they are in the room); the
+    // room's members are read only when someone was mentioned.
+    let members = if to_tell.iter().any(|u| *u != me.id) {
+        store::members(s, &room.id).await.unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     for user in to_tell.iter().filter(|u| **u != me.id) {
         if !members
             .iter()
