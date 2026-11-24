@@ -1,0 +1,8 @@
+[bindings.swift]
+module_name = "OrtusE2E"
+ffi_module_name = "OrtusE2EFFI"
+ffi_module_filename = "OrtusE2EFFI"
+
+[bindings.kotlin]
+package_name = "org.ortus.e2e"
+cdylib_name = "ortus_e2e_ffi"

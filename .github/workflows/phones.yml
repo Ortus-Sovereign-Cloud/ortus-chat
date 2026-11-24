@@ -1,0 +1,111 @@
+name: phones
+
+# The phones' end-to-end library (phones/e2e) built with its UniFFI
+# bindings: an XCFramework and Swift for iOS, jniLibs and Kotlin for
+# Android, uploaded as workflow artifacts with their SHA-256 sums. Its tests
+# run in ci.yml (ci/check.sh).
+
+on:
+  push:
+    branches: [main]
+    paths: ["phones/e2e/**", ".github/workflows/phones.yml"]
+  pull_request:
+    paths: ["phones/e2e/**", ".github/workflows/phones.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: phones-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ios:
+    runs-on: macos-15
+    defaults:
+      run:
+        working-directory: phones/e2e
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          targets: aarch64-apple-ios, aarch64-apple-ios-sim, x86_64-apple-ios
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: phones/e2e
+      - name: The libraries
+        run: |
+          for target in aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios; do
+            cargo build --locked --release -p ortus-e2e-ffi --lib --target "$target"
+          done
+      - name: The Swift bindings
+        run: |
+          cargo build --locked -p ortus-e2e-ffi --features bindgen
+          target/debug/uniffi-bindgen generate --library target/debug/libortus_e2e_ffi.dylib --language swift --out-dir out/swift
+      - name: The XCFramework
+        run: |
+          mkdir -p out/headers out/sim
+          cp out/swift/OrtusE2EFFI.h out/headers/
+          cp out/swift/OrtusE2EFFI.modulemap out/headers/module.modulemap
+          lipo -create target/aarch64-apple-ios-sim/release/libortus_e2e_ffi.a target/x86_64-apple-ios/release/libortus_e2e_ffi.a -output out/sim/libortus_e2e_ffi.a
+          xcodebuild -create-xcframework \
+            -library target/aarch64-apple-ios/release/libortus_e2e_ffi.a -headers out/headers \
+            -library out/sim/libortus_e2e_ffi.a -headers out/headers \
+            -output out/OrtusE2EFFI.xcframework
+          cd out
+          zip -qry OrtusE2EFFI.xcframework.zip OrtusE2EFFI.xcframework
+          zip -qj OrtusE2E-swift.zip swift/OrtusE2E.swift
+          shasum -a 256 OrtusE2EFFI.xcframework.zip OrtusE2E-swift.zip > SHA256SUMS-ios
+          cat SHA256SUMS-ios
+          ls -l *.zip | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ortus-e2e-ios
+          path: |
+            phones/e2e/out/OrtusE2EFFI.xcframework.zip
+            phones/e2e/out/OrtusE2E-swift.zip
+            phones/e2e/out/SHA256SUMS-ios
+          if-no-files-found: error
+
+  android:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: phones/e2e
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          targets: aarch64-linux-android, armv7-linux-androideabi, x86_64-linux-android
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: phones/e2e
+      - run: cargo install cargo-ndk --locked --version 4.1.2
+      - name: The libraries
+        # 16 KB pages, as Android 15 and Google Play ask.
+        env:
+          RUSTFLAGS: -C link-arg=-Wl,-z,max-page-size=16384
+        run: |
+          export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
+          cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 -o out/jniLibs build --locked --release -p ortus-e2e-ffi --lib
+      - name: The Kotlin bindings
+        run: |
+          cargo build --locked -p ortus-e2e-ffi --features bindgen
+          target/debug/uniffi-bindgen generate --library target/debug/libortus_e2e_ffi.so --language kotlin --out-dir out/kotlin
+      - name: Package
+        run: |
+          cd out
+          zip -qry ortus-e2e-jniLibs.zip jniLibs
+          (cd kotlin && zip -qry ../ortus-e2e-kotlin.zip .)
+          sha256sum ortus-e2e-jniLibs.zip ortus-e2e-kotlin.zip > SHA256SUMS-android
+          cat SHA256SUMS-android
+          ls -l *.zip jniLibs/*/*.so | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ortus-e2e-android
+          path: |
+            phones/e2e/out/ortus-e2e-jniLibs.zip
+            phones/e2e/out/ortus-e2e-kotlin.zip
+            phones/e2e/out/SHA256SUMS-android
+          if-no-files-found: error

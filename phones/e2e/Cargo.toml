@@ -1,0 +1,40 @@
+[package]
+name = "ortus-e2e"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "End-to-end rooms on the phones: matrix-sdk-crypto speaking Ortus's chat API."
+repository = "https://github.com/Ortus-Sovereign-Cloud/ortus-chat"
+publish = false
+
+[dependencies]
+matrix-sdk-crypto = { version = "0.19.1", default-features = false }
+# SQLite built in: Android has none of its own to link.
+matrix-sdk-sqlite = { version = "0.19.1", default-features = false, features = ["crypto-store", "bundled"] }
+ruma = { version = "0.17.2", default-features = false }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1.54.1", default-features = false, features = ["rt"] }
+
+[dev-dependencies]
+# The forged devices of the refusal tests, at the SDK's own version.
+vodozemac = "0.11.2"
+
+# Its own workspace and lock: matrix-sdk-sqlite pins a different rusqlite
+# (links = "sqlite3") than ortus-core, so the two cannot share one graph.
+# The UniFFI layer is a member of its own (ffi/, see its Cargo.toml).
+[workspace]
+members = [".", "ffi"]
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+# The phones' libraries: small.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true

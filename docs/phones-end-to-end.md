@@ -64,6 +64,160 @@ browser already uses (`org.ortus.room` in the room key carries Ortus's id).
   backup; Android: no-backup directory), its passphrase in the Keychain /
   Android Keystore.
 
+## Stage 1, as built (2026-11-25)
+
+`phones/e2e` (`ortus-e2e`, its own Cargo workspace and lock) and
+`phones/e2e/ffi` (`ortus-e2e-ffi`, the UniFFI layer). CI's `phones`
+workflow builds `OrtusE2EFFI.xcframework.zip` (aarch64-apple-ios, and
+aarch64-apple-ios-sim with x86_64-apple-ios in one simulator library),
+`OrtusE2E-swift.zip`, `ortus-e2e-jniLibs.zip` (arm64-v8a, armeabi-v7a,
+x86_64; 16 KB pages) and `ortus-e2e-kotlin.zip` (package `org.ortus.e2e`),
+with SHA-256 sums, as workflow artifacts.
+
+The API (Swift and Kotlin names from UniFFI; every call blocks, call it off
+the main thread):
+
+    OrtusE2e.open(storeDir, passphrase, user, device, serverName, transport)
+    inbox() -> Inbox {messages, roomKeys}
+    decrypt(room, messageJson) -> Opened {text, thread?}   // the message as the chat API gives it
+    send(room, text, thread?) -> message id
+    forget()
+    protocol Transport { http(method, path, body?) -> HttpResponse {status, body} }   // path under /api/v1, JSON text
+
+Errors: `Transport`, `Server {status, body}`, `Store`, `Invalid`,
+`Refused {reason}`, `Forgotten`.
+
+### Decided in code, and where it differs from the design above
+
+- **The room's own Megolm session is the crate's, not the SDK's.** The
+  browser takes a room key only with `org.ortus.room` in it, and the SDK's
+  `share_room_key` builds the `m.room_key` content itself (four fields, its
+  extra fields private). So the crate keeps its outbound session
+  (vodozemac's `GroupSession`, pickled in the store, encrypted), rotates it
+  as the browser does (100 messages, a week, someone left, someone came),
+  and sends the key at **index 0** over the SDK's Olm sessions
+  (`Device::encrypt_event_raw`, sessions from `get_missing_sessions` and
+  the claim call). This also settles "session sharing index": phones share
+  at index 0 like browsers; there is no difference left to document. The SDK
+  still does device keys, one-time and fallback keys, device tracking, Olm,
+  room keys received and decryption; `RoomMessage` and `share_room_key` are
+  not used.
+- **Trust on first use** is the crate's: each device's `curve|ed` is kept
+  on first sight; a device whose keys differ, whose self-signature fails, or
+  whose Curve25519 key another device names, is left out of the SDK's
+  key-query answers, given no room key, and its messages are refused.
+- **Checks on top of the SDK's.** The SDK checks the Olm recipient and
+  sender, the session key's signature and the plaintext's room. The crate
+  also refuses a message when its session is not the `sender_key` it
+  names, when that key and the session's Ed25519 key are not a (first-seen)
+  device of the message's sender, when the sealed thread is not the
+  message's (the cleartext event the SDK sees carries no relation, so the
+  SDK cannot copy one in), and when another message used the same session
+  index (kept in the store).
+- **Matrix ids.** `@{user id in lower case}:{server}` as `store::mxid`. The
+  room's Matrix id is **not** `!{room id}:{server}`: it is the room's own
+  `roomId` (`!{random}:{server}`), which the crate reads from
+  `GET /chat/rooms/{room}`.
+- **Device list.** Ortus has no feed of device changes: each time the crate
+  reads a room's devices (on every send; for opening, at most every 30 s,
+  and again when a sender's device is not known) it marks those people
+  changed for the SDK and answers its key query from that list.
+- **Keys upload.** `PUT /chat/devices/{device}` carries `deviceKeys` every
+  time (the SDK sends them only at first); `open` publishes them again, in
+  case the server let the device go (a person's eleventh device). The SDK's
+  one-time key names are base64 (`+`, `/`), which the server refuses: they
+  are mapped to `-` and `_` (a name is a label; a key is found by itself).
+- **To-device the SDK sends on its own** (a new Olm session after a broken
+  one) goes through a room shared with the recipient, when there is one;
+  key requests and forwarding are off.
+- **Partly kept keys.** A device whose to-device message the server did not
+  keep (`stored`) is not counted as given the key, and gets it with the
+  next message, as in the browser.
+- **`forget()`** deletes the store's files on the phone only. The server
+  has no call to remove a device's keys; it keeps them until the person's
+  eleventh device makes it go.
+- **Tests run the server in another process.** matrix-sdk-sqlite 0.19.1
+  uses rusqlite 0.40 and ortus-core rusqlite 0.41; both link `sqlite3`, so
+  one binary cannot hold both. `phones/e2e/tests` start
+  `examples/e2e_host.rs`, which is the app in process exactly as `tests/`
+  run it (`tests/common`, SQLite and PostgreSQL with S3), and talk to it
+  over stdin and stdout. The browser side is `web/src/e2e.ts` itself under
+  Node (`web/interop/e2e-peer.ts`, with ortus-kit's `call` bridged to the
+  same server and IndexedDB in memory).
+
+### The tests (`cargo test -p ortus-e2e`, in `ci/check.sh`)
+
+- `two_phones_read_each_other_threads_included`: a message and thread
+  replies both ways; the server keeps no text; one's own messages open; the
+  session is kept, changes after 100 messages (an index from the middle of
+  the old one still opens) and when someone leaves (who gets nothing).
+- `a_phone_and_the_browser_read_each_other`: the phone's room key and
+  messages opened by the browser's Sealer, the browser's by the phone,
+  threads included, both orders of Olm session; moved out of its thread is
+  refused.
+- `what_the_wire_format_refuses_is_refused`: a room key for another
+  recipient (with a control that the same key for this device opens), a
+  replayed index, a message moved into a thread, given to another sender or
+  to another room, and a device whose keys the server changed (no room key
+  for it when a newcomer brings a new session; what it seals is refused for
+  not being the sender's device).
+
+## Open: the owner's ruling (stage 1 is not pushed until then)
+
+`cargo deny check` of `phones/e2e` fails, and `ci/check.sh` with it:
+
+1. **MPL-2.0.** matrix-sdk-crypto 0.19.1 is Apache-2.0, but needs, not
+   optionally, `as_variant`, `eyeball` (with `readlock`, `readlock-tokio`),
+   and through matrix-sdk-common `eyeball-im` and `imbl` (with
+   `imbl-sized-chunks`), all MPL-2.0 (`imbl` "MPL-2.0+"). UniFFI (`uniffi`
+   and its crates, 0.32.2) is MPL-2.0 too. deny.toml takes no MPL.
+2. **RUSTSEC-2026-0459.** matrix-sdk-sqlite 0.19.1 pins rusqlite 0.40, whose
+   `libsqlite3-sys` 0.38.2 bundles SQLite 3.53.2: "SQLite versions before
+   3.54.0 can return uninitialized page-cache memory when a process opens a
+   database file together with a sibling write-ahead-log (-wal) file whose
+   page size differs from the database's … The attack vector is local and
+   needs the victim to open the files." matrix-rust-sdk's main moved to
+   rusqlite 0.41.1 on 2026-11-09 (18757f7e08ec), not released yet; that
+   release would also end the `links` clash, so the tests could run the app
+   in their own process.
+
+The ways on:
+
+- **A. Keep the SDK:** allow MPL-2.0 for the phones' graph (the SDK's seven
+  crates and UniFFI), and ignore the advisory until a matrix-sdk-sqlite on
+  rusqlite 0.41 is released (or take that release when it comes).
+- **B. vodozemac alone** (Apache-2.0, already the browser interop test's
+  reference): the crate's own account, Olm sessions and store on rusqlite
+  0.41, which removes the SDK's MPL and the advisory and lets the tests run
+  in process; it reverses the 2026-11-24 decision and is the code the SDK
+  was chosen to avoid. UniFFI's MPL stays a choice of its own: accept it, or
+  a hand-written C ABI with Swift and JNI wrappers.
+
+## Stage 2
+
+- Publish the four zips and their sums as release assets per chat commit
+  (today they are workflow artifacts only); the phones pin them by checksum.
+- iOS (ortus-ios): add the XCFramework and `OrtusE2E.swift`; the store
+  directory in Application Support with complete-until-first-unlock file
+  protection, excluded from backup; the passphrase random, in the Keychain
+  (after first unlock, this device only); `Transport` on the app's
+  authenticated URLSession (synchronous: call the crate off the main
+  thread).
+- Android (ortus-android): add `jniLibs` and the Kotlin file, and JNA
+  (`net.java.dev.jna:jna`, `@aar`) which UniFFI's Kotlin needs; the store
+  in `noBackupFilesDir`; the passphrase wrapped by an Android Keystore key.
+- `user` and `serverName` from `me` of `GET /chat/rooms`
+  (`@{user}:{serverName}`); a device id made once per install (letters and
+  digits) and kept with the passphrase.
+- Rooms: `inbox()` on opening an end-to-end room and on a live update;
+  `decrypt` each message with `sealed`; show a refused one as "cannot be
+  opened" (never its text); `send` for the composer; pin rooms once seen
+  encrypted, as the browser does, and never send them in the clear.
+- Sign-out: `forget()`; a server call to remove a device's keys would let
+  sign-out tell the server too (not there yet).
+- UI tests: an end-to-end room opens, sends, and shows a reply from the
+  browser.
+
 ## Later (needs server and browser work too)
 
 Key backup (`room_keys` endpoints, a recovery key), cross-signing and

@@ -1,0 +1,28 @@
+[package]
+name = "ortus-e2e-ffi"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "UniFFI bindings of ortus-e2e for the iOS and Android apps."
+repository = "https://github.com/Ortus-Sovereign-Cloud/ortus-chat"
+publish = false
+
+# UniFFI is MPL-2.0, which deny.toml does not allow (nor does it allow the
+# MPL-2.0 crates matrix-sdk-crypto itself needs): the owner's ruling is
+# open, docs/phones-end-to-end.md. ortus-e2e itself has no UniFFI in it.
+
+[lib]
+name = "ortus_e2e_ffi"
+crate-type = ["lib", "staticlib", "cdylib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["bindgen"]
+
+[features]
+bindgen = ["uniffi/cli"]
+
+[dependencies]
+ortus-e2e = { path = ".." }
+uniffi = "0.32.2"

@@ -1,2 +1,4 @@
 /target
 /.deps
+/phones/e2e/target
+/phones/e2e/out
