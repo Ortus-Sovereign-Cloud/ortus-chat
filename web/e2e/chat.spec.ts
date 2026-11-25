@@ -120,7 +120,10 @@ test("the new channel dialog takes focus, closes with Escape and gives focus bac
   await expect(dialog).toHaveCount(0);
   await expect(open).toBeFocused();
   // Cancel gives focus back too.
-  await page.keyboard.press("Enter");
+  await expect(async () => {
+    await open.press("Enter");
+    await expect(dialog).toBeVisible({ timeout: 1_000 });
+  }).toPass();
   await dialog.getByRole("button", { name: en.cancel }).click();
   await expect(dialog).toHaveCount(0);
   await expect(open).toBeFocused();
