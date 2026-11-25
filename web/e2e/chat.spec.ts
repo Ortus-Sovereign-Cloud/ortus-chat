@@ -107,3 +107,21 @@ test("a message is edited and deleted in a dialog of the page", async ({ page })
   await deleting.getByRole("button", { name: en.delete }).click();
   await expect(chat.getByText("Gauge at 4.2 m")).toBeHidden();
 });
+
+test("the new channel dialog takes focus, closes with Escape and gives focus back", async ({ page }) => {
+  await page.goto("/chat");
+  const chat = page.locator("ortus-chat-main");
+  const open = chat.getByRole("button", { name: en.newChannel }).first();
+  await open.focus();
+  await page.keyboard.press("Enter");
+  const dialog = chat.getByRole("dialog", { name: en.newChannel });
+  await expect(dialog.getByLabel(en.channelName)).toBeFocused();
+  await page.keyboard.press("Escape");
+  await expect(dialog).toHaveCount(0);
+  await expect(open).toBeFocused();
+  // Cancel gives focus back too.
+  await page.keyboard.press("Enter");
+  await dialog.getByRole("button", { name: en.cancel }).click();
+  await expect(dialog).toHaveCount(0);
+  await expect(open).toBeFocused();
+});

@@ -77,6 +77,13 @@ function hm(ms: number): string {
   return new Intl.DateTimeFormat(lang(), { hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).format(new Date(ms));
 }
 
+/** The focused element, inside shadow roots too. */
+function deepFocus(): HTMLElement | null {
+  let a = document.activeElement;
+  while (a?.shadowRoot?.activeElement) a = a.shadowRoot.activeElement;
+  return a instanceof HTMLElement ? a : null;
+}
+
 @customElement("ortus-chat-main")
 export class OrtusChatMain extends LitElement {
   static override styles = [
@@ -1271,7 +1278,7 @@ export class OrtusChatMain extends LitElement {
 
   private dialogs(): TemplateResult {
     return html`${this.creating
-        ? html`<dialog open aria-label=${t(this.localize, this.creating === "direct" ? "newDirect" : "newChannel")}>
+        ? html`<dialog class="modal" aria-label=${t(this.localize, this.creating === "direct" ? "newDirect" : "newChannel")} @close=${() => ((this.creating = null), (this.error = ""))}>
             <form @submit=${this.createRoom}>
               <h2>${t(this.localize, this.creating === "direct" ? "newDirect" : "newChannel")}</h2>
               ${this.creating !== "direct"
@@ -1286,7 +1293,7 @@ export class OrtusChatMain extends LitElement {
           </dialog>`
         : nothing}
       ${this.directory
-        ? html`<dialog open aria-label=${t(this.localize, "browseChannels")}>
+        ? html`<dialog class="modal" aria-label=${t(this.localize, "browseChannels")} @close=${() => (this.directory = null)}>
             <form @submit=${(e: Event) => e.preventDefault()}>
               <h2>${t(this.localize, "browseChannels")}</h2>
               <ul>
@@ -1297,7 +1304,7 @@ export class OrtusChatMain extends LitElement {
           </dialog>`
         : nothing}
       ${this.taskFor
-        ? html`<dialog open aria-label=${t(this.localize, "turnIntoTask")}>
+        ? html`<dialog class="modal" aria-label=${t(this.localize, "turnIntoTask")} @close=${() => ((this.taskFor = null), (this.error = ""))}>
             <form @submit=${this.makeTask}>
               <h2>${t(this.localize, "turnIntoTask")}</h2>
               <label>${t(this.localize, "taskTitle")}<input class="input" name="title" required .value=${this.taskFor.text.slice(0, 200)} /></label>
@@ -1311,7 +1318,7 @@ export class OrtusChatMain extends LitElement {
           </dialog>`
         : nothing}
       ${this.files
-        ? html`<dialog open aria-label=${t(this.localize, "fromDrive")}>
+        ? html`<dialog class="modal" aria-label=${t(this.localize, "fromDrive")} @close=${() => (this.files = null)}>
             <form @submit=${(e: Event) => e.preventDefault()}>
               <h2>${t(this.localize, "fromDrive")}</h2>
               <ul>${this.files.map((f) => html`<li><button type="button" class="button wide" @click=${() => this.sendFile(f.id)}>${f.name}</button></li>`)}</ul>
@@ -1320,6 +1327,26 @@ export class OrtusChatMain extends LitElement {
             </form>
           </dialog>`
         : nothing}`;
+  }
+
+  /** What had focus before a dialog opened. */
+  private opener: HTMLElement | null = null;
+
+  override updated(): void {
+    // A dialog that just appeared opens as a modal: focus moves into it,
+    // the page behind is inert and Escape closes it.
+    const shown = this.renderRoot.querySelectorAll<HTMLDialogElement>("dialog.modal");
+    for (const d of shown) {
+      if (d.open) continue;
+      this.opener ??= deepFocus();
+      d.showModal();
+    }
+    // Closed by a button, not by Escape: focus goes back where it was.
+    if (!shown.length && this.opener) {
+      const back = this.opener;
+      this.opener = null;
+      if (back.isConnected) back.focus();
+    }
   }
 
   override willUpdate(): void {
