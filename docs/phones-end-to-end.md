@@ -227,6 +227,42 @@ already have a `message`, and UniFFI's Kotlin did not compile with it.
 - UI tests: an end-to-end room opens, sends, and shows a reply from the
   browser.
 
+### Stage 2, as built (2026-11-25)
+
+Both phones open and seal end-to-end rooms (ortus-android 7398eab,
+ortus-ios 3cc2652, against ortus 6544d58 with chat bb172b2).
+
+- Each phone's `ci/e2e-lib.sh` builds the library from source at the chat
+  commit the pinned program names, into `.deps/e2e` (not in git): Android
+  `.so` files for arm64-v8a, armeabi-v7a and x86_64 (16 KB pages) with the
+  Kotlin bindings; iOS an XCFramework with the Swift bindings, as a module
+  of its own (`OrtusE2E`). CI keeps `.deps/e2e` per pin. Their LICENSES.md
+  list the crates inside (generated, checked in CI).
+- The store: Android `noBackupFilesDir/e2e/<user>`, passphrase sealed by
+  the Keystore (`Store`); iOS Application Support `e2e/<user>`, protected
+  until first unlock and excluded from backup, passphrase in the Keychain
+  (after first unlock, this device only). A store that does not open makes
+  a new device (new id, new passphrase).
+- One thread (Android) or serial queue (iOS) of its own runs every call.
+  The library's HTTP goes straight to the server: not the offline cache,
+  not the outbox.
+- The kits refuse `say` for a room seen as end-to-end (`SealedRoom`), so
+  nothing in the clear can leave the phone, offline outbox included; the
+  server refuses it too.
+- Messages that do not open show "cannot be opened on this phone", never
+  their ciphertext; Android logs the library's reason (`ortus-e2e`).
+- Sign-out calls `forget()`.
+- Tests: the kits (no network), and on the emulator and simulator against a
+  real Ortus: another device of the same person (the library in the test
+  process, signed in with the owner's session) writes in a room; the phone
+  opens it; what the phone writes opens on the other device; the server
+  keeps no text. The browser's side is covered by the crate's interop
+  tests (`olm_interop.rs`, `rooms.rs`).
+- Not yet: live updates in a sealed room (it loads on opening and after
+  sending, as plain rooms on the phones do), threads in sealed rooms on
+  the phones, and the notification extension (which never opens the
+  store: a sealed message's notification has no text).
+
 ## Later (needs server and browser work too)
 
 Key backup (`room_keys` endpoints, a recovery key), cross-signing and
