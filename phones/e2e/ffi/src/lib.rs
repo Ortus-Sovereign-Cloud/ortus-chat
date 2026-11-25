@@ -19,13 +19,13 @@ pub struct HttpResponse {
 #[derive(Debug, uniffi::Error)]
 pub enum TransportError {
     /// No answer (offline, a timeout).
-    Failed { message: String },
+    Failed { detail: String },
 }
 
 impl fmt::Display for TransportError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            TransportError::Failed { message } => write!(f, "{message}"),
+            TransportError::Failed { detail } => write!(f, "{detail}"),
         }
     }
 }
@@ -34,7 +34,7 @@ impl std::error::Error for TransportError {}
 
 impl From<uniffi::UnexpectedUniFFICallbackError> for TransportError {
     fn from(e: uniffi::UnexpectedUniFFICallbackError) -> Self {
-        TransportError::Failed { message: e.reason }
+        TransportError::Failed { detail: e.reason }
     }
 }
 
@@ -64,13 +64,13 @@ impl ortus_e2e::Transport for Bridge {
 #[derive(Debug, uniffi::Error)]
 pub enum E2eError {
     /// The HTTP function gave no answer.
-    Transport { message: String },
+    Transport { detail: String },
     /// The server answered with an error.
     Server { status: u16, body: String },
     /// The store could not be opened, read or written (a wrong passphrase).
-    Store { message: String },
+    Store { detail: String },
     /// What was asked does not hold.
-    Invalid { message: String },
+    Invalid { detail: String },
     /// A message this device does not open, and why.
     Refused { reason: String },
     /// After `forget()`.
@@ -80,10 +80,10 @@ pub enum E2eError {
 impl fmt::Display for E2eError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            E2eError::Transport { message } => write!(f, "no answer: {message}"),
+            E2eError::Transport { detail } => write!(f, "no answer: {detail}"),
             E2eError::Server { status, body } => write!(f, "the server answered {status}: {body}"),
-            E2eError::Store { message } => write!(f, "the store: {message}"),
-            E2eError::Invalid { message } => write!(f, "{message}"),
+            E2eError::Store { detail } => write!(f, "the store: {detail}"),
+            E2eError::Invalid { detail } => write!(f, "{detail}"),
             E2eError::Refused { reason } => write!(f, "not opened: {reason}"),
             E2eError::Forgotten => write!(f, "this device was forgotten"),
         }
@@ -96,10 +96,10 @@ impl From<ortus_e2e::Error> for E2eError {
     fn from(e: ortus_e2e::Error) -> Self {
         use ortus_e2e::Error as E;
         match e {
-            E::Transport(message) => E2eError::Transport { message },
+            E::Transport(detail) => E2eError::Transport { detail },
             E::Server { status, body } => E2eError::Server { status, body },
-            E::Store(message) => E2eError::Store { message },
-            E::Invalid(message) => E2eError::Invalid { message },
+            E::Store(detail) => E2eError::Store { detail },
+            E::Invalid(detail) => E2eError::Invalid { detail },
             E::Refused(reason) => E2eError::Refused { reason },
             E::Forgotten => E2eError::Forgotten,
         }

@@ -196,6 +196,9 @@ unmaintained (RUSTSEC-2026-0374).
 
 ## Stage 2
 
+The FFI's error fields are `detail`, not `message`: Kotlin's exceptions
+already have a `message`, and UniFFI's Kotlin did not compile with it.
+
 - The phones build the library themselves from the chat commit they pin
   (no releases to publish): their CI checks out ortus-chat at the pin and
   runs the same build as `phones.yml`; bindings and library come from one
