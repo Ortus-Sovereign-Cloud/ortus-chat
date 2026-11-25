@@ -196,8 +196,10 @@ unmaintained (RUSTSEC-2026-0374).
 
 ## Stage 2
 
-- Publish the four zips and their sums as release assets per chat commit
-  (today they are workflow artifacts only); the phones pin them by checksum.
+- The phones build the library themselves from the chat commit they pin
+  (no releases to publish): their CI checks out ortus-chat at the pin and
+  runs the same build as `phones.yml`; bindings and library come from one
+  build.
 - iOS (ortus-ios): add the XCFramework and `OrtusE2E.swift`; the store
   directory in Application Support with complete-until-first-unlock file
   protection, excluded from backup; the passphrase random, in the Keychain
@@ -214,8 +216,11 @@ unmaintained (RUSTSEC-2026-0374).
   `decrypt` each message with `sealed`; show a refused one as "cannot be
   opened" (never its text); `send` for the composer; pin rooms once seen
   encrypted, as the browser does, and never send them in the clear.
-- Sign-out: `forget()`; a server call to remove a device's keys would let
-  sign-out tell the server too (not there yet).
+- Sign-out: `forget()`. It asks the server to drop the device
+  (`DELETE /chat/devices/:device`: its keys, one-time and fallback keys and
+  waiting messages) and deletes the store; offline, the phone forgets
+  anyway and the server drops the device when the person's eleventh
+  replaces it.
 - UI tests: an end-to-end room opens, sends, and shows a reply from the
   browser.
 

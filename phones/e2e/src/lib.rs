@@ -373,12 +373,16 @@ impl E2e {
         self.rt.block_on(inner.send(room, text, thread))
     }
 
-    /// Forgets this device: its keys and sessions are deleted from the
-    /// phone (the server keeps its published keys until the person's
-    /// eleventh device replaces it).
+    /// Forgets this device: the server is asked to drop its published
+    /// keys and waiting messages (offline, it stays until the person's
+    /// eleventh device replaces it), and its keys and sessions are deleted
+    /// from the phone.
     pub fn forget(&self) -> Result<()> {
         let mut guard = self.lock();
         if let Some(inner) = guard.take() {
+            let path = format!("/chat/devices/{}", enc(inner.device.as_str()));
+            // Signing out goes on without an answer: the phone forgets anyway.
+            let _ = self.rt.block_on(inner.http("DELETE", &path, None));
             // The store's pool is let go inside its runtime.
             let _in = self.rt.enter();
             drop(inner);

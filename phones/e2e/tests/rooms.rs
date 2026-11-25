@@ -136,6 +136,28 @@ fn two_phones_read_each_other_threads_included() {
             read(&w, &a, &room, &after).unwrap().0,
             "{n}"
         );
+
+        // Signing out: the phone forgets its keys, the server its device.
+        let listed = |w: &World| {
+            w.ok(
+                &olena,
+                "GET",
+                &format!("/chat/rooms/{}/devices", enc(&room)),
+                None,
+            )
+            .to_string()
+        };
+        assert!(listed(&w).contains("PHONEA"), "{n}");
+        a.e2e.forget().unwrap();
+        assert_eq!(
+            Err(Error::Forgotten),
+            a.e2e.send(&room, "after signing out", None).map(|_| ()),
+            "{n}"
+        );
+        assert!(
+            !listed(&w).contains("PHONEA"),
+            "{n}: the server dropped the device"
+        );
     }
 }
 

@@ -32,6 +32,7 @@ fn call<A: rust_web_server::application::Application>(
         "GET" => client.get(&url),
         "PATCH" => client.patch(&url),
         "PUT" => client.put(&url),
+        "DELETE" => client.delete(&url),
         _ => client.post(&url),
     };
     r = r
@@ -264,6 +265,55 @@ fn sealed_rooms_keep_nothing_readable() {
             )
             .0,
             "{name}: not a member"
+        );
+
+        // A device of one's own goes (a phone signing out); another
+        // person's call removes only their own device of that name.
+        let spare = Account::new();
+        assert_eq!(
+            200,
+            call(
+                &client,
+                &olena,
+                "PUT",
+                "/chat/devices/SPARE",
+                Some(json!({"deviceKeys": device_keys(&spare, &olena_mx, "SPARE")}))
+            )
+            .0,
+            "{name}"
+        );
+        let count = |who| {
+            call(
+                &client,
+                who,
+                "GET",
+                &format!("/chat/rooms/{room}/devices"),
+                None,
+            )
+            .1["devices"]
+                .as_array()
+                .unwrap()
+                .len()
+        };
+        assert_eq!(3, count(&olena), "{name}");
+        let (status, gone) = call(&client, &marek, "DELETE", "/chat/devices/SPARE", None);
+        assert_eq!(
+            (200, false),
+            (status, gone["removed"] == true),
+            "{name}: {gone}"
+        );
+        assert_eq!(3, count(&olena), "{name}: not his device");
+        let (status, gone) = call(&client, &olena, "DELETE", "/chat/devices/SPARE", None);
+        assert_eq!(
+            (200, true),
+            (status, gone["removed"] == true),
+            "{name}: {gone}"
+        );
+        assert_eq!(2, count(&olena), "{name}: gone");
+        assert_eq!(
+            400,
+            call(&client, &olena, "DELETE", "/chat/devices/no%20such", None).0,
+            "{name}: a device id"
         );
 
         // One-time keys are given out once each; non-members get none.

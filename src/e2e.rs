@@ -334,6 +334,32 @@ async fn forget_device(s: &dyn AsyncStore, user: &str, device: &str) -> Result<(
     Ok(())
 }
 
+/// One of my devices goes: its keys, one-time and fallback keys and the
+/// messages waiting for it (a phone signing out, a browser forgotten).
+async fn remove_device(
+    request: &Request,
+    params: &PathParams,
+    instance: &Arc<Instance>,
+) -> Result<Response, ApiError> {
+    let me = signed(request, instance).await?;
+    let device = params.get("device").unwrap_or_default();
+    if !valid_id(device) {
+        return Err(ApiError::bad_request(
+            "A device id is letters, digits, - and _.",
+        ));
+    }
+    let s = instance.store.as_ref();
+    let had = !s
+        .query(
+            "SELECT 1 FROM chat_devices WHERE user_id = $1 AND device = $2",
+            &[me.id.as_str().into(), device.into()],
+        )
+        .await?
+        .is_empty();
+    forget_device(s, &me.id, device).await?;
+    Ok(ok(&json!({"device": device, "removed": had})))
+}
+
 /// The members' (joined or invited) devices, with their signed keys.
 async fn devices(
     request: &Request,
@@ -690,6 +716,7 @@ async fn say_sealed(
 }
 
 crate::api::with_params!(h_put_device, put_device);
+crate::api::with_params!(h_remove_device, remove_device);
 crate::api::with_params!(h_devices, devices);
 crate::api::with_params!(h_claim, claim);
 crate::api::with_params!(h_send_to_device, send_to_device);
@@ -710,6 +737,7 @@ pub fn routes() -> Vec<Route> {
     };
     vec![
         route(Method::Put, "/chat/devices/:device", "chatDevice", "A device of mine publishes its signed device keys, one-time keys and fallback key: {deviceKeys, oneTimeKeys, fallbackKeys}.", h_put_device),
+        route(Method::Delete, "/chat/devices/:device", "chatDeviceRemove", "One of my devices goes, with its keys and the messages waiting for it: {device, removed}.", h_remove_device),
         route(Method::Get, "/chat/devices/:device/inbox", "chatInbox", "Olm messages waiting for one of my devices, and how many one-time keys it has left.", h_inbox),
         route(Method::Post, "/chat/devices/:device/inbox/done", "chatInboxDone", "Messages a device has taken in: {ids}.", h_inbox_done),
         route(Method::Get, "/chat/rooms/:room/devices", "chatRoomDevices", "An end-to-end room's members' devices with their signed keys (members and invited people).", h_devices),
