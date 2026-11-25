@@ -6,7 +6,15 @@ import { axe } from "./axe.js";
 
 test.use({ bypassCSP: true });
 
-test("chat passes axe: desktop and phone, light and dark", async ({ page }) => {
+test("chat passes axe: desktop and phone, light and dark", async ({ page: owner, browser }) => {
+  // A person of its own: chat's live streams are counted per person, and
+  // the other tests are the owner.
+  const r = await owner.request.post("/api/v1/admin/users", { headers: { "X-Requested-With": "ortus" }, data: { email: `axe-${Date.now()}@ministry.example`, name: "Irena Axe" } });
+  expect(r.status()).toBe(200);
+  const link = new URL((await r.json()).link);
+  const page = await (await browser.newContext({ storageState: { cookies: [], origins: [] }, bypassCSP: true })).newPage();
+  await page.goto(link.pathname + link.hash);
+  await expect(page).toHaveURL(/\/welcome$/);
   const failures: string[] = [];
   for (const [name, size] of [["desktop", { width: 1440, height: 900 }], ["phone", { width: 390, height: 844 }]] as const) {
     for (const scheme of ["light", "dark"] as const) {
@@ -20,4 +28,5 @@ test("chat passes axe: desktop and phone, light and dark", async ({ page }) => {
     }
   }
   expect(failures).toEqual([]);
+  await page.context().close();
 });
