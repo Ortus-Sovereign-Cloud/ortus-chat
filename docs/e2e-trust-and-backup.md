@@ -109,6 +109,29 @@ the recovery key), recover with a key, start or accept a verification,
 its emoji, confirm, and scan or show a QR code. The apps: Settings ›
 Recovery, a shield on rooms and members, the verification sheets.
 
+## As built (26 November 2026)
+
+- Server (chat c6078f1 and after): every route above, and
+  `POST /chat/verification` (typed to-device messages to one's own devices
+  or to someone sharing a room), `GET /chat/keys?user=` (their devices and
+  master key, for verifying), `GET /chat/admin/escrow?email=` (an
+  administrator takes a person's sealed escrow copy; recorded).
+- Browser: recovery set up (Recovery in a sealed room), recovery on a new
+  browser, room keys backed up as they come, the escrow copy, a warning
+  with the room's unverified devices and Verify, verification by emoji
+  (Matrix's m.sas.v1, written on WebCrypto); Admin › Chat with the escrow
+  key and a person's recovery key opened from their copy.
+- Phones: recovery with the recovery key (set up on a computer: the phones
+  do not make one), the warning, verification by emoji (accepting a
+  request, and asking one's own other devices), all by matrix-sdk-crypto.
+- Tests: the formats against matrix-sdk-crypto (`trust_interop.rs`), the
+  browser and a phone on a real server (`trust_phone.rs`: the phone
+  restores the browser's backup; both show the same emoji and finish),
+  the browser flows (`recovery`, `escrow`, `verify` specs), the server's
+  checks (`tests/trust.rs`).
+- Not yet: QR codes (emoji work everywhere); phones asking someone else to
+  verify (they answer anyone's request); setting up recovery on a phone.
+
 ## Order and tests
 
 1. **Server**: the routes with their checks (a signature that does not
