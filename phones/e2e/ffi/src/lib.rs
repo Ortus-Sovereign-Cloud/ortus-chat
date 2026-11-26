@@ -121,6 +121,32 @@ pub struct Inbox {
     pub room_keys: u32,
 }
 
+/// Where recovery stands: set up for the person, and opened on this phone.
+#[derive(uniffi::Record)]
+pub struct RecoveryState {
+    pub set: bool,
+    pub here: bool,
+}
+
+/// A device nobody vouched for.
+#[derive(uniffi::Record)]
+pub struct DeviceRef {
+    pub user: String,
+    pub device: String,
+}
+
+/// A verification by emoji, as the screen shows it.
+#[derive(uniffi::Record)]
+pub struct VerificationView {
+    pub id: String,
+    pub user: String,
+    pub device: Option<String>,
+    /// requested, incoming, waiting, emoji, done or cancelled.
+    pub state: String,
+    /// The seven emoji's numbers in Matrix's table, when there are some to compare.
+    pub emoji: Vec<u8>,
+}
+
 /// End-to-end rooms for one person on this phone.
 #[derive(uniffi::Object)]
 pub struct OrtusE2e {
@@ -186,6 +212,66 @@ impl OrtusE2e {
     }
 
     /// Deletes this device's keys and sessions from the phone.
+    /// Where recovery stands for this person and this phone.
+    pub fn recovery_state(&self) -> Result<RecoveryState, E2eError> {
+        let r = self.inner.recovery_state()?;
+        Ok(RecoveryState {
+            set: r.set,
+            here: r.here,
+        })
+    }
+
+    /// Recovery here with the recovery key: answers how many room keys came
+    /// back from the backup; Invalid when it is not the person's key.
+    pub fn recover(&self, recovery_key: String) -> Result<u32, E2eError> {
+        Ok(self.inner.recover(&recovery_key)?)
+    }
+
+    /// The room's devices nobody vouched for (rooms warn; messages still go).
+    pub fn unverified(&self, room: String) -> Result<Vec<DeviceRef>, E2eError> {
+        Ok(self
+            .inner
+            .unverified(&room)?
+            .into_iter()
+            .map(|(user, device)| DeviceRef { user, device })
+            .collect())
+    }
+
+    /// Takes in what came for this device and moves verifications on (the
+    /// screen calls it every few seconds while one is open).
+    pub fn verifications(&self) -> Result<Vec<VerificationView>, E2eError> {
+        Ok(self
+            .inner
+            .verifications()?
+            .into_iter()
+            .map(|v| VerificationView {
+                id: v.id,
+                user: v.user,
+                device: v.device,
+                state: v.state,
+                emoji: v.emoji,
+            })
+            .collect())
+    }
+
+    /// Asks the person's other devices to verify with this one: its id.
+    pub fn verify_own_devices(&self) -> Result<String, E2eError> {
+        Ok(self.inner.verify_own_devices()?)
+    }
+
+    pub fn accept_verification(&self, id: String) -> Result<(), E2eError> {
+        Ok(self.inner.accept_verification(&id)?)
+    }
+
+    /// Whether the emoji are the same on both screens.
+    pub fn confirm_verification(&self, id: String, same: bool) -> Result<(), E2eError> {
+        Ok(self.inner.confirm_verification(&id, same)?)
+    }
+
+    pub fn cancel_verification(&self, id: String) -> Result<(), E2eError> {
+        Ok(self.inner.cancel_verification(&id)?)
+    }
+
     pub fn forget(&self) -> Result<(), E2eError> {
         Ok(self.inner.forget()?)
     }

@@ -74,6 +74,9 @@ const database = {
 const { Sealer } = await import("../src/e2e.ts");
 const first = await next();
 const sealer = new Sealer(first.me);
+// The latest of each verification, as the screen would show it.
+const views = new Map<string, unknown>();
+sealer.onVerification = (v) => views.set(v.id, v);
 say({ result: "ready" });
 for (;;) {
   const c = await next();
@@ -89,6 +92,21 @@ for (;;) {
       say({ result: null });
     } else if (c.cmd === "open") {
       say({ result: await sealer.open(c.room, c.roomId, c.message.sealed, c.message.sender, c.message.id, c.message.thread ?? null) });
+    } else if (c.cmd === "setUpRecovery") {
+      say({ result: await sealer.setUpRecovery() });
+    } else if (c.cmd === "unverified") {
+      say({ result: await sealer.unverified(c.room) });
+    } else if (c.cmd === "verify") {
+      say({ result: await sealer.verify(c.user) });
+    } else if (c.cmd === "poll") {
+      await sealer.pollVerifications();
+      say({ result: [...views.values()] });
+    } else if (c.cmd === "accept") {
+      await sealer.acceptVerification(c.id);
+      say({ result: null });
+    } else if (c.cmd === "confirm") {
+      await sealer.confirmEmoji(c.id, c.same);
+      say({ result: null });
     } else if (c.cmd === "quit") {
       process.exit(0);
     }

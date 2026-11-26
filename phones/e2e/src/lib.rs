@@ -104,6 +104,9 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+mod trust;
+pub use trust::{RecoveryState, VerificationView};
+
 pub type Result<T> = std::result::Result<T, Error>;
 
 fn store_err(e: impl fmt::Display) -> Error {
@@ -272,6 +275,11 @@ struct Inner {
     /// A room each person was seen in (Olm messages the SDK sends on its
     /// own go through it).
     user_room: HashMap<String, String>,
+    /// People's cross-signing keys as the server gave them (by Matrix id):
+    /// master, selfSigning and (one's own) userSigning.
+    cross: HashMap<String, Value>,
+    /// People who sent this device verification messages.
+    verifying: HashSet<OwnedUserId>,
 }
 
 /// End-to-end rooms for one person on one phone.
@@ -324,6 +332,8 @@ impl E2e {
                 rooms: HashMap::new(),
                 devices: HashMap::new(),
                 user_room: HashMap::new(),
+                cross: HashMap::new(),
+                verifying: HashSet::new(),
             };
             inner.publish().await?;
             Ok::<_, Error>(inner)
@@ -371,6 +381,64 @@ impl E2e {
         let mut guard = self.lock();
         let inner = guard.as_mut().ok_or(Error::Forgotten)?;
         self.rt.block_on(inner.send(room, text, thread))
+    }
+
+    fn with<T>(
+        &self,
+        f: impl for<'a> FnOnce(
+            &'a mut Inner,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T>> + 'a>>,
+    ) -> Result<T> {
+        let mut guard = self.lock();
+        let inner = guard.as_mut().ok_or(Error::Forgotten)?;
+        self.rt.block_on(f(inner))
+    }
+
+    /// Where recovery stands: set up for the person, and opened on this phone.
+    pub fn recovery_state(&self) -> Result<RecoveryState> {
+        self.with(|i| Box::pin(i.recovery_state()))
+    }
+
+    /// Recovery on this phone with the recovery key: the cross-signing keys
+    /// open, this device is signed, and the backup (one the master key
+    /// signed) is restored and kept up. Answers how many room keys came back.
+    pub fn recover(&self, recovery_key: &str) -> Result<u32> {
+        let key = recovery_key.to_string();
+        self.with(move |i| Box::pin(async move { i.recover(&key).await }))
+    }
+
+    /// A room's devices nobody vouched for: (person, device).
+    pub fn unverified(&self, room: &str) -> Result<Vec<(String, String)>> {
+        let room = room.to_string();
+        self.with(move |i| Box::pin(async move { i.unverified(&room).await }))
+    }
+
+    /// Takes in what came for this device and moves verifications on:
+    /// how each stands (the screen polls it).
+    pub fn verifications(&self) -> Result<Vec<VerificationView>> {
+        self.with(|i| Box::pin(i.verifications()))
+    }
+
+    /// Asks one's own other devices to verify with this one.
+    pub fn verify_own_devices(&self) -> Result<String> {
+        self.with(|i| Box::pin(i.verify_own_devices()))
+    }
+
+    pub fn accept_verification(&self, id: &str) -> Result<()> {
+        let id = id.to_string();
+        self.with(move |i| Box::pin(async move { i.accept_verification(&id).await }))
+    }
+
+    /// The person says whether the emoji are the same on both screens.
+    pub fn confirm_verification(&self, id: &str, same: bool) -> Result<()> {
+        let id = id.to_string();
+        self.with(move |i| Box::pin(async move { i.confirm_verification(&id, same).await }))
+    }
+
+    pub fn cancel_verification(&self, id: &str) -> Result<()> {
+        let id = id.to_string();
+        self.with(move |i| Box::pin(async move { i.cancel_verification(&id).await }))
     }
 
     /// Forgets this device: the server is asked to drop its published
@@ -565,6 +633,25 @@ impl Inner {
                             .await
                             .map_err(store_err)?;
                     }
+                    AnyOutgoingRequest::ToDeviceRequest(t)
+                        if Self::outgoing_kind(r.request()).is_some() =>
+                    {
+                        self.forward_verification(t).await?;
+                        self.machine
+                            .mark_request_as_sent(&id, &send_event_to_device::v3::Response::new())
+                            .await
+                            .map_err(store_err)?;
+                    }
+                    AnyOutgoingRequest::SignatureUpload(u) => {
+                        self.upload_signatures(&u.signed_keys).await?;
+                        self.machine
+                            .mark_request_as_sent(
+                                &id,
+                                &ruma::api::client::keys::upload_signatures::v3::Response::new(),
+                            )
+                            .await
+                            .map_err(store_err)?;
+                    }
                     AnyOutgoingRequest::ToDeviceRequest(t) => {
                         self.forward(t).await?;
                         self.machine
@@ -632,6 +719,20 @@ impl Inner {
                 None => continue,
             }
             response.device_keys.insert(user.clone(), devices);
+            let keys = self
+                .cross
+                .get(user.as_str())
+                .cloned()
+                .unwrap_or(Value::Null);
+            if let Ok(k) = serde_json::from_value(keys["master"].clone()) {
+                response.master_keys.insert(user.clone(), k);
+            }
+            if let Ok(k) = serde_json::from_value(keys["selfSigning"].clone()) {
+                response.self_signing_keys.insert(user.clone(), k);
+            }
+            if let Ok(k) = serde_json::from_value(keys["userSigning"].clone()) {
+                response.user_signing_keys.insert(user.clone(), k);
+            }
         }
         response
     }
@@ -723,6 +824,34 @@ impl Inner {
         Ok(())
     }
 
+    pub(crate) async fn take_inbox(&mut self) -> Result<Inbox> {
+        self.inbox().await
+    }
+
+    /// Tells the SDK these people's devices (or cross-signing keys) changed.
+    pub(crate) async fn changed(&mut self, users: &[OwnedUserId]) -> Result<()> {
+        self.machine
+            .update_tracked_users(users.iter().map(|u| u.as_ref()))
+            .await
+            .map_err(store_err)?;
+        let mut lists = DeviceLists::default();
+        lists.changed = users.to_vec();
+        self.machine
+            .receive_sync_changes(
+                EncryptionSyncChanges {
+                    to_device_events: Vec::new(),
+                    changed_devices: &lists,
+                    one_time_keys_counts: &BTreeMap::new(),
+                    unused_fallback_keys: None,
+                    next_batch_token: None,
+                },
+                &decryption_settings(),
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(())
+    }
+
     async fn inbox(&mut self) -> Result<Inbox> {
         let r = self
             .http(
@@ -732,6 +861,22 @@ impl Inner {
             )
             .await?;
         let messages = r["messages"].as_array().cloned().unwrap_or_default();
+        // Verification messages: their senders' keys first, so the SDK knows
+        // the device that speaks.
+        let senders: HashSet<String> = messages
+            .iter()
+            .filter(|m| {
+                m["type"]
+                    .as_str()
+                    .is_some_and(|t| t.starts_with("m.key.verification."))
+            })
+            .filter_map(|m| m["sender"].as_str().map(str::to_string))
+            .collect();
+        for sender in senders {
+            self.note_verifying(&sender);
+            self.read_keys_of(&sender).await?;
+            self.process(None).await?;
+        }
         let mut events = Vec::new();
         let mut ids = Vec::new();
         for m in &messages {
@@ -803,6 +948,11 @@ impl Inner {
         for d in r["devices"].as_array().into_iter().flatten() {
             if let Some(k) = self.check_device(d).await? {
                 known.push(k);
+            }
+        }
+        if let Some(people) = r["crossSigning"].as_object() {
+            for (who, keys) in people {
+                self.cross.insert(who.clone(), keys.clone());
             }
         }
         // A Curve25519 key is one device's: two naming it are both refused.

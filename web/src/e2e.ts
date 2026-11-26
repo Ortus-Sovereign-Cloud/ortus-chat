@@ -51,6 +51,8 @@ interface Outbound {
 interface Inbound {
   session: olm.MegolmInbound;
   senderUser: string;
+  /** The Ed25519 key of the device that made the session (for backups). */
+  signing?: string;
 }
 
 /** This browser's cross-signing keys and backup key (seeds), after recovery was set up or used. */
@@ -346,7 +348,7 @@ export class Sealer {
         const where = this.key("in", `${room}|${theirs}|${c.session_id}`);
         const had = await get<Inbound>(where);
         if (!had || (had.senderUser === m.sender && had.session.ratchet.index > inbound.ratchet.index)) {
-          await put(where, { session: inbound, senderUser: m.sender } satisfies Inbound);
+          await put(where, { session: inbound, senderUser: m.sender, signing: p.keys?.ed25519 } satisfies Inbound);
           if (c.room_id) await this.backUp([{ roomId: c.room_id, room, senderKey: theirs, sessionId: c.session_id, inbound, signingKey: p.keys?.ed25519 ?? "" }]).catch(() => undefined);
         }
       } catch {
@@ -385,7 +387,7 @@ export class Sealer {
       const initialKey = await olm.sessionKey(session);
       out = { id: olm.sessionId(session.signing.publicKey), session, initialKey, sharedWith: [], created: Date.now(), count: 0 };
       const inbound = await olm.megolmInbound(initialKey);
-      await put(this.key("in", `${room}|${olm.b64(a.identity.publicKey)}|${out.id}`), { session: inbound, senderUser: this.me } satisfies Inbound);
+      await put(this.key("in", `${room}|${olm.b64(a.identity.publicKey)}|${out.id}`), { session: inbound, senderUser: this.me, signing: olm.b64(a.signing.publicKey) } satisfies Inbound);
       await put(where, out);
       await this.backUp([{ roomId, room, senderKey: olm.b64(a.identity.publicKey), sessionId: out.id, inbound, signingKey: olm.b64(a.signing.publicKey) }]).catch(() => undefined);
     }
@@ -645,7 +647,7 @@ export class Sealer {
       const info = await call<{ room?: { roomId?: string }; roomId?: string }>("GET", `/chat/rooms/${enc(room)}`).catch(() => null);
       const roomId = info?.room?.roomId ?? info?.roomId;
       if (!roomId) continue;
-      out.push({ roomId, room, senderKey, sessionId, inbound: rec.session, signingKey: senderKey === olm.b64(a.identity.publicKey) ? olm.b64(a.signing.publicKey) : "" });
+      out.push({ roomId, room, senderKey, sessionId, inbound: rec.session, signingKey: rec.signing ?? (senderKey === olm.b64(a.identity.publicKey) ? olm.b64(a.signing.publicKey) : "") });
     }
     for (let i = 0; i < out.length; i += 200) await this.backUp(out.slice(i, i + 200));
   }

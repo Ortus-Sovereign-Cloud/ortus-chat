@@ -266,7 +266,7 @@ export async function backupRoomKey(
   const exported = {
     algorithm: "m.megolm.v1.aes-sha2",
     sender_key: session.senderKey,
-    sender_claimed_keys: { ed25519: session.signingKey },
+    sender_claimed_keys: session.signingKey ? { ed25519: session.signingKey } : {},
     forwarding_curve25519_key_chain: [],
     session_key: session.sessionKey,
   };
