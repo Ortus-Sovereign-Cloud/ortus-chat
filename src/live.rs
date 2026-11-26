@@ -3,6 +3,7 @@
 //! is typing. Read from the database, so it works on every node.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
@@ -51,50 +52,73 @@ pub const WAKE_MIGRATIONS: &[Migration] = &[Migration {
 /// Streams open per person at most.
 const MAX_STREAMS: usize = 10;
 
-static STREAMS: LazyLock<Mutex<HashMap<String, usize>>> = LazyLock::new(Default::default);
+/// Each person's open streams, oldest first: (id, told to end).
+type Streams = HashMap<String, Vec<(u64, Arc<AtomicBool>)>>;
+static STREAMS: LazyLock<Mutex<Streams>> = LazyLock::new(Default::default);
+static NEXT: AtomicU64 = AtomicU64::new(1);
 
-struct Open(String);
+/// One open stream of a person; it lets its place go when dropped.
+struct Open {
+    user: String,
+    id: u64,
+    ended: Arc<AtomicBool>,
+}
 
 impl Open {
-    fn take(user: &str) -> Option<Open> {
+    /// A place for a new stream. At the cap the person's oldest stream is
+    /// told to end (a page closed a moment ago is still counted until its
+    /// next ping fails): the window just opened is the one in use.
+    fn take(user: &str) -> Open {
         let mut all = STREAMS.lock().unwrap_or_else(|e| e.into_inner());
-        let n = all.entry(user.to_string()).or_insert(0);
-        if *n >= MAX_STREAMS {
-            return None;
+        let mine = all.entry(user.to_string()).or_default();
+        let live: Vec<_> = mine
+            .iter()
+            .filter(|(_, e)| !e.load(Ordering::Relaxed))
+            .collect();
+        if live.len() >= MAX_STREAMS {
+            live[0].1.store(true, Ordering::Relaxed);
         }
-        *n += 1;
-        Some(Open(user.to_string()))
+        let open = Open {
+            user: user.to_string(),
+            id: NEXT.fetch_add(1, Ordering::Relaxed),
+            ended: Arc::new(AtomicBool::new(false)),
+        };
+        mine.push((open.id, Arc::clone(&open.ended)));
+        open
+    }
+
+    /// Told to make way for a newer stream of the same person.
+    fn ended(&self) -> bool {
+        self.ended.load(Ordering::Relaxed)
     }
 }
 
 impl Drop for Open {
     fn drop(&mut self) {
         let mut all = STREAMS.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(n) = all.get_mut(&self.0) {
-            *n = n.saturating_sub(1);
-            if *n == 0 {
-                all.remove(&self.0);
+        if let Some(mine) = all.get_mut(&self.user) {
+            mine.retain(|(id, _)| *id != self.id);
+            if mine.is_empty() {
+                all.remove(&self.user);
             }
         }
     }
 }
 
-fn events(request: &Request, instance: Arc<Instance>, user: String) -> Response {
-    let Some(open) = Open::take(&user) else {
-        return answer(
-            request,
-            Err::<Response, _>(ApiError::too_many("Too many open chat windows.")),
-        );
-    };
+fn events(_request: &Request, instance: Arc<Instance>, user: String) -> Response {
+    let open = Open::take(&user);
     let (sender, response) = SseStream::new().keep_alive(Duration::from_secs(15)).start();
     ortus_core::runtime::io().spawn(async move {
-        let _open = open;
+        let open = open;
         let started = store::now();
         let mut known: HashMap<String, i64> = HashMap::new();
         let mut typing_seen: HashMap<String, String> = HashMap::new();
         let mut first = true;
         let mut pinged = started;
         loop {
+            if open.ended() {
+                return;
+            }
             let s = instance.store.as_ref();
             let rooms = match store::rooms_of(s, &user).await {
                 Ok(r) => r,
@@ -251,4 +275,32 @@ pub fn routes() -> Vec<Route> {
         Route { method: Method::Get, path: "/chat/events", id: "chatEvents", tag: "chat", summary: "Server-sent events: `event` (a room's new event: message, reply, edit, deletion, reaction), `room` (a new room or invitation), `typing`.", access: Access::Signed, response: crate::api::object, handler: h_events },
         Route { method: Method::Post, path: "/chat/rooms/:room/typing", id: "chatTyping", tag: "chat", summary: "The person is typing in a room (for five seconds).", access: Access::Signed, response: crate::api::object, handler: h_typing },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn at_the_cap_the_oldest_stream_makes_way() {
+        let user = "streams-test-user";
+        let first: Vec<Open> = (0..MAX_STREAMS).map(|_| Open::take(user)).collect();
+        assert!(first.iter().all(|o| !o.ended()), "room for ten");
+        let newest = Open::take(user);
+        assert!(first[0].ended(), "the oldest is told to end");
+        assert!(
+            first[1..].iter().all(|o| !o.ended()) && !newest.ended(),
+            "only the oldest"
+        );
+        // A twelfth: the next oldest still running makes way, not the one told already.
+        let twelfth = Open::take(user);
+        assert!(first[1].ended() && !twelfth.ended());
+        drop(first);
+        drop(newest);
+        drop(twelfth);
+        assert!(
+            !STREAMS.lock().unwrap().contains_key(user),
+            "all places given back"
+        );
+    }
 }
