@@ -236,17 +236,15 @@ impl World {
     }
 
     pub fn phone(&self, who: &Person, device: &str) -> Phone {
+        self.phone_via(who, device, self.transport(who))
+    }
+
+    /// A phone whose calls go through `transport` (one that fails, say).
+    pub fn phone_via(&self, who: &Person, device: &str, transport: Arc<dyn Transport>) -> Phone {
         let dir = dir();
         let (user, server) = who.ids();
-        let e2e = E2e::open(
-            &dir.0,
-            "a passphrase",
-            &user,
-            device,
-            &server,
-            self.transport(who),
-        )
-        .unwrap_or_else(|e| panic!("{}: open: {e}", self.name));
+        let e2e = E2e::open(&dir.0, "a passphrase", &user, device, &server, transport)
+            .unwrap_or_else(|e| panic!("{}: open: {e}", self.name));
         Phone {
             e2e,
             dir,

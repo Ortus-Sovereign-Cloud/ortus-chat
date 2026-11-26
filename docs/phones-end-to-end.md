@@ -263,12 +263,12 @@ ortus-ios 3cc2652, against ortus 6544d58 with chat bb172b2).
   the phones, and the notification extension (which never opens the
   store: a sealed message's notification has no text).
 
-## Later (needs server and browser work too)
+## Trust (built: see e2e-trust-and-backup.md)
 
-Key backup (`room_keys` endpoints, a recovery key), cross-signing and
-device verification (QR or emoji), so a server adding a device to someone
-is detected. Each needs new chat endpoints and the browser to take part;
-they are a second step, not V1 of phones in end-to-end rooms.
+Key backup with a recovery key (set up on a phone or in the browser, with
+the organisation's escrow copy), cross-signing, and device verification by
+QR code or emoji, so a server adding a device to someone is shown as
+unverified in every room it is in.
 
 ## Tests
 

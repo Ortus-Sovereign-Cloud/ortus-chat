@@ -172,12 +172,41 @@ impl Inner {
             .await
             .is_some_and(|d| d["key"].is_string());
         let status = self.machine.cross_signing_status().await;
-        // Keys made here whose set-up did not finish (the server refused
-        // them) do not count: set-up is offered again and uploads them anew.
+        // Keys made here count only when they are the person's on the
+        // server: a set-up that stopped half-way, then finished elsewhere,
+        // leaves keys here that are nobody's (the recovery key is asked for).
+        let held = status.has_master && status.has_self_signing && status.has_user_signing;
         Ok(RecoveryState {
             set,
-            here: set && status.has_master && status.has_self_signing && status.has_user_signing,
+            here: set && held && self.master_is_the_servers().await?,
         })
+    }
+
+    /// The master key this phone holds is the one the server has for the person.
+    async fn master_is_the_servers(&self) -> Result<bool> {
+        let Some(seed) = self
+            .machine
+            .export_cross_signing_keys()
+            .await
+            .map_err(crate::store_err)?
+            .and_then(|k| k.master_key.clone())
+        else {
+            return Ok(false);
+        };
+        let Ok(secret) = vodozemac::Ed25519SecretKey::from_base64(&seed) else {
+            return Ok(false);
+        };
+        let ours = secret.public_key().to_base64();
+        let me = self.me.to_string();
+        let r = self
+            .http("GET", &format!("/chat/keys?user={}", enc(&me)), None)
+            .await?;
+        let theirs = r["crossSigning"][&me]["master"]["keys"]
+            .as_object()
+            .and_then(|k| k.values().next())
+            .and_then(|v| v.as_str())
+            .map(|k| k.trim_end_matches('=').to_string());
+        Ok(theirs.as_deref() == Some(ours.trim_end_matches('=')))
     }
 
     /// Sets recovery up from this phone (the person's first device to do
@@ -196,7 +225,9 @@ impl Inner {
             .get(&me)
             .and_then(|k| k["master"]["keys"].as_object().cloned());
         let status = self.machine.cross_signing_status().await;
-        if theirs.is_some_and(|k| !k.is_empty()) && !status.has_master {
+        if theirs.is_some_and(|k| !k.is_empty())
+            && !(status.has_master && self.master_is_the_servers().await?)
+        {
             // Another device made cross-signing keys: recovery is theirs to finish.
             return Err(Error::Invalid(
                 "Recovery is being set up on another device.".into(),
@@ -294,10 +325,8 @@ impl Inner {
         }
         let text = key.to_base58();
         // The organisation's escrow copy, as the browser seals it.
-        let policy = self
-            .http("GET", "/chat/policy", None)
-            .await
-            .unwrap_or_default();
+        // Not reached, not set up: never without the escrow copy the organisation asked for.
+        let policy = self.http("GET", "/chat/policy", None).await?;
         if let Some(escrow) = policy["escrowKey"].as_str() {
             let public = vodozemac::Curve25519PublicKey::from_base64(escrow)
                 .map_err(|e| Error::Invalid(format!("the escrow key: {e}")))?;

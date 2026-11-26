@@ -340,3 +340,104 @@ fn a_phone_verifies_another_persons_device() {
         );
     }
 }
+
+/// The server's transport, except that one call (method and path) fails
+/// once, as a phone losing its connection half-way.
+struct FailOnce {
+    inner: std::sync::Arc<dyn ortus_e2e::Transport>,
+    method: &'static str,
+    path: &'static str,
+    failed: std::sync::atomic::AtomicBool,
+}
+
+impl ortus_e2e::Transport for FailOnce {
+    fn http(&self, method: &str, path: &str, body: Option<&str>) -> Result<(u16, String), String> {
+        if method == self.method
+            && path == self.path
+            && !self.failed.swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err("offline".into());
+        }
+        self.inner.http(method, path, body)
+    }
+}
+
+fn failing_once(
+    w: &World,
+    who: &Person,
+    method: &'static str,
+    path: &'static str,
+) -> std::sync::Arc<dyn ortus_e2e::Transport> {
+    std::sync::Arc::new(FailOnce {
+        inner: w.transport(who),
+        method,
+        path,
+        failed: std::sync::atomic::AtomicBool::new(false),
+    })
+}
+
+#[test]
+fn a_set_up_cut_half_way_is_finished_or_given_way() {
+    for w in World::all() {
+        let n = &w.name;
+        // Cut after the cross-signing keys and the backup went up: tried again, it finishes.
+        let olena = w.person("olena@ministry.example", true);
+        let (room, _) = w.sealed_room(&olena, &[]);
+        let phone = w.phone_via(
+            &olena,
+            "PHONEA",
+            failing_once(&w, &olena, "PUT", "/chat/account-data/m.megolm_backup.v1"),
+        );
+        let sent = phone.e2e.send(&room, "Before the cut", None).unwrap();
+        assert!(phone.e2e.set_up_recovery().is_err(), "{n}: cut");
+        let state = phone.e2e.recovery_state().unwrap();
+        assert!(!state.set && !state.here, "{n}: not set up: {state:?}");
+        let key = phone.e2e.set_up_recovery().expect("tried again");
+        assert!(phone.e2e.recovery_state().unwrap().here, "{n}");
+        let mut browser = Browser::start(&w, &olena);
+        browser.ask(json!({"cmd": "ready"}));
+        let restored = browser.ask(json!({"cmd": "recover", "key": key}));
+        assert!(restored.as_u64().unwrap() >= 1, "{n}: {restored}");
+        let _ = sent;
+
+        // Cut the same way, then set up in a browser instead: the phone's
+        // keys are nobody's, and it asks for the recovery key.
+        let taras = w.person("taras@ministry.example", true);
+        let phone = w.phone_via(
+            &taras,
+            "PHONET",
+            failing_once(&w, &taras, "PUT", "/chat/account-data/m.megolm_backup.v1"),
+        );
+        assert!(phone.e2e.set_up_recovery().is_err(), "{n}: cut");
+        let mut browser = Browser::start(&w, &taras);
+        browser.ask(json!({"cmd": "ready"}));
+        let key = browser.ask(json!({"cmd": "setUpRecovery"}));
+        let Some(key) = key.as_str() else {
+            panic!("{n}: the browser sets up: {key}");
+        };
+        let state = phone.e2e.recovery_state().unwrap();
+        assert!(
+            state.set && !state.here,
+            "{n}: the phone's keys are not the person's: {state:?}"
+        );
+        phone
+            .e2e
+            .recover(key)
+            .expect("recovers with the browser's key");
+        assert!(phone.e2e.recovery_state().unwrap().here, "{n}");
+
+        // The escrow key cannot be read: nothing is set up without its copy.
+        let iryna = w.person("iryna@ministry.example", true);
+        let phone = w.phone_via(
+            &iryna,
+            "PHONEI",
+            failing_once(&w, &iryna, "GET", "/chat/policy"),
+        );
+        assert!(
+            phone.e2e.set_up_recovery().is_err(),
+            "{n}: no policy, no set-up"
+        );
+        assert!(!phone.e2e.recovery_state().unwrap().set, "{n}");
+        assert!(phone.e2e.set_up_recovery().is_ok(), "{n}: tried again");
+    }
+}

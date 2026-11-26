@@ -809,7 +809,7 @@ export class Sealer {
     if (v.view.user !== this.me) {
       const master = keys.crossSigning[v.view.user]?.master;
       const theirs = firstKey(master);
-      if (!mine || !master || !theirs) return this.startSasIfOurs(a, v);
+      if (!mine || !master || !theirs) return this.emojiInstead(a, v);
       mode = 0;
       first = olm.b64(mine.master.publicKey);
       second = theirs[1];
@@ -824,7 +824,7 @@ export class Sealer {
         sign = { kind: "device", object: plain(d.deviceKeys) };
       } else {
         const master = firstKey(keys.crossSigning[this.me]?.master);
-        if (!master) return this.startSasIfOurs(a, v);
+        if (!master) return this.emojiInstead(a, v);
         mode = 2;
         first = olm.b64(a.signing.publicKey);
         second = master[1];
@@ -846,9 +846,9 @@ export class Sealer {
     v.view.state = "qr";
   }
 
-  /** No code possible: emoji, started by the side that asked. */
-  private async startSasIfOurs(a: Account, v: Verification): Promise<void> {
-    if (v.started) await this.startSas(a, v);
+  /** No code possible (this browser lacks the keys one needs): emoji, started here. */
+  private async emojiInstead(a: Account, v: Verification): Promise<void> {
+    await this.startSas(a, v);
   }
 
   /** The other device scanned the code and says so on its screen: whether it does. */
