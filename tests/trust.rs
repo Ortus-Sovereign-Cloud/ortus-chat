@@ -559,6 +559,69 @@ fn trust_and_backup() {
             "{name}: the other setting stays"
         );
 
+        // Verification messages: to one's own other devices, or to someone
+        // one shares a room with; carried with their type.
+        let anna = signed_in(&instance, "anna@ministry.example", Role::Member);
+        let anna_mx = mx(&anna);
+        let annas = Account::new();
+        assert_eq!(
+            200,
+            call(
+                &client,
+                &anna,
+                "PUT",
+                "/chat/devices/ANNA",
+                Some(json!({"deviceKeys": device_keys(&annas, &anna_mx, "ANNA")}))
+            )
+            .0
+        );
+        let start = json!({"transaction_id": "T1", "method": "m.sas.v1", "from_device": "LAPTOP"});
+        let send = |token: &str, user: &str, device: &str, kind: &str| {
+            call(
+                &client,
+                token,
+                "POST",
+                "/chat/verification",
+                Some(
+                    json!({"user": user, "device": device, "fromDevice": "LAPTOP", "type": kind, "content": start}),
+                ),
+            )
+        };
+        let (status, out) = send(&olena, &olena_mx, "*", "m.key.verification.request");
+        assert_eq!(
+            (200, 1),
+            (status, out["sent"].as_i64().unwrap_or(0)),
+            "{name}: her other device, not this one: {out}"
+        );
+        let inbox = call(&client, &olena, "GET", "/chat/devices/PHONE/inbox", None).1;
+        let got = inbox["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["type"] == "m.key.verification.request")
+            .cloned();
+        assert_eq!(
+            Some("T1"),
+            got.as_ref()
+                .and_then(|m| m["content"]["transaction_id"].as_str()),
+            "{name}: {inbox}"
+        );
+        assert_eq!(
+            200,
+            send(&olena, &marek_mx, "HIS", "m.key.verification.start").0,
+            "{name}: they share a room"
+        );
+        assert_eq!(
+            403,
+            send(&olena, &anna_mx, "ANNA", "m.key.verification.start").0,
+            "{name}: no shared room"
+        );
+        assert_eq!(
+            400,
+            send(&olena, &marek_mx, "HIS", "m.room.encrypted").0,
+            "{name}: verification types only"
+        );
+
         // The escrow copy: an administrator takes a person's, once they made one.
         let marek_escrow = "/chat/admin/escrow?email=marek@ministry.example";
         assert_eq!(

@@ -734,6 +734,134 @@ async fn get_keys(request: &Request, instance: &Arc<Instance>) -> Result<Respons
     Ok(ok(&json!({"rooms": rooms})))
 }
 
+// ---- verification messages -------------------------------------------------
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Verification {
+    /// The person's Matrix id.
+    user: String,
+    /// One of their devices, or "*" for all of them (a request).
+    device: String,
+    from_device: String,
+    #[serde(rename = "type")]
+    kind: String,
+    content: Value,
+}
+
+/// Someone's devices' keys and master key, for verifying them (oneself, or
+/// someone one shares a room with), with the viewer's signatures on them.
+async fn get_keys_of(request: &Request, instance: &Arc<Instance>) -> Result<Response, ApiError> {
+    let me = crate::api::signed(request, instance).await?;
+    let server = store::server_name(instance);
+    let user = crate::api::query(request, "user")
+        .and_then(|u| {
+            u.strip_prefix('@')
+                .and_then(|r| r.strip_suffix(&format!(":{server}")))
+                .map(str::to_string)
+        })
+        .ok_or_else(|| bad("Whose keys: ?user=@person:server"))?;
+    let s = instance.store.as_ref();
+    if user != me.id && !shares_room(s, &me.id, &user).await? {
+        return Err(ApiError::forbidden());
+    }
+    let mut devices: Vec<Value> = s
+        .query("SELECT device, keys FROM chat_devices WHERE user_id = $1 ORDER BY created_at", &[user.as_str().into()])
+        .await?
+        .iter()
+        .map(|r| json!({"device": r.text(0), "deviceKeys": serde_json::from_str::<Value>(r.text(1).unwrap_or("null")).unwrap_or(Value::Null), "userId": user}))
+        .collect();
+    let cross_signing = for_devices(
+        instance,
+        &me.id,
+        &[user.clone(), me.id.clone()],
+        &mut devices,
+    )
+    .await;
+    Ok(ok(
+        &json!({"devices": devices, "crossSigning": cross_signing}),
+    ))
+}
+
+async fn shares_room(s: &dyn AsyncStore, a: &str, b: &str) -> Result<bool, ApiError> {
+    Ok(!s
+        .query(
+            "SELECT 1 FROM chat_members x JOIN chat_members y ON x.room = y.room WHERE x.user_id = $1 AND y.user_id = $2 AND x.state IN ('join', 'invite') AND y.state IN ('join', 'invite') LIMIT 1",
+            &[a.into(), b.into()],
+        )
+        .await?
+        .is_empty())
+}
+
+/// A verification message (m.key.verification.*) to one's own devices, or
+/// to someone one shares a room with: not sealed (Matrix's way), carried
+/// with its type, under the same allowance per sender as room keys.
+async fn post_verification(
+    request: &Request,
+    instance: &Arc<Instance>,
+) -> Result<Response, ApiError> {
+    let me = crate::api::signed(request, instance).await?;
+    let input: Verification = body(request)?;
+    crate::e2e::my_device(instance, &me.id, &input.from_device).await?;
+    let text = input.content.to_string();
+    if !input.kind.starts_with("m.key.verification.")
+        || input.kind.len() > 64
+        || !input.content.is_object()
+        || text.len() > 16 * 1024
+    {
+        return Err(bad(
+            "A verification message is an m.key.verification.* object of at most 16 KB.",
+        ));
+    }
+    let server = store::server_name(instance);
+    let user = input
+        .user
+        .strip_prefix('@')
+        .and_then(|r| r.strip_suffix(&format!(":{server}")))
+        .ok_or_else(|| bad("Verification is with people of this server."))?
+        .to_string();
+    let s = instance.store.as_ref();
+    if user != me.id && !shares_room(s, &me.id, &user).await? {
+        return Err(ApiError::forbidden());
+    }
+    let devices: Vec<String> = s
+        .query(
+            "SELECT device FROM chat_devices WHERE user_id = $1",
+            &[user.as_str().into()],
+        )
+        .await?
+        .iter()
+        .filter_map(|r| r.text(0).map(str::to_string))
+        .filter(|d| input.device == "*" || *d == input.device)
+        .filter(|d| !(user == me.id && *d == input.from_device))
+        .collect();
+    let sender = crate::e2e::me_mx(instance, &me.id);
+    let wrapped =
+        json!({"ortus.verification": {"type": input.kind, "content": input.content}}).to_string();
+    let mut sent = 0;
+    for device in &devices {
+        let pending = s
+            .query(
+                "SELECT COUNT(*) FROM chat_to_device WHERE user_id = $1 AND device = $2 AND sender = $3",
+                &[user.as_str().into(), device.as_str().into(), sender.as_str().into()],
+            )
+            .await?
+            .first()
+            .and_then(|r| r.int(0))
+            .unwrap_or(0);
+        if pending >= crate::e2e::MAX_PENDING_PER_SENDER {
+            continue;
+        }
+        s.execute(
+            "INSERT INTO chat_to_device (id, user_id, device, sender, sender_device, content, at) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            &[format!("tv{}", ortus_core::auth::random_hex(12)).into(), user.as_str().into(), device.as_str().into(), sender.as_str().into(), input.from_device.as_str().into(), wrapped.as_str().into(), now().into()],
+        )
+        .await?;
+        sent += 1;
+    }
+    Ok(ok(&json!({"sent": sent})))
+}
+
 // ---- the organisation's escrow ----------------------------------------------
 
 /**
@@ -809,6 +937,8 @@ handler!(h_delete_version, delete_version, params);
 handler!(h_put_keys, put_keys);
 handler!(h_get_keys, get_keys);
 handler!(h_get_escrow, get_escrow);
+handler!(h_post_verification, post_verification);
+handler!(h_get_keys_of, get_keys_of);
 
 pub fn routes() -> Vec<Route> {
     let route = |method, path, id, summary, handler| Route {
@@ -831,6 +961,8 @@ pub fn routes() -> Vec<Route> {
         route(Method::Delete, "/chat/backup/version/:version", "chatBackupDelete", "Deletes a backup and its keys.", h_delete_version),
         route(Method::Put, "/chat/backup/keys", "chatBackupKeysSet", "Room keys into my current backup (?version=): {rooms: {room: {sessions: {id: keyData}}}}; a key is replaced only by a better copy.", h_put_keys),
         route(Method::Get, "/chat/backup/keys", "chatBackupKeys", "The room keys in a backup of mine (?version=).", h_get_keys),
+        route(Method::Post, "/chat/verification", "chatVerification", "A verification message to my own devices or to someone I share a room with: {user, device (or *), fromDevice, type, content}.", h_post_verification),
+        route(Method::Get, "/chat/keys", "chatKeysOf", "Someone's devices' keys and master key, for verifying them (?user=): oneself, or someone I share a room with.", h_get_keys_of),
         route(Method::Get, "/chat/admin/escrow", "chatEscrowCopy", "An administrator takes a person's escrow copy (?email=): their recovery key sealed to the organisation's escrow key; recorded.", h_get_escrow),
     ]
 }

@@ -2,7 +2,8 @@
 // open room in the middle, a thread on the right with its recorded
 // decision, which can become a task. Everything new arrives live.
 import { ApiError, LitElement, LocalizeController, call, controls, css, customElement, html, nothing, state, type TemplateResult } from "ortus-kit";
-import { Sealer, type RecoveryState, type Sealed } from "./e2e.js";
+import { Sealer, type RecoveryState, type Sealed, type VerificationView } from "./e2e.js";
+import { EMOJI } from "./verify.js";
 import { t } from "./i18n.js";
 
 interface RoomItem {
@@ -268,8 +269,20 @@ export class OrtusChatMain extends LitElement {
         font-size: 14px;
       }
       .unverified {
+        border: 0;
+        background: none;
+        padding: 0;
         color: var(--ortus-amber, #f5a35b);
+        font: inherit;
         font-size: 14px;
+        cursor: pointer;
+        text-decoration: underline;
+      }
+      .emoji {
+        display: flex;
+        gap: 12px;
+        font-size: 36px;
+        flex-wrap: wrap;
       }
       .recovery-key {
         display: block;
@@ -737,6 +750,10 @@ export class OrtusChatMain extends LitElement {
   @state() private recoveryKey = "";
   @state() private recoveryNote = "";
   @state() private recoveryBusy = false;
+  /** The verification on screen (by emoji), and the list of who is not vouched for. */
+  @state() private verification: VerificationView | null = null;
+  @state() private unverifiedOpen = false;
+  private verifier = 0;
   /** End-to-end rooms on this browser. */
   private sealer: Sealer | null = null;
   private events: EventSource | null = null;
@@ -764,6 +781,8 @@ export class OrtusChatMain extends LitElement {
       this.events = null;
       window.clearInterval(this.poller);
       this.poller = 0;
+      window.clearInterval(this.verifier);
+      this.verifier = 0;
     }, 0);
   }
 
@@ -932,7 +951,16 @@ export class OrtusChatMain extends LitElement {
     this.roomsFailed = "";
     this.rooms = r.rooms;
     this.people = { ...this.people, ...r.people };
-    if (r.me !== this.me || !this.sealer) this.sealer = new Sealer(r.me);
+    if (r.me !== this.me || !this.sealer) {
+      this.sealer = new Sealer(r.me);
+      this.sealer.onVerification = (v) => {
+        this.verification = v;
+        if (v.state === "done" && this.current) void this.syncKeys(this.current);
+      };
+      // Verification requests come to this device as to-device messages.
+      window.clearInterval(this.verifier);
+      this.verifier = window.setInterval(() => void this.sealer?.pollVerifications().catch(() => undefined), 3000);
+    }
     this.me = r.me;
   }
 
@@ -1033,6 +1061,53 @@ export class OrtusChatMain extends LitElement {
     }
   }
 
+  private verifyDialogs() {
+    const v = this.verification;
+    const name = (user: string) => (user === this.me ? t(this.localize, "yourOtherDevice") : (this.people[user]?.name ?? user));
+    const unverifiedUsers = [...new Set(this.unverified.map((d) => d.user))];
+    return html`${this.unverifiedOpen
+      ? html`<dialog class="modal" aria-label=${t(this.localize, "unverifiedTitle")} @close=${() => (this.unverifiedOpen = false)}>
+          <form method="dialog">
+            <h2>${t(this.localize, "unverifiedTitle")}</h2>
+            <p>${t(this.localize, "unverifiedLead")}</p>
+            <ul>
+              ${unverifiedUsers.map(
+                (user) => html`<li class="row"><span>${user === this.me ? t(this.localize, "yourDevices") : (this.people[user]?.name ?? user)} · ${this.unverified.filter((d) => d.user === user).map((d) => d.device).join(", ")}</span>
+                  <button type="button" class="button" @click=${() => ((this.unverifiedOpen = false), void this.sealer?.verify(user))}>${t(this.localize, "verify")}</button></li>`,
+              )}
+            </ul>
+            <button class="button">${t(this.localize, "close")}</button>
+          </form>
+        </dialog>`
+      : nothing}${v
+      ? html`<dialog class="modal" aria-label=${t(this.localize, "verifyTitle")} @close=${() => {
+          if (this.verification && this.verification.state !== "done" && this.verification.state !== "cancelled") void this.sealer?.cancelVerification(this.verification.id);
+          this.verification = null;
+        }}>
+          <form method="dialog">
+            <h2>${t(this.localize, "verifyTitle")}</h2>
+            ${v.state === "requested"
+              ? html`<p role="status">${t(this.localize, "verifyRequested", { name: name(v.user) })}</p>`
+              : v.state === "incoming"
+                ? html`<p>${t(this.localize, "verifyIncoming", { name: name(v.user) })}</p>
+                    <div class="row"><button class="button">${t(this.localize, "verifyDecline")}</button>
+                    <button type="button" class="button primary" @click=${() => void this.sealer?.acceptVerification(v.id)}>${t(this.localize, "verifyAccept")}</button></div>`
+                : v.state === "waiting"
+                  ? html`<p role="status">${t(this.localize, "verifyWaiting")}</p>`
+                  : v.state === "emoji"
+                    ? html`<p>${t(this.localize, "verifyCompare")}</p>
+                        <p class="emoji" data-testid="verify-emoji">${(v.emoji ?? []).map((n) => html`<span>${EMOJI[n]}</span>`)}</p>
+                        <div class="row"><button type="button" class="button" @click=${() => void this.sealer?.confirmEmoji(v.id, false)}>${t(this.localize, "verifyDifferent")}</button>
+                        <button type="button" class="button primary" @click=${() => void this.sealer?.confirmEmoji(v.id, true)}>${t(this.localize, "verifySame")}</button></div>`
+                    : v.state === "done"
+                      ? html`<p role="status">${t(this.localize, "verifyDone")}</p>`
+                      : html`<p role="status">${t(this.localize, "verifyCancelled", { reason: v.reason ?? "" })}</p>`}
+            ${v.state === "done" || v.state === "cancelled" || v.state === "requested" || v.state === "waiting" ? html`<button class="button">${t(this.localize, "close")}</button>` : nothing}
+          </form>
+        </dialog>`
+      : nothing}`;
+  }
+
   private recoveryDialog() {
     if (!this.recoveryOpen) return nothing;
     const r = this.recovery;
@@ -1055,7 +1130,8 @@ export class OrtusChatMain extends LitElement {
                   <div class="row"><button type="button" class="button" @click=${close}>${t(this.localize, "cancel")}</button>
                   <button class="button primary" ?disabled=${this.recoveryBusy}>${t(this.localize, "recoveryEnter")}</button></div>`
               : html`<p>${t(this.localize, "recoveryHere")}</p>
-                  <div class="row"><button type="button" class="button primary" @click=${close}>${t(this.localize, "close")}</button></div>`}
+                  <div class="row"><button type="button" class="button" @click=${() => (close(), void this.sealer?.verify(this.me))}>${t(this.localize, "verifyMine")}</button>
+                  <button type="button" class="button primary" @click=${close}>${t(this.localize, "close")}</button></div>`}
         ${this.recoveryNote ? html`<p role="status" class="note">${this.recoveryNote}</p>` : nothing}
       </form>
     </dialog>`;
@@ -1362,7 +1438,7 @@ export class OrtusChatMain extends LitElement {
   }
 
   private dialogs(): TemplateResult {
-    return html`${this.recoveryDialog()}${this.creating
+    return html`${this.recoveryDialog()}${this.verifyDialogs()}${this.creating
         ? html`<dialog class="modal" aria-label=${t(this.localize, this.creating === "direct" ? "newDirect" : "newChannel")} @close=${() => ((this.creating = null), (this.error = ""))}>
             <form @submit=${this.createRoom}>
               <h2>${t(this.localize, this.creating === "direct" ? "newDirect" : "newChannel")}</h2>
@@ -1480,7 +1556,7 @@ export class OrtusChatMain extends LitElement {
                 <span class="muted">${t(this.localize, "members", { count: this.members.filter((m) => m.state === "join").length })}</span>
                 ${room.encrypted ? html`<span class="e2e">🔒 ${t(this.localize, "endToEnd")}</span>` : nothing}
                 ${room.encrypted && this.unverified.length
-                  ? html`<span class="unverified" role="status" title=${this.unverified.map((d) => `${this.people[d.user]?.name ?? d.user} · ${d.device}`).join("\n")}>⚠ ${t(this.localize, "unverifiedDevices", { count: this.unverified.length })}</span>`
+                  ? html`<span role="status"><button class="unverified" title=${this.unverified.map((d) => `${this.people[d.user]?.name ?? d.user} · ${d.device}`).join("\n")} @click=${() => (this.unverifiedOpen = true)}>⚠ ${t(this.localize, "unverifiedDevices", { count: this.unverified.length })}</button></span>`
                   : nothing}
                 ${room.encrypted ? html`<button class="button" @click=${() => (this.recoveryOpen = true)}>${t(this.localize, "recovery")}</button>` : nothing}
                 ${room.federated

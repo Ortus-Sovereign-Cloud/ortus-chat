@@ -736,8 +736,10 @@ impl Inner {
         let mut ids = Vec::new();
         for m in &messages {
             ids.push(m["id"].clone());
-            let event =
-                json!({"type": "m.room.encrypted", "sender": m["sender"], "content": m["content"]});
+            // Olm messages are m.room.encrypted; verification messages come
+            // with their own type (m.key.verification.*).
+            let kind = m["type"].as_str().unwrap_or("m.room.encrypted");
+            let event = json!({"type": kind, "sender": m["sender"], "content": m["content"]});
             if let Ok(raw) = serde_json::from_value(event) {
                 events.push(raw);
             }

@@ -68,7 +68,7 @@ const MAX_DEVICES: usize = 10;
 const MAX_ONE_TIME_KEYS: i64 = 100;
 const MAX_SEALED: usize = 64 * 1024;
 /// To-device messages one sender may have waiting for one device.
-const MAX_PENDING_PER_SENDER: i64 = 200;
+pub(crate) const MAX_PENDING_PER_SENDER: i64 = 200;
 
 fn valid_id(s: &str) -> bool {
     !s.is_empty()
@@ -126,7 +126,7 @@ async fn encrypted_room_or_invited(
     Ok(room)
 }
 
-fn me_mx(instance: &Instance, user: &str) -> String {
+pub(crate) fn me_mx(instance: &Instance, user: &str) -> String {
     store::mxid(user, &store::server_name(instance))
 }
 
@@ -521,7 +521,11 @@ struct Message {
     content: Value,
 }
 
-async fn my_device(instance: &Instance, user: &str, device: &str) -> Result<(), ApiError> {
+pub(crate) async fn my_device(
+    instance: &Instance,
+    user: &str,
+    device: &str,
+) -> Result<(), ApiError> {
     let found = !instance
         .store
         .query(
@@ -619,7 +623,16 @@ async fn inbox(
         .await?;
     let list: Vec<Value> = rows
         .iter()
-        .map(|r| json!({"id": r.text(0), "sender": r.text(1), "senderDevice": r.text(2), "content": serde_json::from_str::<Value>(r.text(3).unwrap_or("null")).unwrap_or(Value::Null)}))
+        .map(|r| {
+            let content = serde_json::from_str::<Value>(r.text(3).unwrap_or("null")).unwrap_or(Value::Null);
+            // A verification message is kept with its type (trust.rs); the
+            // rest are Olm messages.
+            let (kind, content) = match content.get("ortus.verification") {
+                Some(v) => (v["type"].clone(), v["content"].clone()),
+                None => (json!("m.room.encrypted"), content),
+            };
+            json!({"id": r.text(0), "sender": r.text(1), "senderDevice": r.text(2), "type": kind, "content": content})
+        })
         .collect();
     Ok(ok(
         &json!({"messages": list, "oneTimeKeyCount": one_time_count(s, &me.id, device).await, "fallbackKey": has_fallback(s, &me.id, device).await}),

@@ -8,6 +8,7 @@
 import { call } from "ortus-kit";
 import * as olm from "./olm.js";
 import * as trust from "./trust.js";
+import * as sas from "./verify.js";
 
 export const OLM = "m.olm.v1.curve25519-aes-sha2";
 export const MEGOLM = "m.megolm.v1.aes-sha2";
@@ -67,6 +68,32 @@ export interface RecoveryState {
   set: boolean;
   here: boolean;
   escrow: boolean;
+}
+
+/** A verification by emoji, as the screen shows it. */
+export interface VerificationView {
+  id: string;
+  /** The other person (oneself, for one's own other device). */
+  user: string;
+  device?: string;
+  /** requested: we asked; incoming: they ask; waiting: keys are being agreed; emoji: compare; done; cancelled. */
+  state: "requested" | "incoming" | "waiting" | "emoji" | "done" | "cancelled";
+  emoji?: number[];
+  reason?: string;
+}
+
+interface Verification {
+  view: VerificationView;
+  started: boolean;
+  start?: Record<string, unknown>;
+  commitment?: string;
+  ours?: sas.Ephemeral;
+  theirKey?: string;
+  secret?: Uint8Array;
+  confirmed?: boolean;
+  theirMac?: { mac?: Record<string, string>; keys?: string };
+  macSent?: boolean;
+  vouched?: string[];
 }
 
 /** Secrets kept in secret storage (Matrix's names). */
@@ -236,15 +263,21 @@ export class Sealer {
   /** Room keys sent to this device: opened, checked and kept. */
   private async inbox(a: Account): Promise<void> {
     const r = await call<{
-      messages: { id: string; sender: string; senderDevice: string; content: { sender_key?: string; ciphertext?: Record<string, olm.OlmMessage> } }[];
+      messages: { id: string; sender: string; senderDevice: string; type?: string; content: { sender_key?: string; ciphertext?: Record<string, olm.OlmMessage> } & Record<string, unknown> }[];
       oneTimeKeyCount: number;
       fallbackKey: boolean;
     }>("GET", `/chat/devices/${a.device}/inbox`);
     const mine = olm.b64(a.identity.publicKey);
     const roomDevices = new Map<string, Device[] | null>();
     const done: string[] = [];
+    const verifications: typeof r.messages = [];
     for (const m of r.messages) {
       let keep = true;
+      if (m.type && m.type !== "m.room.encrypted") {
+        if (m.type.startsWith("m.key.verification.")) verifications.push(m);
+        done.push(m.id);
+        continue;
+      }
       try {
         const theirs = m.content.sender_key ?? "";
         const theirKey = olm.unb64(theirs);
@@ -323,6 +356,7 @@ export class Sealer {
       }
     }
     if (done.length) await call("POST", `/chat/devices/${a.device}/inbox/done`, { ids: done });
+    for (const m of verifications) await this.onVerificationMessage(a, m.type ?? "", m.sender, m.senderDevice, m.content).catch(() => undefined);
     await this.topUp(a, r.oneTimeKeyCount, r.fallbackKey);
   }
 
@@ -645,6 +679,183 @@ export class Sealer {
       }
       return out;
     });
+  }
+
+
+  // ---- verification by emoji (verify.ts) ------------------------------------
+
+  private verifications = new Map<string, Verification>();
+  /** Told whenever a verification changes (the screen shows it). */
+  onVerification?: (v: VerificationView) => void;
+
+  private changed(v: Verification): void {
+    this.onVerification?.({ ...v.view, emoji: v.view.emoji ? [...v.view.emoji] : undefined });
+  }
+
+  private async sendVerification(a: Account, user: string, device: string, type: string, content: Record<string, unknown>): Promise<void> {
+    await call("POST", "/chat/verification", { user, device, fromDevice: a.device, type, content });
+  }
+
+  /** Looks for verification messages (and room keys) for this device. */
+  pollVerifications(): Promise<void> {
+    return this.run(async () => {
+      const a = await this.account();
+      await this.inbox(a);
+    });
+  }
+
+  /** Starts verifying someone (oneself: one's other devices). Answers its id. */
+  verify(user: string): Promise<string> {
+    return this.run(async () => {
+      const a = await this.account();
+      const id = sas.transactionId();
+      const v: Verification = { view: { id, user, state: "requested" }, started: true };
+      this.verifications.set(id, v);
+      await this.sendVerification(a, user, "*", "m.key.verification.request", { from_device: a.device, methods: [sas.SAS], transaction_id: id, timestamp: Date.now() });
+      this.changed(v);
+      return id;
+    });
+  }
+
+  /** Says yes to someone's request. */
+  acceptVerification(id: string): Promise<void> {
+    return this.run(async () => {
+      const v = this.verifications.get(id);
+      if (!v || v.view.state !== "incoming" || !v.view.device) return;
+      const a = await this.account();
+      v.view.state = "waiting";
+      await this.sendVerification(a, v.view.user, v.view.device, "m.key.verification.ready", { from_device: a.device, methods: [sas.SAS], transaction_id: id });
+      this.changed(v);
+    });
+  }
+
+  /** The person says whether the emoji are the same on both screens. */
+  confirmEmoji(id: string, same: boolean): Promise<void> {
+    return this.run(async () => {
+      const v = this.verifications.get(id);
+      if (!v || v.view.state !== "emoji" || !v.secret || !v.view.device) return;
+      const a = await this.account();
+      if (!same) return this.cancel(a, v, "m.mismatched_sas", "The emoji were not the same.");
+      v.confirmed = true;
+      const keys: Record<string, string> = { [`ed25519:${a.device}`]: olm.b64(a.signing.publicKey) };
+      const mine = await this.trustKeys();
+      if (mine) keys[trust.keyId(mine.master)] = olm.b64(mine.master.publicKey);
+      const content = await sas.macContent(v.secret, { user: this.me, device: a.device }, { user: v.view.user, device: v.view.device }, id, keys);
+      await this.sendVerification(a, v.view.user, v.view.device, "m.key.verification.mac", { transaction_id: id, ...content });
+      v.macSent = true;
+      v.view.state = "waiting";
+      this.changed(v);
+      await this.finish(a, v);
+    });
+  }
+
+  cancelVerification(id: string): Promise<void> {
+    return this.run(async () => {
+      const v = this.verifications.get(id);
+      if (v && v.view.state !== "done" && v.view.state !== "cancelled") await this.cancel(await this.account(), v, "m.user", "Cancelled.");
+    });
+  }
+
+  private async cancel(a: Account, v: Verification, code: string, reason: string): Promise<void> {
+    v.view.state = "cancelled";
+    v.view.reason = reason;
+    if (v.view.device) await this.sendVerification(a, v.view.user, v.view.device, "m.key.verification.cancel", { transaction_id: v.view.id, code, reason }).catch(() => undefined);
+    this.changed(v);
+  }
+
+  private async onVerificationMessage(a: Account, type: string, sender: string, senderDevice: string, c: Record<string, unknown>): Promise<void> {
+    const id = typeof c.transaction_id === "string" ? c.transaction_id : "";
+    if (!id) return;
+    let v = this.verifications.get(id);
+    if (type === "m.key.verification.request") {
+      if (v || !(c.methods as string[] | undefined)?.includes(sas.SAS)) return;
+      v = { view: { id, user: sender, device: senderDevice, state: "incoming" }, started: false };
+      this.verifications.set(id, v);
+      return this.changed(v);
+    }
+    // Every later message is the other side's, from the device it began with.
+    if (!v || v.view.user !== sender || (v.view.device && v.view.device !== senderDevice)) return;
+    if (type === "m.key.verification.cancel") {
+      v.view.state = "cancelled";
+      v.view.reason = typeof c.reason === "string" ? c.reason : "";
+      return this.changed(v);
+    }
+    if (type === "m.key.verification.ready" && v.started && v.view.state === "requested") {
+      v.view.device = senderDevice;
+      v.view.state = "waiting";
+      v.start = { from_device: a.device, method: sas.SAS, key_agreement_protocols: [sas.KEY_AGREEMENT], hashes: [sas.HASH], message_authentication_codes: [sas.MAC], short_authentication_string: ["emoji", "decimal"], transaction_id: id };
+      await this.sendVerification(a, sender, senderDevice, "m.key.verification.start", v.start);
+      return this.changed(v);
+    }
+    if (type === "m.key.verification.start" && !v.started && v.view.state === "waiting") {
+      if (c.method !== sas.SAS || !(c.key_agreement_protocols as string[] | undefined)?.includes(sas.KEY_AGREEMENT) || !(c.message_authentication_codes as string[] | undefined)?.includes(sas.MAC)) return this.cancel(a, v, "m.unknown_method", "Not a way this device verifies.");
+      v.start = c;
+      v.ours = await sas.ephemeral();
+      const accept = { transaction_id: id, method: sas.SAS, key_agreement_protocol: sas.KEY_AGREEMENT, hash: sas.HASH, message_authentication_code: sas.MAC, short_authentication_string: ["emoji", "decimal"], commitment: await sas.commitment(v.ours.publicKey, c) };
+      await this.sendVerification(a, sender, senderDevice, "m.key.verification.accept", accept);
+      return;
+    }
+    if (type === "m.key.verification.accept" && v.started && typeof c.commitment === "string") {
+      v.commitment = c.commitment;
+      v.ours = await sas.ephemeral();
+      await this.sendVerification(a, sender, senderDevice, "m.key.verification.key", { transaction_id: id, key: v.ours.publicKey });
+      return;
+    }
+    if (type === "m.key.verification.key" && typeof c.key === "string" && v.ours && !v.theirKey) {
+      v.theirKey = c.key;
+      if (v.started) {
+        // The other side committed to its key before it saw ours.
+        if (!v.start || v.commitment !== (await sas.commitment(c.key, v.start))) return this.cancel(a, v, "m.mismatched_commitment", "The keys did not match what was promised.");
+      } else {
+        await this.sendVerification(a, sender, senderDevice, "m.key.verification.key", { transaction_id: id, key: v.ours.publicKey });
+      }
+      v.secret = await sas.shared(v.ours, c.key);
+      const me = { user: this.me, device: a.device, key: v.ours.publicKey };
+      const them = { user: sender, device: senderDevice, key: c.key };
+      v.view.emoji = await sas.emoji(v.secret, v.started ? me : them, v.started ? them : me, id);
+      v.view.state = "emoji";
+      return this.changed(v);
+    }
+    if (type === "m.key.verification.mac" && v.secret) {
+      v.theirMac = c as Verification["theirMac"];
+      return this.finish(a, v);
+    }
+    if (type === "m.key.verification.done") return;
+  }
+
+  /** Both sides vouched: check theirs, sign what was verified, say done. */
+  private async finish(a: Account, v: Verification): Promise<void> {
+    if (!v.secret || !v.theirMac || !v.confirmed || !v.macSent || !v.view.device || v.view.state === "done") return;
+    const keys = await call<{ devices: { device: string; deviceKeys: Record<string, unknown> }[]; crossSigning: Record<string, { master?: Record<string, unknown> }> }>("GET", `/chat/keys?user=${enc(v.view.user)}`);
+    const device = keys.devices.find((d) => d.device === v.view.device);
+    const known: Record<string, string> = {};
+    const ed = (device?.deviceKeys.keys as Record<string, string> | undefined)?.[`ed25519:${v.view.device}`];
+    if (ed) known[`ed25519:${v.view.device}`] = ed;
+    const master = keys.crossSigning[v.view.user]?.master;
+    const masterKey = Object.entries((master?.keys as Record<string, string>) ?? {})[0];
+    if (masterKey) known[masterKey[0]] = masterKey[1];
+    const vouched = await sas.checkMac(v.secret, { user: this.me, device: a.device }, { user: v.view.user, device: v.view.device }, v.view.id, v.theirMac, known);
+    if (!vouched || !vouched.includes(`ed25519:${v.view.device}`)) return this.cancel(a, v, "m.key_mismatch", "The keys are not the ones the server has.");
+    v.vouched = vouched;
+    const mine = await this.trustKeys();
+    if (mine && device) {
+      if (v.view.user === this.me) {
+        // One's own device: signed with one's self-signing key.
+        const plain = { ...device.deviceKeys };
+        delete plain.signatures;
+        delete plain.unsigned;
+        await call("POST", "/chat/signatures", { [this.me]: { [v.view.device]: await trust.signDevice(this.me, plain, mine.selfSigning) } });
+      } else if (master && masterKey && vouched.includes(masterKey[0])) {
+        // Someone else: their master key, with one's user-signing key.
+        const plain = { ...master };
+        delete plain.signatures;
+        delete plain.unsigned;
+        await call("POST", "/chat/signatures", { [v.view.user]: { [masterKey[1]]: await trust.signUser(this.me, plain, mine.userSigning) } });
+      }
+    }
+    await this.sendVerification(a, v.view.user, v.view.device, "m.key.verification.done", { transaction_id: v.view.id });
+    v.view.state = "done";
+    this.changed(v);
   }
 
   /** Rooms this browser has seen end-to-end encrypted: never sent to in
