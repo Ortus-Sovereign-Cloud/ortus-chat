@@ -558,5 +558,35 @@ fn trust_and_backup() {
             call(&client, &marek, "GET", "/chat/policy", None).1["encryptedRooms"],
             "{name}: the other setting stays"
         );
+
+        // The escrow copy: an administrator takes a person's, once they made one.
+        let marek_escrow = "/chat/admin/escrow?email=marek@ministry.example";
+        assert_eq!(
+            404,
+            call(&client, &olena, "GET", marek_escrow, None).0,
+            "{name}: none yet"
+        );
+        assert_eq!(200, call(&client, &marek, "PUT", "/chat/account-data/ortus.escrow", Some(json!({"key": escrow, "sealed": {"ephemeral": "e", "ciphertext": "c", "mac": "m"}}))).0);
+        let (status, copy) = call(&client, &olena, "GET", marek_escrow, None);
+        assert_eq!(
+            (200, "c"),
+            (
+                status,
+                copy["sealed"]["ciphertext"].as_str().unwrap_or_default()
+            ),
+            "{name}: {copy}"
+        );
+        assert_eq!(
+            403,
+            call(
+                &client,
+                &marek,
+                "GET",
+                "/chat/admin/escrow?email=olena@ministry.example",
+                None
+            )
+            .0,
+            "{name}: administrators only"
+        );
     }
 }

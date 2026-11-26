@@ -17,7 +17,7 @@ pub mod trust;
 
 use std::sync::Arc;
 
-use ortus_core::app::{App, AppInfo, Group};
+use ortus_core::app::{AdminSection, App, AppInfo, Group};
 use ortus_core::instance::Instance;
 use ortus_core::retention::Rules;
 use ortus_core::storage::{AsyncTx, BoxFuture, Migration};
@@ -47,6 +47,14 @@ pub const OUTBOX_JOB: &str = "chat.federation";
 pub struct Chat;
 
 impl App for Chat {
+    fn admin_sections(&self) -> Vec<AdminSection> {
+        vec![AdminSection {
+            path: "/admin/chat",
+            element: "ortus-chat-admin",
+            label: "chatAdmin",
+        }]
+    }
+
     fn info(&self) -> AppInfo {
         AppInfo {
             id: "chat",

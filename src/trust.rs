@@ -734,6 +734,46 @@ async fn get_keys(request: &Request, instance: &Arc<Instance>) -> Result<Respons
     Ok(ok(&json!({"rooms": rooms})))
 }
 
+// ---- the organisation's escrow ----------------------------------------------
+
+/**
+ * A person's escrow copy (their recovery key sealed to the organisation's
+ * escrow key), for an administrator whose browser holds the escrow
+ * private key: only the sealed copy leaves the server, and each time it
+ * does is recorded.
+ */
+async fn get_escrow(request: &Request, instance: &Arc<Instance>) -> Result<Response, ApiError> {
+    let me = crate::api::signed(request, instance).await?;
+    if me.role < ortus_core::auth::accounts::Role::Admin {
+        return Err(ApiError::forbidden());
+    }
+    let email = crate::api::query(request, "email").unwrap_or_default();
+    let s = instance.store.as_ref();
+    let user = ortus_core::people::id_by_email(s, email.trim())
+        .await?
+        .ok_or_else(|| ApiError::not_found("Nobody here has that address."))?;
+    let rows = s
+        .query(
+            "SELECT content FROM chat_account_data WHERE user_id = $1 AND kind = 'ortus.escrow'",
+            &[user.as_str().into()],
+        )
+        .await?;
+    let content = rows
+        .first()
+        .and_then(|r| r.text(0))
+        .ok_or_else(|| ApiError::not_found("This person has no escrow copy: they have not set up recovery since the escrow key was made."))?;
+    ortus_core::auth::audit(
+        instance,
+        ortus_core::audit::Event::new("chat.escrow_copy_taken", ortus_core::audit::Outcome::Done)
+            .by(&me.id)
+            .on(&user),
+    )
+    .await;
+    Ok(ok(
+        &serde_json::from_str::<Value>(content).unwrap_or(Value::Null)
+    ))
+}
+
 // ---- routes ---------------------------------------------------------------
 
 macro_rules! handler {
@@ -768,6 +808,7 @@ handler!(h_get_version, get_version);
 handler!(h_delete_version, delete_version, params);
 handler!(h_put_keys, put_keys);
 handler!(h_get_keys, get_keys);
+handler!(h_get_escrow, get_escrow);
 
 pub fn routes() -> Vec<Route> {
     let route = |method, path, id, summary, handler| Route {
@@ -790,5 +831,6 @@ pub fn routes() -> Vec<Route> {
         route(Method::Delete, "/chat/backup/version/:version", "chatBackupDelete", "Deletes a backup and its keys.", h_delete_version),
         route(Method::Put, "/chat/backup/keys", "chatBackupKeysSet", "Room keys into my current backup (?version=): {rooms: {room: {sessions: {id: keyData}}}}; a key is replaced only by a better copy.", h_put_keys),
         route(Method::Get, "/chat/backup/keys", "chatBackupKeys", "The room keys in a backup of mine (?version=).", h_get_keys),
+        route(Method::Get, "/chat/admin/escrow", "chatEscrowCopy", "An administrator takes a person's escrow copy (?email=): their recovery key sealed to the organisation's escrow key; recorded.", h_get_escrow),
     ]
 }
