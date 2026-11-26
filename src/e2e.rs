@@ -372,15 +372,24 @@ async fn devices(
     let rows = instance
         .store
         .query(
-            "SELECT m.member, d.device, d.keys FROM chat_devices d JOIN chat_members m ON m.user_id = d.user_id AND m.room = $1 AND m.state IN ('join', 'invite') ORDER BY m.member, d.created_at",
+            "SELECT m.member, d.device, d.keys, d.user_id FROM chat_devices d JOIN chat_members m ON m.user_id = d.user_id AND m.room = $1 AND m.state IN ('join', 'invite') ORDER BY m.member, d.created_at",
             &[room.id.as_str().into()],
         )
         .await?;
-    let list: Vec<Value> = rows
+    let mut list: Vec<Value> = rows
         .iter()
-        .map(|r| json!({"user": r.text(0), "device": r.text(1), "deviceKeys": serde_json::from_str::<Value>(r.text(2).unwrap_or("null")).unwrap_or(Value::Null)}))
+        .map(|r| json!({"user": r.text(0), "device": r.text(1), "deviceKeys": serde_json::from_str::<Value>(r.text(2).unwrap_or("null")).unwrap_or(Value::Null), "userId": r.text(3)}))
         .collect();
-    Ok(ok(&json!({"devices": list})))
+    // Who vouches for whom: cross-signing keys and the signatures on devices.
+    let mut members: Vec<String> = rows
+        .iter()
+        .filter_map(|r| r.text(3).map(str::to_string))
+        .collect();
+    members.push(me.id.clone());
+    members.sort();
+    members.dedup();
+    let cross_signing = crate::trust::for_devices(instance, &me.id, &members, &mut list).await;
+    Ok(ok(&json!({"devices": list, "crossSigning": cross_signing})))
 }
 
 /// The member (joined or invited) behind a Matrix id, with their user id.
@@ -757,6 +766,13 @@ pub async fn forget(
         "DELETE FROM chat_one_time_keys WHERE user_id = $1",
         "DELETE FROM chat_fallback_keys WHERE user_id = $1",
         "DELETE FROM chat_to_device WHERE user_id = $1",
+        // Their trust: cross-signing keys, signatures by and on them, their
+        // account data (secret storage, the escrow copy) and backups.
+        "DELETE FROM chat_cross_signing WHERE user_id = $1",
+        "DELETE FROM chat_key_signatures WHERE signer_user = $1 OR target_user = $1",
+        "DELETE FROM chat_account_data WHERE user_id = $1",
+        "DELETE FROM chat_backup_keys WHERE user_id = $1",
+        "DELETE FROM chat_backup_versions WHERE user_id = $1",
     ] {
         tx.execute(sql, &[user.into()]).await?;
     }

@@ -13,6 +13,7 @@ pub mod matrix;
 pub mod policy;
 pub mod service;
 pub mod store;
+pub mod trust;
 
 use std::sync::Arc;
 
@@ -35,6 +36,7 @@ static MIGRATIONS: std::sync::LazyLock<Vec<Migration>> = std::sync::LazyLock::ne
     all.extend_from_slice(index::MIGRATIONS);
     all.extend_from_slice(hooks::MIGRATIONS);
     all.extend_from_slice(live::WAKE_MIGRATIONS);
+    all.extend_from_slice(trust::MIGRATIONS);
     all
 });
 
@@ -63,6 +65,7 @@ impl App for Chat {
         all.extend(live::routes());
         all.extend(policy::routes());
         all.extend(e2e::routes());
+        all.extend(trust::routes());
         all.extend(hooks::routes());
         all
     }
