@@ -47,6 +47,7 @@ const database = {
     const t: { oncomplete?: () => void; onerror?: () => void; objectStore: (n: string) => unknown } = {
       objectStore: (n: string) => ({
         get: (key: unknown) => request(() => copy(stores.get(n)!.get(key))),
+        getAllKeys: () => request(() => [...stores.get(n)!.keys()]),
         put: (value: unknown, key: unknown) => {
           stores.get(n)!.set(key, copy(value));
           queueMicrotask(() => t.oncomplete?.());

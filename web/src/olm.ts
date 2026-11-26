@@ -449,6 +449,24 @@ export async function megolmInbound(key: string): Promise<MegolmInbound> {
   return { ratchet: { parts: data.slice(5, 133), index: new DataView(data.buffer, data.byteOffset + 1, 4).getUint32(0) }, signingKey };
 }
 
+/**
+ * A session as Matrix exports it (for backups and key export): version 1,
+ * the index, the ratchet and the signing key, not signed (the backup's own
+ * signature vouches for it).
+ */
+export function exportSessionKey(s: MegolmInbound): string {
+  const index = new Uint8Array(4);
+  new DataView(index.buffer).setUint32(0, s.ratchet.index);
+  return b64(concat(new Uint8Array([1]), index, s.ratchet.parts, s.signingKey));
+}
+
+/** A session from Matrix's export format (a backup's). */
+export function importSessionKey(key: string): MegolmInbound {
+  const data = unb64(key);
+  if (data.length !== 1 + 4 + 128 + 32 || data[0] !== 1) throw new Error("not an exported session key");
+  return { ratchet: { parts: data.slice(5, 133), index: new DataView(data.buffer, data.byteOffset + 1, 4).getUint32(0) }, signingKey: data.slice(133, 165) };
+}
+
 async function megolmKeys(parts: Uint8Array): Promise<{ aesKey: Bytes; macKey: Bytes; iv: Bytes }> {
   const k = await hkdf(new Uint8Array(32), parts, "MEGOLM_KEYS", 80);
   return { aesKey: k.slice(0, 32), macKey: k.slice(32, 64), iv: k.slice(64, 80) };

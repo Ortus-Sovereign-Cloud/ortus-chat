@@ -7,6 +7,7 @@
 // be read out. One operation at a time per person, across tabs too.
 import { call } from "ortus-kit";
 import * as olm from "./olm.js";
+import * as trust from "./trust.js";
 
 export const OLM = "m.olm.v1.curve25519-aes-sha2";
 export const MEGOLM = "m.megolm.v1.aes-sha2";
@@ -51,6 +52,27 @@ interface Inbound {
   senderUser: string;
 }
 
+/** This browser's cross-signing keys and backup key (seeds), after recovery was set up or used. */
+interface Trust {
+  master: string;
+  selfSigning: string;
+  userSigning: string;
+  backup?: string;
+  /** The backup version whose auth data the master key signed. */
+  version?: string;
+}
+
+/** Where recovery stands: set up for the person, and opened on this browser. */
+export interface RecoveryState {
+  set: boolean;
+  here: boolean;
+  escrow: boolean;
+}
+
+/** Secrets kept in secret storage (Matrix's names). */
+const SECRETS = { master: "m.cross_signing.master", selfSigning: "m.cross_signing.self_signing", userSigning: "m.cross_signing.user_signing", backup: "m.megolm_backup.v1" } as const;
+const BACKUP = "m.megolm_backup.v1.curve25519-aes-sha2";
+
 const enc = (s: string): string => encodeURIComponent(s);
 
 // ---- IndexedDB -------------------------------------------------------------
@@ -83,6 +105,23 @@ async function put(key: string, value: unknown): Promise<void> {
     t.oncomplete = () => resolve();
     t.onerror = () => reject(t.error);
   });
+}
+
+/** Every kept value whose key starts with `prefix`. */
+async function entries<T>(prefix: string): Promise<[string, T][]> {
+  const d = await db();
+  const keys = await new Promise<IDBValidKey[]>((resolve, reject) => {
+    const r = d.transaction("state").objectStore("state").getAllKeys();
+    r.onsuccess = () => resolve(r.result);
+    r.onerror = () => reject(r.error);
+  });
+  const out: [string, T][] = [];
+  for (const k of keys) {
+    if (typeof k !== "string" || !k.startsWith(prefix)) continue;
+    const v = await get<T>(k);
+    if (v !== undefined) out.push([k, v]);
+  }
+  return out;
 }
 
 function deviceId(): string {
@@ -273,7 +312,10 @@ export class Sealer {
         // overwritten by another sender.
         const where = this.key("in", `${room}|${theirs}|${c.session_id}`);
         const had = await get<Inbound>(where);
-        if (!had || (had.senderUser === m.sender && had.session.ratchet.index > inbound.ratchet.index)) await put(where, { session: inbound, senderUser: m.sender } satisfies Inbound);
+        if (!had || (had.senderUser === m.sender && had.session.ratchet.index > inbound.ratchet.index)) {
+          await put(where, { session: inbound, senderUser: m.sender } satisfies Inbound);
+          if (c.room_id) await this.backUp([{ roomId: c.room_id, room, senderKey: theirs, sessionId: c.session_id, inbound, signingKey: p.keys?.ed25519 ?? "" }]).catch(() => undefined);
+        }
       } catch {
         // A message this device cannot open: dropped.
       } finally {
@@ -308,8 +350,10 @@ export class Sealer {
       const session = await olm.megolmOutbound();
       const initialKey = await olm.sessionKey(session);
       out = { id: olm.sessionId(session.signing.publicKey), session, initialKey, sharedWith: [], created: Date.now(), count: 0 };
-      await put(this.key("in", `${room}|${olm.b64(a.identity.publicKey)}|${out.id}`), { session: await olm.megolmInbound(initialKey), senderUser: this.me } satisfies Inbound);
+      const inbound = await olm.megolmInbound(initialKey);
+      await put(this.key("in", `${room}|${olm.b64(a.identity.publicKey)}|${out.id}`), { session: inbound, senderUser: this.me } satisfies Inbound);
       await put(where, out);
+      await this.backUp([{ roomId, room, senderKey: olm.b64(a.identity.publicKey), sessionId: out.id, inbound, signingKey: olm.b64(a.signing.publicKey) }]).catch(() => undefined);
     }
     const current = out;
     const targets = devices.filter((d) => !(d.user === this.me && d.device === a.device) && !current.sharedWith.includes(`${d.user}|${d.device}`));
@@ -382,7 +426,7 @@ export class Sealer {
     if (cached !== undefined) return Promise.resolve(cached);
     return this.run(async () => {
       if (s.algorithm !== MEGOLM) return null;
-      const rec = await get<Inbound>(this.key("in", `${room}|${s.sender_key}|${s.session_id}`));
+      const rec = (await get<Inbound>(this.key("in", `${room}|${s.sender_key}|${s.session_id}`))) ?? (await this.restored(room, roomId, s, sender));
       // The session must be the sender's own device's.
       if (!rec || rec.senderUser !== sender) return null;
       try {
@@ -401,6 +445,205 @@ export class Sealer {
       } catch {
         return null;
       }
+    });
+  }
+
+
+  // ---- trust: recovery, cross-signing, backup (docs/e2e-trust-and-backup.md)
+
+  private async trustKeys(): Promise<{ t: Trust; master: trust.SeedKey; selfSigning: trust.SeedKey; userSigning: trust.SeedKey; backup?: trust.SeedKey } | null> {
+    const t = await get<Trust>(this.key("trust", ""));
+    if (!t) return null;
+    return {
+      t,
+      master: await trust.ed25519FromSeed(olm.unb64(t.master)),
+      selfSigning: await trust.ed25519FromSeed(olm.unb64(t.selfSigning)),
+      userSigning: await trust.ed25519FromSeed(olm.unb64(t.userSigning)),
+      backup: t.backup ? await trust.x25519FromSeed(olm.unb64(t.backup)) : undefined,
+    };
+  }
+
+  /** Where recovery stands for this person and this browser. */
+  recoveryState(): Promise<RecoveryState> {
+    return this.run(async () => {
+      const set = await call<{ key?: string }>("GET", "/chat/account-data/m.secret_storage.default_key").then((d) => !!d.key, () => false);
+      const escrow = await call<{ key?: string }>("GET", "/chat/account-data/ortus.escrow").then((d) => !!d.key, () => false);
+      return { set, here: !!(await get<Trust>(this.key("trust", ""))), escrow };
+    });
+  }
+
+  /** This device's keys (as published) signed by the self-signing key. */
+  private async signThisDevice(a: Account, selfSigning: trust.SeedKey): Promise<void> {
+    const deviceKeys = {
+      user_id: this.me,
+      device_id: a.device,
+      algorithms: [OLM, MEGOLM],
+      keys: { [`curve25519:${a.device}`]: olm.b64(a.identity.publicKey), [`ed25519:${a.device}`]: olm.b64(a.signing.publicKey) },
+    };
+    const signed = await trust.signDevice(this.me, deviceKeys, selfSigning);
+    const r = await call<{ kept: number }>("POST", "/chat/signatures", { [this.me]: { [a.device]: signed } });
+    if (r.kept !== 1) throw new Error("this device could not be signed");
+  }
+
+  /**
+   * Sets recovery up for the person (on their first device): cross-signing
+   * keys, this device signed, a backup signed by the master key, the
+   * secrets in secret storage under a new recovery key, and its escrow copy
+   * when the organisation has an escrow key. Answers the recovery key, to
+   * show once.
+   */
+  setUpRecovery(): Promise<string> {
+    return this.run(async () => {
+      const a = await this.account();
+      const recovery = trust.newRecoveryKey();
+      const cross = await trust.newCrossSigning();
+      await call("PUT", "/chat/cross-signing", await trust.crossSigningUpload(this.me, cross));
+      await this.signThisDevice(a, cross.selfSigning);
+      const backup = await trust.x25519FromSeed(crypto.getRandomValues(new Uint8Array(32)));
+      const authData = await trust.signObject(this.me, { public_key: olm.b64(backup.publicKey) }, cross.master);
+      const { version } = await call<{ version: string }>("POST", "/chat/backup/version", { algorithm: BACKUP, authData });
+      const keyId = olm.b64(crypto.getRandomValues(new Uint8Array(12))).replace(/[^A-Za-z0-9]/g, "");
+      await call("PUT", `/chat/account-data/m.secret_storage.key.${keyId}`, await trust.keyDescription(recovery));
+      const seeds = { master: cross.master.seed, selfSigning: cross.selfSigning.seed, userSigning: cross.userSigning.seed, backup: backup.seed };
+      for (const [k, name] of Object.entries(SECRETS)) {
+        const secret = await trust.encryptSecret(recovery, name, olm.b64(seeds[k as keyof typeof seeds]));
+        await call("PUT", `/chat/account-data/${name}`, { encrypted: { [keyId]: secret } });
+      }
+      await call("PUT", "/chat/account-data/m.secret_storage.default_key", { key: keyId });
+      const text = trust.encodeRecoveryKey(recovery);
+      const policy = await call<{ escrowKey?: string | null }>("GET", "/chat/policy");
+      if (policy.escrowKey) {
+        await call("PUT", "/chat/account-data/ortus.escrow", { key: policy.escrowKey, sealed: await trust.seal(olm.unb64(policy.escrowKey), text) });
+      }
+      await put(this.key("trust", ""), { master: olm.b64(cross.master.seed), selfSigning: olm.b64(cross.selfSigning.seed), userSigning: olm.b64(cross.userSigning.seed), backup: olm.b64(backup.seed), version } satisfies Trust);
+      await this.backUpAll();
+      return text;
+    });
+  }
+
+  /**
+   * Recovery on this browser with the recovery key: the secrets open, this
+   * device is signed, and the backup (only one the master key signed) is
+   * restored. Answers how many room keys came back; null when the key is
+   * not the person's.
+   */
+  recover(text: string): Promise<number | null> {
+    return this.run(async () => {
+      const a = await this.account();
+      const recovery = trust.decodeRecoveryKey(text);
+      if (!recovery) return null;
+      const { key: keyId } = await call<{ key: string }>("GET", "/chat/account-data/m.secret_storage.default_key");
+      const description = await call<{ iv: string; mac: string }>("GET", `/chat/account-data/m.secret_storage.key.${keyId}`);
+      if (!(await trust.keyMatches(recovery, description))) return null;
+      const seeds: Record<string, string> = {};
+      for (const [k, name] of Object.entries(SECRETS)) {
+        const stored = await call<{ encrypted: Record<string, trust.StoredSecret> }>("GET", `/chat/account-data/${name}`).catch(() => null);
+        const secret = stored?.encrypted?.[keyId];
+        const opened = secret ? await trust.decryptSecret(recovery, name, secret) : null;
+        if (opened) seeds[k] = opened;
+      }
+      if (!seeds.master || !seeds.selfSigning || !seeds.userSigning) return null;
+      const master = await trust.ed25519FromSeed(olm.unb64(seeds.master));
+      await this.signThisDevice(a, await trust.ed25519FromSeed(olm.unb64(seeds.selfSigning)));
+      const t: Trust = { master: seeds.master, selfSigning: seeds.selfSigning, userSigning: seeds.userSigning };
+      let restored = 0;
+      const current = await call<{ version: string; algorithm: string; authData: Record<string, unknown> }>("GET", "/chat/backup/version").catch(() => null);
+      // A backup is used only when the master key signed its key: a backup
+      // the server swapped gets nothing, and gives nothing back.
+      if (seeds.backup && current && current.algorithm === BACKUP && (await olm.verifyJson(current.authData, this.me, trust.keyId(master), master.publicKey))) {
+        const backup = await trust.x25519FromSeed(olm.unb64(seeds.backup));
+        if (current.authData.public_key === olm.b64(backup.publicKey)) {
+          t.backup = seeds.backup;
+          t.version = current.version;
+          const keys = await call<{ rooms: Record<string, { sessions: Record<string, { session_data: trust.Sealed }> }> }>("GET", `/chat/backup/keys?version=${encodeURIComponent(current.version)}`);
+          for (const [roomId, r] of Object.entries(keys.rooms)) {
+            for (const [sessionId, k] of Object.entries(r.sessions)) {
+              const plain = await trust.unseal(backup, k.session_data);
+              if (!plain) continue;
+              const exported = JSON.parse(plain) as { sender_key?: string; session_key?: string };
+              if (!exported.sender_key || !exported.session_key) continue;
+              await put(this.key("bk", `${roomId}|${exported.sender_key}|${sessionId}`), exported.session_key);
+              restored++;
+            }
+          }
+        }
+      }
+      await put(this.key("trust", ""), t);
+      return restored;
+    });
+  }
+
+  /** A session from the backup, taken once its sender key is checked to be the sender's device in the room. */
+  private async restored(room: string, roomId: string, s: Sealed, sender: string): Promise<Inbound | undefined> {
+    const exported = await get<string>(this.key("bk", `${roomId}|${s.sender_key}|${s.session_id}`));
+    if (!exported) return undefined;
+    const devices = await this.devices(room).catch(() => []);
+    if (!devices.some((d) => d.user === sender && d.curve === s.sender_key)) return undefined;
+    const rec: Inbound = { session: olm.importSessionKey(exported), senderUser: sender };
+    await put(this.key("in", `${room}|${s.sender_key}|${s.session_id}`), rec);
+    return rec;
+  }
+
+  /** Room keys into the backup, when this browser has its key and the master key signed it. */
+  private async backUp(sessions: { roomId: string; room: string; senderKey: string; sessionId: string; inbound: olm.MegolmInbound; signingKey: string }[]): Promise<void> {
+    const keys = await this.trustKeys();
+    if (!keys?.backup || !keys.t.version || !sessions.length) return;
+    const rooms: Record<string, { sessions: Record<string, unknown> }> = {};
+    for (const x of sessions) {
+      const data = await trust.backupRoomKey(
+        keys.backup.publicKey,
+        { roomId: x.roomId, sessionId: x.sessionId, senderKey: x.senderKey, sessionKey: olm.exportSessionKey(x.inbound), firstIndex: x.inbound.ratchet.index, signingKey: x.signingKey },
+        false,
+      );
+      (rooms[x.roomId] ??= { sessions: {} }).sessions[x.sessionId] = data;
+    }
+    await call("PUT", `/chat/backup/keys?version=${encodeURIComponent(keys.t.version)}`, { rooms });
+  }
+
+  /** Every room key this browser holds, into the backup (after setting it up). */
+  private async backUpAll(): Promise<void> {
+    const all = await entries<Inbound>(this.key("in", ""));
+    const a = await this.account();
+    const out: Parameters<Sealer["backUp"]>[0] = [];
+    for (const [k, rec] of all) {
+      const [room, senderKey, sessionId] = k.slice(this.key("in", "").length).split("|");
+      if (!room || !senderKey || !sessionId) continue;
+      const info = await call<{ room?: { roomId?: string }; roomId?: string }>("GET", `/chat/rooms/${enc(room)}`).catch(() => null);
+      const roomId = info?.room?.roomId ?? info?.roomId;
+      if (!roomId) continue;
+      out.push({ roomId, room, senderKey, sessionId, inbound: rec.session, signingKey: senderKey === olm.b64(a.identity.publicKey) ? olm.b64(a.signing.publicKey) : "" });
+    }
+    for (let i = 0; i < out.length; i += 200) await this.backUp(out.slice(i, i + 200));
+  }
+
+  /**
+   * Who in a room is not vouched for: devices their owner did not sign with
+   * a self-signing key their master key signed (and, for others, a master
+   * key this person did not verify). Rooms warn about them; messages still
+   * go to them (the owner's decision).
+   */
+  unverified(room: string): Promise<{ user: string; device: string }[]> {
+    return this.run(async () => {
+      const r = await call<{ devices: { user: string; device: string; deviceKeys: Record<string, unknown> }[]; crossSigning: Record<string, { master?: Record<string, unknown>; selfSigning?: Record<string, unknown> }> }>("GET", `/chat/rooms/${enc(room)}/devices`);
+      const mine = await this.trustKeys();
+      const out: { user: string; device: string }[] = [];
+      for (const d of r.devices) {
+        const keys = r.crossSigning[d.user];
+        const key = (o?: Record<string, unknown>): [string, Uint8Array] | null => {
+          const k = Object.entries((o?.keys as Record<string, string>) ?? {})[0];
+          return k ? [k[0], olm.unb64(k[1])] : null;
+        };
+        const master = key(keys?.master);
+        const ssk = key(keys?.selfSigning);
+        let ok = !!(master && ssk && keys?.selfSigning && (await olm.verifyJson(keys.selfSigning, d.user, master[0], master[1])) && (await olm.verifyJson(d.deviceKeys, d.user, ssk[0], ssk[1])));
+        if (ok && master && keys?.master) {
+          // Their master key: one's own, or one this person verified.
+          if (d.user === this.me) ok = !!mine && trust.keyId(mine.master) === master[0];
+          else ok = !!mine && (await olm.verifyJson(keys.master, this.me, trust.keyId(mine.userSigning), mine.userSigning.publicKey));
+        }
+        if (!ok) out.push({ user: d.user, device: d.device });
+      }
+      return out;
     });
   }
 

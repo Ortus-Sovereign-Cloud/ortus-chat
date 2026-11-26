@@ -61,7 +61,7 @@ fn the_browsers_trust_formats_are_matrixs() {
         "a mistyped recovery key is refused"
     );
     assert!(
-        made["recoveryText"].as_str().unwrap().starts_with("EsT"),
+        made["recoveryText"].as_str().unwrap().starts_with("Es"),
         "Matrix's recovery key: {}",
         made["recoveryText"]
     );

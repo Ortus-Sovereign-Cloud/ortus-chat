@@ -2,7 +2,7 @@
 // open room in the middle, a thread on the right with its recorded
 // decision, which can become a task. Everything new arrives live.
 import { ApiError, LitElement, LocalizeController, call, controls, css, customElement, html, nothing, state, type TemplateResult } from "ortus-kit";
-import { Sealer, type Sealed } from "./e2e.js";
+import { Sealer, type RecoveryState, type Sealed } from "./e2e.js";
 import { t } from "./i18n.js";
 
 interface RoomItem {
@@ -266,6 +266,20 @@ export class OrtusChatMain extends LitElement {
         margin-inline-start: auto;
         color: var(--ortus-teal);
         font-size: 14px;
+      }
+      .unverified {
+        color: var(--ortus-amber, #f5a35b);
+        font-size: 14px;
+      }
+      .recovery-key {
+        display: block;
+        padding: 12px;
+        border-radius: 10px;
+        background: var(--ortus-surface-2, rgb(255 255 255 / 0.06));
+        font-family: ui-monospace, monospace;
+        font-size: 15px;
+        word-spacing: 6px;
+        user-select: all;
       }
       .feed {
         display: flex;
@@ -716,6 +730,13 @@ export class OrtusChatMain extends LitElement {
   /** Whether calls are installed, and how many are in the open room's call. */
   @state() private callsInstalled = false;
   @state() private inCall = 0;
+  /** End-to-end trust: devices in the open sealed room nobody vouched for, and recovery. */
+  @state() private unverified: { user: string; device: string }[] = [];
+  @state() private recovery: RecoveryState | null = null;
+  @state() private recoveryOpen = false;
+  @state() private recoveryKey = "";
+  @state() private recoveryNote = "";
+  @state() private recoveryBusy = false;
   /** End-to-end rooms on this browser. */
   private sealer: Sealer | null = null;
   private events: EventSource | null = null;
@@ -974,6 +995,70 @@ export class OrtusChatMain extends LitElement {
     if (!roomId) return;
     void this.sealer?.pin(room).catch(() => undefined);
     await this.sealer?.sync(room, roomId).catch(() => undefined);
+    if (this.current === room && this.sealer) {
+      this.unverified = await this.sealer.unverified(room).catch(() => []);
+      this.recovery = await this.sealer.recoveryState().catch(() => null);
+    }
+  }
+
+  private async setUpRecovery(): Promise<void> {
+    if (!this.sealer) return;
+    this.recoveryBusy = true;
+    this.recoveryNote = "";
+    try {
+      this.recoveryKey = await this.sealer.setUpRecovery();
+      this.recovery = await this.sealer.recoveryState();
+    } catch (e) {
+      this.recoveryNote = e instanceof ApiError ? e.message : String(e);
+    } finally {
+      this.recoveryBusy = false;
+    }
+  }
+
+  private async recoverWithKey(e: Event): Promise<void> {
+    e.preventDefault();
+    if (!this.sealer) return;
+    const typed = ((e.target as HTMLFormElement).elements.namedItem("recoveryKey") as HTMLInputElement).value;
+    this.recoveryBusy = true;
+    this.recoveryNote = "";
+    try {
+      const count = await this.sealer.recover(typed);
+      this.recoveryNote = count === null ? t(this.localize, "recoveryWrong") : t(this.localize, "recoveryRestored", { count });
+      this.recovery = await this.sealer.recoveryState();
+      if (count !== null && this.current) await this.loadMessages(this.current);
+    } catch (err) {
+      this.recoveryNote = err instanceof ApiError ? err.message : String(err);
+    } finally {
+      this.recoveryBusy = false;
+    }
+  }
+
+  private recoveryDialog() {
+    if (!this.recoveryOpen) return nothing;
+    const r = this.recovery;
+    const close = () => ((this.recoveryOpen = false), (this.recoveryKey = ""), (this.recoveryNote = ""));
+    return html`<dialog class="modal recovery" aria-label=${t(this.localize, "recoveryTitle")} @close=${close}>
+      <form method="dialog" @submit=${(e: Event) => (r?.set && !r.here ? this.recoverWithKey(e) : undefined)}>
+        <h2>${t(this.localize, "recoveryTitle")}</h2>
+        ${this.recoveryKey
+          ? html`<p>${t(this.localize, "recoveryKeyShown")}</p>
+              <p><code class="recovery-key" data-testid="recovery-key">${this.recoveryKey}</code></p>
+              ${r?.escrow ? html`<p class="muted">${t(this.localize, "recoveryEscrow")}</p>` : nothing}
+              <div class="row"><button type="button" class="button primary" @click=${close}>${t(this.localize, "recoverySaved")}</button></div>`
+          : !r?.set
+            ? html`<p>${t(this.localize, "recoverySetUpLead")}</p>
+                <div class="row"><button type="button" class="button" @click=${close}>${t(this.localize, "cancel")}</button>
+                <button type="button" class="button primary" ?disabled=${this.recoveryBusy} @click=${() => void this.setUpRecovery()}>${t(this.localize, "recoverySetUp")}</button></div>`
+            : !r.here
+              ? html`<p>${t(this.localize, "recoveryEnterLead")}</p>
+                  <label>${t(this.localize, "recoveryKeyLabel")}<input class="input" name="recoveryKey" autocomplete="off" spellcheck="false" required /></label>
+                  <div class="row"><button type="button" class="button" @click=${close}>${t(this.localize, "cancel")}</button>
+                  <button class="button primary" ?disabled=${this.recoveryBusy}>${t(this.localize, "recoveryEnter")}</button></div>`
+              : html`<p>${t(this.localize, "recoveryHere")}</p>
+                  <div class="row"><button type="button" class="button primary" @click=${close}>${t(this.localize, "close")}</button></div>`}
+        ${this.recoveryNote ? html`<p role="status" class="note">${this.recoveryNote}</p>` : nothing}
+      </form>
+    </dialog>`;
   }
 
   /** Sealed messages opened on this device (or marked as not readable). */
@@ -1277,7 +1362,7 @@ export class OrtusChatMain extends LitElement {
   }
 
   private dialogs(): TemplateResult {
-    return html`${this.creating
+    return html`${this.recoveryDialog()}${this.creating
         ? html`<dialog class="modal" aria-label=${t(this.localize, this.creating === "direct" ? "newDirect" : "newChannel")} @close=${() => ((this.creating = null), (this.error = ""))}>
             <form @submit=${this.createRoom}>
               <h2>${t(this.localize, this.creating === "direct" ? "newDirect" : "newChannel")}</h2>
@@ -1394,6 +1479,10 @@ export class OrtusChatMain extends LitElement {
                 ${room.label ? html`<span class="label">${room.label.toUpperCase()}</span>` : nothing}
                 <span class="muted">${t(this.localize, "members", { count: this.members.filter((m) => m.state === "join").length })}</span>
                 ${room.encrypted ? html`<span class="e2e">🔒 ${t(this.localize, "endToEnd")}</span>` : nothing}
+                ${room.encrypted && this.unverified.length
+                  ? html`<span class="unverified" role="status" title=${this.unverified.map((d) => `${this.people[d.user]?.name ?? d.user} · ${d.device}`).join("\n")}>⚠ ${t(this.localize, "unverifiedDevices", { count: this.unverified.length })}</span>`
+                  : nothing}
+                ${room.encrypted ? html`<button class="button" @click=${() => (this.recoveryOpen = true)}>${t(this.localize, "recovery")}</button>` : nothing}
                 ${room.federated
                   ? html`<span class="shared">${t(this.localize, "sharedWithPartners")} <code>${room.roomId ?? ""}</code></span>`
                   : this.federation && room.kind !== "direct" && !room.encrypted && this.isOwner()
