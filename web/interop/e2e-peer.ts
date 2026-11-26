@@ -107,6 +107,16 @@ for (;;) {
     } else if (c.cmd === "confirm") {
       await sealer.confirmEmoji(c.id, c.same);
       say({ result: null });
+    } else if (c.cmd === "recover") {
+      say({ result: await sealer.recover(c.key) });
+    } else if (c.cmd === "recoveryState") {
+      say({ result: await sealer.recoveryState() });
+    } else if (c.cmd === "emoji") {
+      await sealer.startEmoji(c.id);
+      say({ result: null });
+    } else if (c.cmd === "confirmScanned") {
+      await sealer.confirmScanned(c.id, c.yes);
+      say({ result: null });
     } else if (c.cmd === "quit") {
       process.exit(0);
     }

@@ -141,10 +141,23 @@ pub struct VerificationView {
     pub id: String,
     pub user: String,
     pub device: Option<String>,
-    /// requested, incoming, waiting, emoji, done or cancelled.
+    /// requested, incoming, ready (choose: scan, show or emoji), qr (this
+    /// phone's code is shown), scanned (the other device scanned it: did it
+    /// say so?), waiting, emoji, done or cancelled.
     pub state: String,
     /// The seven emoji's numbers in Matrix's table, when there are some to compare.
     pub emoji: Vec<u8>,
+    /// The other device shows a code this phone can scan.
+    pub can_scan: bool,
+    /// The other device can scan a code this phone shows.
+    pub can_show: bool,
+}
+
+/// A QR code to draw: `width` × `width` modules, dark when true, row by row.
+#[derive(uniffi::Record)]
+pub struct QrImage {
+    pub width: u32,
+    pub modules: Vec<bool>,
 }
 
 /// End-to-end rooms for one person on this phone.
@@ -227,6 +240,42 @@ impl OrtusE2e {
         Ok(self.inner.recover(&recovery_key)?)
     }
 
+    /// Sets recovery up from this phone (nobody set it up yet): the
+    /// recovery key, to show once.
+    pub fn set_up_recovery(&self) -> Result<String, E2eError> {
+        Ok(self.inner.set_up_recovery()?)
+    }
+
+    /// Asks one device (a row of a room's unverified devices) to verify: its id.
+    pub fn verify_device(&self, user: String, device: String) -> Result<String, E2eError> {
+        Ok(self.inner.verify_device(&user, &device)?)
+    }
+
+    /// Emoji, chosen over a QR code.
+    pub fn start_emoji(&self, id: String) -> Result<(), E2eError> {
+        Ok(self.inner.start_emoji(&id)?)
+    }
+
+    /// The other device's code as the camera read it: its bytes, or its
+    /// data codewords (iOS's error-corrected payload, ZXing's raw bytes).
+    pub fn scan_qr(&self, id: String, scanned: Vec<u8>) -> Result<(), E2eError> {
+        Ok(self.inner.scan_qr(&id, &scanned)?)
+    }
+
+    /// This phone's code, for the other device to scan.
+    pub fn show_qr(&self, id: String) -> Result<QrImage, E2eError> {
+        let q = self.inner.show_qr(&id)?;
+        Ok(QrImage {
+            width: q.width,
+            modules: q.modules,
+        })
+    }
+
+    /// Whether the other device said it scanned this phone's code.
+    pub fn confirm_scanned(&self, id: String, yes: bool) -> Result<(), E2eError> {
+        Ok(self.inner.confirm_scanned(&id, yes)?)
+    }
+
     /// The room's devices nobody vouched for (rooms warn; messages still go).
     pub fn unverified(&self, room: String) -> Result<Vec<DeviceRef>, E2eError> {
         Ok(self
@@ -250,6 +299,8 @@ impl OrtusE2e {
                 device: v.device,
                 state: v.state,
                 emoji: v.emoji,
+                can_scan: v.can_scan,
+                can_show: v.can_show,
             })
             .collect())
     }

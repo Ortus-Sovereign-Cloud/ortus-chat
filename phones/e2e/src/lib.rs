@@ -105,7 +105,7 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 
 mod trust;
-pub use trust::{RecoveryState, VerificationView};
+pub use trust::{qr_payload, QrImage, RecoveryState, VerificationView};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -406,6 +406,42 @@ impl E2e {
     pub fn recover(&self, recovery_key: &str) -> Result<u32> {
         let key = recovery_key.to_string();
         self.with(move |i| Box::pin(async move { i.recover(&key).await }))
+    }
+
+    /// Sets recovery up from this phone (nobody set it up yet): answers the
+    /// recovery key, to show once.
+    pub fn set_up_recovery(&self) -> Result<String> {
+        self.with(|i| Box::pin(i.set_up_recovery()))
+    }
+
+    /// Asks one device (another person's, or one's own) to verify.
+    pub fn verify_device(&self, user: &str, device: &str) -> Result<String> {
+        let (user, device) = (user.to_string(), device.to_string());
+        self.with(move |i| Box::pin(async move { i.verify_device(&user, &device).await }))
+    }
+
+    /// Emoji, chosen over a QR code.
+    pub fn start_emoji(&self, id: &str) -> Result<()> {
+        let id = id.to_string();
+        self.with(move |i| Box::pin(async move { i.start_emoji(&id).await }))
+    }
+
+    /// The other device's QR code, as the camera read it.
+    pub fn scan_qr(&self, id: &str, scanned: &[u8]) -> Result<()> {
+        let (id, scanned) = (id.to_string(), scanned.to_vec());
+        self.with(move |i| Box::pin(async move { i.scan_qr(&id, &scanned).await }))
+    }
+
+    /// This phone's QR code, for the other device to scan.
+    pub fn show_qr(&self, id: &str) -> Result<QrImage> {
+        let id = id.to_string();
+        self.with(move |i| Box::pin(async move { i.show_qr(&id).await }))
+    }
+
+    /// Whether the other device said it scanned this phone's code.
+    pub fn confirm_scanned(&self, id: &str, yes: bool) -> Result<()> {
+        let id = id.to_string();
+        self.with(move |i| Box::pin(async move { i.confirm_scanned(&id, yes).await }))
     }
 
     /// A room's devices nobody vouched for: (person, device).

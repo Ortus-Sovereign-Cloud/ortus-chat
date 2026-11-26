@@ -121,16 +121,29 @@ Recovery, a shield on rooms and members, the verification sheets.
   with the room's unverified devices and Verify, verification by emoji
   (Matrix's m.sas.v1, written on WebCrypto); Admin › Chat with the escrow
   key and a person's recovery key opened from their copy.
-- Phones: recovery with the recovery key (set up on a computer: the phones
-  do not make one), the warning, verification by emoji (accepting a
-  request, and asking one's own other devices), all by matrix-sdk-crypto.
+- Phones: recovery set up on the phone (the same formats: the browser
+  recovers with a phone's key, and the escrow copy opens to it) or
+  recovered with the key; the warning, with Verify on each unverified
+  device (another person's or one's own); verification by emoji or QR code
+  (scan the other device's code, show this phone's), all by
+  matrix-sdk-crypto.
+- QR codes (`m.qr_code.show.v1`, `m.qr_code.scan.v1`, `m.reciprocate.v1`):
+  the browser shows a code (`web/src/qr.ts`, written by hand: byte mode,
+  level M) when the other device can scan, and emoji stay a choice; what is
+  signed once the code is scanned is fixed when the code is made (the keys
+  it shows), and only after the person confirms the other device scanned
+  it. Phones scan (the code's raw bytes: the payload is binary) and show.
 - Tests: the formats against matrix-sdk-crypto (`trust_interop.rs`), the
   browser and a phone on a real server (`trust_phone.rs`: the phone
-  restores the browser's backup; both show the same emoji and finish),
-  the browser flows (`recovery`, `escrow`, `verify` specs), the server's
-  checks (`tests/trust.rs`).
-- Not yet: QR codes (emoji work everywhere); phones asking someone else to
-  verify (they answer anyone's request); setting up recovery on a phone.
+  restores the browser's backup, both show the same emoji and finish;
+  `trust_more.rs`: recovery set up on a phone, opened by the browser and
+  by the escrow key; the browser's code, read back by an independent
+  decoder (rqrr) and scanned by a phone; a phone verifying another
+  person's device), the browser flows (`recovery`, `escrow`, `verify`
+  specs), the server's checks (`tests/trust.rs`).
+- Not yet: the browser scanning a phone's code (no camera API it can rely
+  on: a phone shows its code to another phone, and emoji between a phone
+  and a browser work both ways).
 
 ## Order and tests
 

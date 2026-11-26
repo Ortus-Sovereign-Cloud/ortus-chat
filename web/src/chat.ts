@@ -4,6 +4,17 @@
 import { ApiError, LitElement, LocalizeController, call, controls, css, customElement, html, nothing, state, type TemplateResult } from "ortus-kit";
 import { Sealer, type RecoveryState, type Sealed, type VerificationView } from "./e2e.js";
 import { EMOJI } from "./verify.js";
+
+/** A verification QR code as SVG: dark modules on white, with the quiet zone (cameras need both, in any theme). */
+function qrSvg(modules: boolean[][], label: string) {
+  const n = modules.length;
+  const size = n + 8;
+  let d = "";
+  modules.forEach((row, y) => row.forEach((dark, x) => dark && (d += `M${x + 4} ${y + 4}h1v1h-1z`)));
+  return html`<svg class="qr" data-testid="verify-qr" role="img" aria-label=${label} viewBox="0 0 ${size} ${size}" shape-rendering="crispEdges">
+    <rect width=${size} height=${size} fill="#fff"></rect><path d=${d} fill="#000"></path>
+  </svg>`;
+}
 import { t } from "./i18n.js";
 
 interface RoomItem {
@@ -277,6 +288,13 @@ export class OrtusChatMain extends LitElement {
         font-size: 14px;
         cursor: pointer;
         text-decoration: underline;
+      }
+      .qr {
+        display: block;
+        width: min(280px, 100%);
+        height: auto;
+        margin: 8px auto;
+        border-radius: 8px;
       }
       .emoji {
         display: flex;
@@ -1092,6 +1110,14 @@ export class OrtusChatMain extends LitElement {
                 ? html`<p>${t(this.localize, "verifyIncoming", { name: name(v.user) })}</p>
                     <div class="row"><button class="button">${t(this.localize, "verifyDecline")}</button>
                     <button type="button" class="button primary" @click=${() => void this.sealer?.acceptVerification(v.id)}>${t(this.localize, "verifyAccept")}</button></div>`
+                : v.state === "qr" && v.qr
+                  ? html`<p>${t(this.localize, "verifyScanThis")}</p>
+                      ${qrSvg(v.qr, t(this.localize, "verifyCodeLabel"))}
+                      <div class="row"><button type="button" class="button" @click=${() => void this.sealer?.startEmoji(v.id)}>${t(this.localize, "verifyUseEmoji")}</button></div>`
+                : v.state === "scanned"
+                  ? html`<p>${t(this.localize, "verifyScanned")}</p>
+                      <div class="row"><button type="button" class="button" @click=${() => void this.sealer?.confirmScanned(v.id, false)}>${t(this.localize, "verifyScannedNo")}</button>
+                      <button type="button" class="button primary" @click=${() => void this.sealer?.confirmScanned(v.id, true)}>${t(this.localize, "verifyScannedYes")}</button></div>`
                 : v.state === "waiting"
                   ? html`<p role="status">${t(this.localize, "verifyWaiting")}</p>`
                   : v.state === "emoji"
@@ -1102,7 +1128,7 @@ export class OrtusChatMain extends LitElement {
                     : v.state === "done"
                       ? html`<p role="status">${t(this.localize, "verifyDone")}</p>`
                       : html`<p role="status">${t(this.localize, "verifyCancelled", { reason: v.reason ?? "" })}</p>`}
-            ${v.state === "done" || v.state === "cancelled" || v.state === "requested" || v.state === "waiting" ? html`<button class="button">${t(this.localize, "close")}</button>` : nothing}
+            ${v.state === "done" || v.state === "cancelled" || v.state === "requested" || v.state === "waiting" || v.state === "qr" ? html`<button class="button">${t(this.localize, "close")}</button>` : nothing}
           </form>
         </dialog>`
       : nothing}`;

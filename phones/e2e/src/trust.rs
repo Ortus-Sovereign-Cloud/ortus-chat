@@ -8,6 +8,7 @@
 use std::collections::BTreeMap;
 
 use matrix_sdk_crypto::backups::DecryptionError;
+use matrix_sdk_crypto::matrix_sdk_qrcode::QrVerificationData;
 use matrix_sdk_crypto::olm::ExportedRoomKey;
 use matrix_sdk_crypto::secret_storage::{AesHmacSha2EncryptedData, SecretStorageKey};
 use matrix_sdk_crypto::store::types::{BackupDecryptionKey, CrossSigningKeyExport};
@@ -17,6 +18,7 @@ use matrix_sdk_crypto::types::requests::{
 use matrix_sdk_crypto::{Verification, VerificationRequest};
 use ruma::api::client::backup::add_backup_keys;
 use ruma::api::client::keys::upload_signatures;
+use ruma::events::key::verification::VerificationMethod;
 use ruma::events::secret::request::SecretName;
 use ruma::events::secret_storage::key::{
     SecretStorageEncryptionAlgorithm, SecretStorageKeyEventContent,
@@ -37,16 +39,79 @@ pub struct RecoveryState {
     pub here: bool,
 }
 
-/// A verification by emoji, as the screen shows it.
+/// A verification (by QR code or emoji), as the screen shows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerificationView {
     pub id: String,
     pub user: String,
     pub device: Option<String>,
-    /// requested, incoming, waiting, emoji, done, cancelled (as the browser's).
+    /// requested, incoming, ready (choose: scan, show or emoji), qr (our
+    /// code is shown), scanned (the other device scanned ours: did it say
+    /// so?), waiting, emoji, done, cancelled.
     pub state: String,
     /// The seven emoji's numbers (Matrix's table), when there are some to compare.
     pub emoji: Vec<u8>,
+    /// The other device shows a code this phone can scan.
+    pub can_scan: bool,
+    /// The other device can scan a code this phone shows.
+    pub can_show: bool,
+}
+
+/// A QR code to show: `width` × `width` modules, dark when true, row by row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QrImage {
+    pub width: u32,
+    pub modules: Vec<bool>,
+}
+
+/// The ways this phone verifies: emoji, and QR codes both ways.
+const METHODS: [VerificationMethod; 4] = [
+    VerificationMethod::SasV1,
+    VerificationMethod::QrCodeScanV1,
+    VerificationMethod::QrCodeShowV1,
+    VerificationMethod::ReciprocateV1,
+];
+
+/// The bytes a verification QR code holds, from what a scanner gives: the
+/// bytes themselves (they begin with MATRIX), or the code's data codewords
+/// (iOS's error-corrected payload, ZXing's raw bytes): one byte-mode
+/// segment, its length in 8 bits (versions 1 to 9) or 16 (10 to 40).
+pub fn qr_payload(scanned: &[u8]) -> Option<Vec<u8>> {
+    if scanned.starts_with(b"MATRIX") {
+        return Some(scanned.to_vec());
+    }
+    let bit = |i: usize| -> Option<u32> {
+        scanned
+            .get(i / 8)
+            .map(|b| u32::from((b >> (7 - i % 8)) & 1))
+    };
+    let read = |at: usize, n: usize| -> Option<u32> {
+        (0..n).try_fold(0u32, |acc, k| Some((acc << 1) | bit(at + k)?))
+    };
+    let mut at = 0;
+    let mut mode = read(at, 4)?;
+    if mode == 0b0111 {
+        // An ECI designator (one byte here) before the data.
+        at += 12;
+        mode = read(at, 4)?;
+    }
+    if mode != 0b0100 {
+        return None;
+    }
+    at += 4;
+    for count_bits in [8, 16] {
+        let Some(n) = read(at, count_bits) else {
+            continue;
+        };
+        let start = at + count_bits;
+        let bytes: Option<Vec<u8>> = (0..n as usize)
+            .map(|k| read(start + 8 * k, 8).map(|b| b as u8))
+            .collect();
+        if let Some(b) = bytes.filter(|b| b.starts_with(b"MATRIX")) {
+            return Some(b);
+        }
+    }
+    None
 }
 
 fn unb64(text: &str) -> Option<Vec<u8>> {
@@ -107,10 +172,164 @@ impl Inner {
             .await
             .is_some_and(|d| d["key"].is_string());
         let status = self.machine.cross_signing_status().await;
+        // Keys made here whose set-up did not finish (the server refused
+        // them) do not count: set-up is offered again and uploads them anew.
         Ok(RecoveryState {
             set,
-            here: status.has_master && status.has_self_signing && status.has_user_signing,
+            here: set && status.has_master && status.has_self_signing && status.has_user_signing,
         })
+    }
+
+    /// Sets recovery up from this phone (the person's first device to do
+    /// so): cross-signing keys, this device signed, a backup the master key
+    /// signed, the secrets in secret storage under a new recovery key, and
+    /// its escrow copy when the organisation has an escrow key. The same
+    /// formats as the browser's. Answers the recovery key, to show once.
+    pub(crate) async fn set_up_recovery(&mut self) -> Result<String> {
+        let me = self.me.to_string();
+        if self.recovery_state().await?.set {
+            return Err(Error::Invalid("Recovery is already set up for you.".into()));
+        }
+        self.read_keys_of(&me).await?;
+        let theirs = self
+            .cross
+            .get(&me)
+            .and_then(|k| k["master"]["keys"].as_object().cloned());
+        let status = self.machine.cross_signing_status().await;
+        if theirs.is_some_and(|k| !k.is_empty()) && !status.has_master {
+            // Another device made cross-signing keys: recovery is theirs to finish.
+            return Err(Error::Invalid(
+                "Recovery is being set up on another device.".into(),
+            ));
+        }
+        // Never a reset: an identity made here before (an upload refused)
+        // is uploaded again.
+        let boot = self
+            .machine
+            .bootstrap_cross_signing(false)
+            .await
+            .map_err(|e| Error::Invalid(e.to_string()))?;
+        let keys = &boot.upload_signing_keys_req;
+        let body = json!({
+            "master": serde_json::to_value(&keys.master_key).map_err(crate::store_err)?,
+            "selfSigning": serde_json::to_value(&keys.self_signing_key).map_err(crate::store_err)?,
+            "userSigning": serde_json::to_value(&keys.user_signing_key).map_err(crate::store_err)?,
+        });
+        self.http("PUT", "/chat/cross-signing", Some(body)).await?;
+        self.upload_signatures(&boot.upload_signatures_req.signed_keys)
+            .await?;
+        self.read_keys_of(&me).await?;
+        self.process(None).await?;
+
+        // The backup, signed by the master key and this device.
+        let backup = BackupDecryptionKey::new();
+        let mut info = backup.to_backup_info();
+        self.machine
+            .backup_machine()
+            .sign_backup(&mut info)
+            .await
+            .map_err(|e| Error::Invalid(e.to_string()))?;
+        let info = serde_json::to_value(&info).map_err(crate::store_err)?;
+        let made = self
+            .http(
+                "POST",
+                "/chat/backup/version",
+                Some(json!({"algorithm": info["algorithm"], "authData": info["auth_data"]})),
+            )
+            .await?;
+        let version = made["version"].as_str().unwrap_or_default().to_string();
+        self.machine
+            .backup_machine()
+            .save_decryption_key(Some(backup.clone()), Some(version.clone()))
+            .await
+            .map_err(crate::store_err)?;
+        let public = backup.megolm_v1_public_key();
+        public.set_version(version.clone());
+        self.machine
+            .backup_machine()
+            .enable_backup_v1(public)
+            .await
+            .map_err(crate::store_err)?;
+
+        // Secret storage under the recovery key; the default key last, so a
+        // set-up that stops half-way is not taken for one that finished.
+        let key = SecretStorageKey::new();
+        let key_id = key.key_id().to_string();
+        let description = serde_json::to_value(key.event_content()).map_err(crate::store_err)?;
+        self.http(
+            "PUT",
+            &format!(
+                "/chat/account-data/{}",
+                enc(&format!("m.secret_storage.key.{key_id}"))
+            ),
+            Some(description),
+        )
+        .await?;
+        let export = self
+            .machine
+            .export_cross_signing_keys()
+            .await
+            .map_err(crate::store_err)?
+            .ok_or_else(|| Error::Invalid("The cross-signing keys are missing.".into()))?;
+        let seeds = [
+            export.master_key.clone(),
+            export.self_signing_key.clone(),
+            export.user_signing_key.clone(),
+            Some(backup.to_base64()),
+        ];
+        for ((name, kind), seed) in SECRETS.into_iter().zip(seeds) {
+            let seed = seed.ok_or_else(|| Error::Invalid(format!("{kind} is missing.")))?;
+            let sealed = key.encrypt(seed.into_bytes(), &name);
+            let stored = json!({"encrypted": {key_id.clone(): {
+                "iv": Base64::<ruma::serde::base64::Standard, _>::new(sealed.iv.to_vec()).encode(),
+                "ciphertext": sealed.ciphertext.encode(),
+                "mac": Base64::<ruma::serde::base64::Standard, _>::new(sealed.mac.to_vec()).encode(),
+            }}});
+            self.http(
+                "PUT",
+                &format!("/chat/account-data/{}", enc(kind)),
+                Some(stored),
+            )
+            .await?;
+        }
+        let text = key.to_base58();
+        // The organisation's escrow copy, as the browser seals it.
+        let policy = self
+            .http("GET", "/chat/policy", None)
+            .await
+            .unwrap_or_default();
+        if let Some(escrow) = policy["escrowKey"].as_str() {
+            let public = vodozemac::Curve25519PublicKey::from_base64(escrow)
+                .map_err(|e| Error::Invalid(format!("the escrow key: {e}")))?;
+            let m = vodozemac::pk_encryption::PkEncryption::from_key(public)
+                .encrypt(text.as_bytes())
+                .map_err(|e| Error::Invalid(format!("the escrow key: {e}")))?;
+            let b64 =
+                |b: &[u8]| Base64::<ruma::serde::base64::Standard, _>::new(b.to_vec()).encode();
+            self.http(
+                "PUT",
+                "/chat/account-data/ortus.escrow",
+                Some(json!({"key": escrow, "sealed": {
+                    "ephemeral": m.ephemeral_key.to_base64(),
+                    "ciphertext": b64(&m.ciphertext),
+                    "mac": b64(&m.mac),
+                }})),
+            )
+            .await?;
+        }
+        self.http(
+            "PUT",
+            "/chat/account-data/m.secret_storage.default_key",
+            Some(json!({"key": key_id})),
+        )
+        .await?;
+        // Every room key this phone holds, into the backup.
+        for _ in 0..100 {
+            if !self.back_up_some().await? {
+                break;
+            }
+        }
+        Ok(text)
     }
 
     /// Recovery here with the recovery key. Answers how many room keys came
@@ -281,6 +500,11 @@ impl Inner {
 
     /// Room keys into the backup, when this phone has its key (after recovery).
     pub(crate) async fn back_up(&self) -> Result<()> {
+        self.back_up_some().await.map(|_| ())
+    }
+
+    /// One batch of room keys into the backup: whether there was one.
+    async fn back_up_some(&self) -> Result<bool> {
         let Some((id, request)) = self
             .machine
             .backup_machine()
@@ -288,7 +512,7 @@ impl Inner {
             .await
             .map_err(crate::store_err)?
         else {
-            return Ok(());
+            return Ok(false);
         };
         let rooms = serde_json::to_value(&request.rooms).map_err(crate::store_err)?;
         let r = self
@@ -307,7 +531,7 @@ impl Inner {
             .mark_request_as_sent(&id, &response)
             .await
             .map_err(crate::store_err)?;
-        Ok(())
+        Ok(true)
     }
 
     /// The room's devices nobody vouched for (their owner's self-signing
@@ -353,22 +577,35 @@ impl Inner {
         let user = r.other_user().to_string();
         let device = r.other_device_id().map(|d| d.to_string());
         let id = r.flow_id().as_str().to_string();
-        let sas = match self.machine.get_verification(r.other_user(), &id) {
-            Some(Verification::SasV1(s)) => Some(s),
-            _ => None,
-        };
-        let (state, emoji) = if r.is_cancelled() || sas.as_ref().is_some_and(|s| s.is_cancelled()) {
-            ("cancelled", Vec::new())
-        } else if r.is_done() || sas.as_ref().is_some_and(|s| s.is_done()) {
-            ("done", Vec::new())
-        } else if let Some(e) = sas.as_ref().and_then(|s| s.emoji_index()) {
-            ("emoji", e.to_vec())
-        } else if !r.we_started() && !r.is_ready() && sas.is_none() {
-            ("incoming", Vec::new())
-        } else if r.we_started() && !r.is_ready() {
-            ("requested", Vec::new())
-        } else {
-            ("waiting", Vec::new())
+        let theirs = r.their_supported_methods().unwrap_or_default();
+        let can_scan = theirs.contains(&VerificationMethod::QrCodeShowV1);
+        let can_show = theirs.contains(&VerificationMethod::QrCodeScanV1);
+        let flow = self.machine.get_verification(r.other_user(), &id);
+        let (state, emoji) = match &flow {
+            _ if r.is_cancelled() || flow.as_ref().is_some_and(|f| f.is_cancelled()) => {
+                ("cancelled", Vec::new())
+            }
+            _ if r.is_done() || flow.as_ref().is_some_and(|f| f.is_done()) => ("done", Vec::new()),
+            Some(Verification::SasV1(sas)) => match sas.emoji_index() {
+                Some(e) => ("emoji", e.to_vec()),
+                None => ("waiting", Vec::new()),
+            },
+            Some(Verification::QrV1(qr)) => {
+                if qr.reciprocated() {
+                    // We scanned theirs: the other device confirms.
+                    ("waiting", Vec::new())
+                } else if qr.has_been_scanned() && !qr.has_been_confirmed() {
+                    ("scanned", Vec::new())
+                } else if qr.has_been_confirmed() {
+                    ("waiting", Vec::new())
+                } else {
+                    ("qr", Vec::new())
+                }
+            }
+            _ if !r.we_started() && !r.is_ready() => ("incoming", Vec::new()),
+            _ if r.we_started() && !r.is_ready() => ("requested", Vec::new()),
+            _ if r.is_ready() => ("ready", Vec::new()),
+            _ => ("waiting", Vec::new()),
         };
         VerificationView {
             id,
@@ -376,6 +613,8 @@ impl Inner {
             device,
             state: state.into(),
             emoji,
+            can_scan,
+            can_show,
         }
     }
 
@@ -413,9 +652,14 @@ impl Inner {
         self.take_inbox().await?;
         for r in self.requests() {
             let id = r.flow_id().as_str().to_string();
-            // Ours, and the other side said ready: start the emoji.
+            // Ours, and the other side said ready: start the emoji, unless
+            // a QR code is possible (the person chooses: scan, show or emoji).
+            let theirs = r.their_supported_methods().unwrap_or_default();
+            let qr = theirs.contains(&VerificationMethod::QrCodeShowV1)
+                || theirs.contains(&VerificationMethod::QrCodeScanV1);
             if r.we_started()
                 && r.is_ready()
+                && !qr
                 && self.machine.get_verification(r.other_user(), &id).is_none()
             {
                 if let Ok(Some((_, start))) = r.start_sas().await {
@@ -450,11 +694,115 @@ impl Inner {
             .and_then(|i| i.own())
             .ok_or_else(|| Error::Invalid("Recovery is not set up for you yet.".into()))?;
         let (request, outgoing) = identity
-            .request_verification()
+            .request_verification_with_methods(METHODS.to_vec())
             .await
             .map_err(crate::store_err)?;
         self.send_verification(outgoing).await?;
         Ok(request.flow_id().as_str().to_string())
+    }
+
+    /// Asks one device of someone (another person, or one's own) to verify
+    /// with this one: a row of a room's unverified devices.
+    pub(crate) async fn verify_device(&mut self, user: &str, device: &str) -> Result<String> {
+        let user_id = UserId::parse(user).map_err(|_| Error::Invalid("No such person.".into()))?;
+        self.read_keys_of(user).await?;
+        if user != self.me.as_str() {
+            let me = self.me.to_string();
+            self.read_keys_of(&me).await?;
+        }
+        self.process(None).await?;
+        let d = self
+            .machine
+            .get_device(&user_id, device.into(), None)
+            .await
+            .map_err(crate::store_err)?
+            .ok_or_else(|| Error::Invalid("No such device.".into()))?;
+        let (request, outgoing) = d.request_verification_with_methods(METHODS.to_vec());
+        self.note_verifying(user);
+        self.send_verification(outgoing).await?;
+        Ok(request.flow_id().as_str().to_string())
+    }
+
+    /// The emoji, chosen over a QR code.
+    pub(crate) async fn start_emoji(&mut self, id: &str) -> Result<()> {
+        let r = self.request(id)?;
+        if let Some((_, start)) = r.start_sas().await.map_err(crate::store_err)? {
+            self.send_verification(start).await?;
+        }
+        Ok(())
+    }
+
+    /// The other device's QR code, scanned here (what the scanner gave:
+    /// the bytes, or the code's data codewords).
+    pub(crate) async fn scan_qr(&mut self, id: &str, scanned: &[u8]) -> Result<()> {
+        let r = self.request(id)?;
+        let other = r.other_user().to_string();
+        let me = self.me.to_string();
+        self.read_keys_of(&other).await?;
+        if other != me {
+            self.read_keys_of(&me).await?;
+        }
+        self.process(None).await?;
+        let bytes = qr_payload(scanned)
+            .ok_or_else(|| Error::Invalid("That is not a verification code.".into()))?;
+        let data = QrVerificationData::from_bytes(bytes)
+            .map_err(|_| Error::Invalid("That is not a verification code.".into()))?;
+        let r = self.request(id)?;
+        let qr = r
+            .scan_qr_code(data)
+            .await
+            .map_err(|e| Error::Invalid(format!("The code does not match: {e}")))?
+            .ok_or_else(|| Error::Invalid("This verification cannot use a code now.".into()))?;
+        if let Some(reciprocate) = qr.reciprocate() {
+            self.send_verification(reciprocate).await?;
+        }
+        Ok(())
+    }
+
+    /// This phone's QR code for the other device to scan (made once).
+    pub(crate) async fn show_qr(&mut self, id: &str) -> Result<QrImage> {
+        let r = self.request(id)?;
+        let other = r.other_user().to_string();
+        let me = self.me.to_string();
+        self.read_keys_of(&other).await?;
+        if other != me {
+            self.read_keys_of(&me).await?;
+        }
+        self.process(None).await?;
+        let r = self.request(id)?;
+        let qr = match self.machine.get_verification(r.other_user(), id) {
+            Some(Verification::QrV1(qr)) => *qr,
+            _ => r
+                .generate_qr_code()
+                .await
+                .map_err(crate::store_err)?
+                .ok_or_else(|| Error::Invalid("This verification cannot show a code.".into()))?,
+        };
+        let code = qr.to_qr_code().map_err(|e| Error::Invalid(e.to_string()))?;
+        let width = code.width() as u32;
+        let modules = code
+            .to_colors()
+            .into_iter()
+            .map(|c| c == matrix_sdk_crypto::matrix_sdk_qrcode::qrcode::Color::Dark)
+            .collect();
+        Ok(QrImage { width, modules })
+    }
+
+    /// The other device scanned this phone's code and says so (or not).
+    pub(crate) async fn confirm_scanned(&mut self, id: &str, yes: bool) -> Result<()> {
+        let r = self.request(id)?;
+        let Some(Verification::QrV1(qr)) = self.machine.get_verification(r.other_user(), id) else {
+            return Err(Error::Invalid("Nothing was scanned.".into()));
+        };
+        let out = if yes {
+            qr.confirm_scanning()
+        } else {
+            qr.cancel_with_code(ruma::events::key::verification::cancel::CancelCode::KeyMismatch)
+        };
+        if let Some(out) = out {
+            self.send_verification(out).await?;
+        }
+        self.flush().await
     }
 
     fn request(&self, id: &str) -> Result<VerificationRequest> {
@@ -469,7 +817,7 @@ impl Inner {
         let user = r.other_user().to_string();
         self.read_keys_of(&user).await?;
         self.process(None).await?;
-        if let Some(ready) = r.accept() {
+        if let Some(ready) = r.accept_with_methods(METHODS.to_vec()) {
             self.send_verification(ready).await?;
         }
         Ok(())
@@ -528,5 +876,40 @@ impl Inner {
             }
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::qr_payload;
+
+    /// Data codewords as a scanner gives them: byte mode, the count, the
+    /// bytes, a terminator, padding.
+    fn codewords(payload: &[u8], count_bits: usize) -> Vec<u8> {
+        let mut bits: Vec<u8> = Vec::new();
+        let mut put = |v: u32, n: usize| (0..n).rev().for_each(|i| bits.push(((v >> i) & 1) as u8));
+        put(0b0100, 4);
+        put(payload.len() as u32, count_bits);
+        payload.iter().for_each(|b| put(u32::from(*b), 8));
+        put(0, 4);
+        while !bits.len().is_multiple_of(8) {
+            bits.push(0);
+        }
+        let mut out: Vec<u8> = bits
+            .chunks(8)
+            .map(|c| c.iter().fold(0, |a, b| (a << 1) | b))
+            .collect();
+        out.extend([0xec, 0x11, 0xec]);
+        out
+    }
+
+    #[test]
+    fn reads_the_bytes_from_what_a_scanner_gives() {
+        let payload = b"MATRIX\x02\x00\x00\x02ab0123456789012345678901234567890123456789012345678901234567890123secret!!";
+        assert_eq!(Some(payload.to_vec()), qr_payload(payload));
+        assert_eq!(Some(payload.to_vec()), qr_payload(&codewords(payload, 8)));
+        assert_eq!(Some(payload.to_vec()), qr_payload(&codewords(payload, 16)));
+        assert_eq!(None, qr_payload(&codewords(b"not a verification", 8)));
+        assert_eq!(None, qr_payload(b""));
     }
 }

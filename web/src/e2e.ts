@@ -9,6 +9,7 @@ import { call } from "ortus-kit";
 import * as olm from "./olm.js";
 import * as trust from "./trust.js";
 import * as sas from "./verify.js";
+import { qrCode } from "./qr.js";
 
 export const OLM = "m.olm.v1.curve25519-aes-sha2";
 export const MEGOLM = "m.megolm.v1.aes-sha2";
@@ -72,21 +73,46 @@ export interface RecoveryState {
   escrow: boolean;
 }
 
-/** A verification by emoji, as the screen shows it. */
+/** A verification (by QR code or emoji), as the screen shows it. */
 export interface VerificationView {
   id: string;
   /** The other person (oneself, for one's own other device). */
   user: string;
   device?: string;
-  /** requested: we asked; incoming: they ask; waiting: keys are being agreed; emoji: compare; done; cancelled. */
-  state: "requested" | "incoming" | "waiting" | "emoji" | "done" | "cancelled";
+  /**
+   * requested: we asked; incoming: they ask; qr: our code is shown for the
+   * other device to scan (or emoji instead); scanned: the other device
+   * scanned it (does it say so?); waiting: keys are being agreed; emoji:
+   * compare; done; cancelled.
+   */
+  state: "requested" | "incoming" | "qr" | "scanned" | "waiting" | "emoji" | "done" | "cancelled";
   emoji?: number[];
+  /** The code's modules, dark when true, while it is shown. */
+  qr?: boolean[][];
   reason?: string;
+}
+
+/** The ways this browser verifies: emoji, and showing a QR code to a phone's camera. */
+const QR_SHOW = "m.qr_code.show.v1";
+const QR_SCAN = "m.qr_code.scan.v1";
+const RECIPROCATE = "m.reciprocate.v1";
+const METHODS = [sas.SAS, QR_SHOW, RECIPROCATE];
+
+/** What a shown code vouches for, fixed when it was made: what is signed once the other device scanned it. */
+interface ShownCode {
+  secret: string;
+  /** Their master key (another person), their device's keys (one's own other device), or nothing to sign (this browser does not hold the keys). */
+  sign: { kind: "master"; keyId: string; key: string; object: Record<string, unknown> } | { kind: "device"; object: Record<string, unknown> } | { kind: "none" };
 }
 
 interface Verification {
   view: VerificationView;
+  /** We sent the request. */
   started: boolean;
+  /** We sent the emoji's start message (the starting side of m.sas.v1). */
+  sasStarted?: boolean;
+  theirMethods?: string[];
+  code?: ShownCode;
   start?: Record<string, unknown>;
   commitment?: string;
   ours?: sas.Ephemeral;
@@ -713,7 +739,7 @@ export class Sealer {
       const id = sas.transactionId();
       const v: Verification = { view: { id, user, state: "requested" }, started: true };
       this.verifications.set(id, v);
-      await this.sendVerification(a, user, "*", "m.key.verification.request", { from_device: a.device, methods: [sas.SAS], transaction_id: id, timestamp: Date.now() });
+      await this.sendVerification(a, user, "*", "m.key.verification.request", { from_device: a.device, methods: METHODS, transaction_id: id, timestamp: Date.now() });
       this.changed(v);
       return id;
     });
@@ -726,7 +752,122 @@ export class Sealer {
       if (!v || v.view.state !== "incoming" || !v.view.device) return;
       const a = await this.account();
       v.view.state = "waiting";
-      await this.sendVerification(a, v.view.user, v.view.device, "m.key.verification.ready", { from_device: a.device, methods: [sas.SAS], transaction_id: id });
+      await this.sendVerification(a, v.view.user, v.view.device, "m.key.verification.ready", { from_device: a.device, methods: METHODS, transaction_id: id });
+      // Their camera can read a code: show one (emoji stay a choice).
+      if (v.theirMethods?.includes(QR_SCAN)) await this.showCode(a, v);
+      this.changed(v);
+    });
+  }
+
+  /** Emoji, chosen over the code shown. */
+  startEmoji(id: string): Promise<void> {
+    return this.run(async () => {
+      const v = this.verifications.get(id);
+      if (!v || v.view.state !== "qr" || !v.view.device) return;
+      await this.startSas(await this.account(), v);
+      this.changed(v);
+    });
+  }
+
+  private async startSas(a: Account, v: Verification): Promise<void> {
+    if (!v.view.device) return;
+    v.view.state = "waiting";
+    v.view.qr = undefined;
+    v.code = undefined;
+    v.sasStarted = true;
+    v.start = { from_device: a.device, method: sas.SAS, key_agreement_protocols: [sas.KEY_AGREEMENT], hashes: [sas.HASH], message_authentication_codes: [sas.MAC], short_authentication_string: ["emoji", "decimal"], transaction_id: v.view.id };
+    await this.sendVerification(a, v.view.user, v.view.device, "m.key.verification.start", v.start);
+  }
+
+  /**
+   * The QR code for the other device's camera (Matrix's format: MATRIX, 2,
+   * the mode, the transaction, two keys, a secret). Another person: our
+   * master key and theirs. One's own other device: our master key and that
+   * device's key when this browser holds the keys; else this device's key
+   * and the master key. What will be signed is fixed here, with the keys
+   * the code shows. Without the keys a code needs, emoji are used.
+   */
+  private async showCode(a: Account, v: Verification): Promise<void> {
+    const device = v.view.device;
+    if (!device) return;
+    const mine = await this.trustKeys();
+    const keys = await call<{ devices: { device: string; deviceKeys: Record<string, unknown> }[]; crossSigning: Record<string, { master?: Record<string, unknown> }> }>("GET", `/chat/keys?user=${enc(v.view.user)}`);
+    const firstKey = (o?: Record<string, unknown>): [string, string] | null => {
+      const k = Object.entries((o?.keys as Record<string, string>) ?? {})[0];
+      return k ? [k[0], k[1]] : null;
+    };
+    const plain = (o: Record<string, unknown>) => {
+      const c = { ...o };
+      delete c.signatures;
+      delete c.unsigned;
+      return c;
+    };
+    let mode: number;
+    let first: string;
+    let second: string;
+    let sign: ShownCode["sign"];
+    if (v.view.user !== this.me) {
+      const master = keys.crossSigning[v.view.user]?.master;
+      const theirs = firstKey(master);
+      if (!mine || !master || !theirs) return this.startSasIfOurs(a, v);
+      mode = 0;
+      first = olm.b64(mine.master.publicKey);
+      second = theirs[1];
+      sign = { kind: "master", keyId: theirs[0], key: theirs[1], object: plain(master) };
+    } else {
+      const d = keys.devices.find((x) => x.device === device);
+      const ed = (d?.deviceKeys.keys as Record<string, string> | undefined)?.[`ed25519:${device}`];
+      if (mine && d && ed) {
+        mode = 1;
+        first = olm.b64(mine.master.publicKey);
+        second = ed;
+        sign = { kind: "device", object: plain(d.deviceKeys) };
+      } else {
+        const master = firstKey(keys.crossSigning[this.me]?.master);
+        if (!master) return this.startSasIfOurs(a, v);
+        mode = 2;
+        first = olm.b64(a.signing.publicKey);
+        second = master[1];
+        sign = { kind: "none" };
+      }
+    }
+    const secret = crypto.getRandomValues(new Uint8Array(16));
+    const id = new TextEncoder().encode(v.view.id);
+    const bytes = sas.concat(
+      new TextEncoder().encode("MATRIX"),
+      new Uint8Array([0x02, mode, id.length >> 8, id.length & 0xff]),
+      id,
+      olm.unb64(first),
+      olm.unb64(second),
+      secret,
+    );
+    v.code = { secret: olm.b64(secret), sign };
+    v.view.qr = qrCode(bytes);
+    v.view.state = "qr";
+  }
+
+  /** No code possible: emoji, started by the side that asked. */
+  private async startSasIfOurs(a: Account, v: Verification): Promise<void> {
+    if (v.started) await this.startSas(a, v);
+  }
+
+  /** The other device scanned the code and says so on its screen: whether it does. */
+  confirmScanned(id: string, yes: boolean): Promise<void> {
+    return this.run(async () => {
+      const v = this.verifications.get(id);
+      if (!v || v.view.state !== "scanned" || !v.code || !v.view.device) return;
+      const a = await this.account();
+      if (!yes) return this.cancel(a, v, "m.key_mismatch", "The other device did not confirm the code.");
+      const mine = await this.trustKeys();
+      const sign = v.code.sign;
+      if (mine && sign.kind === "device") {
+        await call("POST", "/chat/signatures", { [this.me]: { [v.view.device]: await trust.signDevice(this.me, sign.object, mine.selfSigning) } });
+      } else if (mine && sign.kind === "master") {
+        await call("POST", "/chat/signatures", { [v.view.user]: { [sign.key]: await trust.signUser(this.me, sign.object, mine.userSigning) } });
+      }
+      await this.sendVerification(a, v.view.user, v.view.device, "m.key.verification.done", { transaction_id: id });
+      v.view.state = "done";
+      v.code = undefined;
       this.changed(v);
     });
   }
@@ -771,7 +912,7 @@ export class Sealer {
     let v = this.verifications.get(id);
     if (type === "m.key.verification.request") {
       if (v || !(c.methods as string[] | undefined)?.includes(sas.SAS)) return;
-      v = { view: { id, user: sender, device: senderDevice, state: "incoming" }, started: false };
+      v = { view: { id, user: sender, device: senderDevice, state: "incoming" }, started: false, theirMethods: (c.methods as string[] | undefined) ?? [] };
       this.verifications.set(id, v);
       return this.changed(v);
     }
@@ -785,11 +926,25 @@ export class Sealer {
     if (type === "m.key.verification.ready" && v.started && v.view.state === "requested") {
       v.view.device = senderDevice;
       v.view.state = "waiting";
-      v.start = { from_device: a.device, method: sas.SAS, key_agreement_protocols: [sas.KEY_AGREEMENT], hashes: [sas.HASH], message_authentication_codes: [sas.MAC], short_authentication_string: ["emoji", "decimal"], transaction_id: id };
-      await this.sendVerification(a, sender, senderDevice, "m.key.verification.start", v.start);
+      v.theirMethods = (c.methods as string[] | undefined) ?? [];
+      // Their camera can read a code: show one, emoji stay a choice; else emoji now.
+      if (v.theirMethods.includes(QR_SCAN)) await this.showCode(a, v);
+      else await this.startSas(a, v);
       return this.changed(v);
     }
-    if (type === "m.key.verification.start" && !v.started && v.view.state === "waiting") {
+    if (type === "m.key.verification.start" && c.method === RECIPROCATE) {
+      // They scanned our code: the secret it held must come back.
+      if (v.view.state !== "qr" || !v.code) return;
+      const got = typeof c.secret === "string" ? c.secret.replace(/=+$/, "") : "";
+      if (got !== v.code.secret.replace(/=+$/, "")) return this.cancel(a, v, "m.key_mismatch", "The scanned code was not this one.");
+      v.view.state = "scanned";
+      v.view.qr = undefined;
+      return this.changed(v);
+    }
+    if (type === "m.key.verification.start" && !v.sasStarted && (v.view.state === "waiting" || v.view.state === "qr")) {
+      v.view.state = "waiting";
+      v.view.qr = undefined;
+      v.code = undefined;
       if (c.method !== sas.SAS || !(c.key_agreement_protocols as string[] | undefined)?.includes(sas.KEY_AGREEMENT) || !(c.message_authentication_codes as string[] | undefined)?.includes(sas.MAC)) return this.cancel(a, v, "m.unknown_method", "Not a way this device verifies.");
       v.start = c;
       v.ours = await sas.ephemeral();
@@ -797,7 +952,7 @@ export class Sealer {
       await this.sendVerification(a, sender, senderDevice, "m.key.verification.accept", accept);
       return;
     }
-    if (type === "m.key.verification.accept" && v.started && typeof c.commitment === "string") {
+    if (type === "m.key.verification.accept" && v.sasStarted && typeof c.commitment === "string") {
       v.commitment = c.commitment;
       v.ours = await sas.ephemeral();
       await this.sendVerification(a, sender, senderDevice, "m.key.verification.key", { transaction_id: id, key: v.ours.publicKey });
@@ -805,7 +960,7 @@ export class Sealer {
     }
     if (type === "m.key.verification.key" && typeof c.key === "string" && v.ours && !v.theirKey) {
       v.theirKey = c.key;
-      if (v.started) {
+      if (v.sasStarted) {
         // The other side committed to its key before it saw ours.
         if (!v.start || v.commitment !== (await sas.commitment(c.key, v.start))) return this.cancel(a, v, "m.mismatched_commitment", "The keys did not match what was promised.");
       } else {
@@ -814,7 +969,7 @@ export class Sealer {
       v.secret = await sas.shared(v.ours, c.key);
       const me = { user: this.me, device: a.device, key: v.ours.publicKey };
       const them = { user: sender, device: senderDevice, key: c.key };
-      v.view.emoji = await sas.emoji(v.secret, v.started ? me : them, v.started ? them : me, id);
+      v.view.emoji = await sas.emoji(v.secret, v.sasStarted ? me : them, v.sasStarted ? them : me, id);
       v.view.state = "emoji";
       return this.changed(v);
     }

@@ -8,17 +8,20 @@ repository = "https://github.com/Ortus-Sovereign-Cloud/ortus-chat"
 publish = false
 
 [dependencies]
-matrix-sdk-crypto = { version = "0.19.1", default-features = false }
+matrix-sdk-crypto = { version = "0.19.1", default-features = false, features = ["qrcode"] }
 # SQLite built in: Android has none of its own to link.
 matrix-sdk-sqlite = { version = "0.19.1", default-features = false, features = ["crypto-store", "bundled"] }
 ruma = { version = "0.17.2", default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1.54.1", default-features = false, features = ["rt"] }
+# The escrow copy of a recovery key made here: sealed as the browser seals
+# it (the backup's format, already in the graph through matrix-sdk-crypto).
+vodozemac = { version = "0.11.2", features = ["insecure-pk-encryption"] }
 
 [dev-dependencies]
-# The forged devices of the refusal tests, at the SDK's own version.
-vodozemac = "0.11.2"
+# Reads the browser's QR codes back, as a phone's camera would.
+rqrr = "0.10"
 
 # Its own workspace and lock: matrix-sdk-sqlite pins a different rusqlite
 # (links = "sqlite3") than ortus-core, so the two cannot share one graph.

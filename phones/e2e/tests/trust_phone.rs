@@ -102,6 +102,10 @@ fn recovery_and_verification_between_the_browser_and_a_phone() {
                 }
             }
             if let Some(v) = find(theirs.as_array().unwrap(), &id) {
+                // The phone's camera could read a code; this test compares emoji.
+                if v["state"] == "qr" {
+                    browser.ask(json!({"cmd": "emoji", "id": id}));
+                }
                 if v["state"] == "emoji" {
                     browser_emoji = v["emoji"].as_array().unwrap().clone();
                 }
