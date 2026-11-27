@@ -113,10 +113,15 @@ test("a device given the room key and then hidden by the server is still warned 
 
   // From now on the server's answer leaves the second browser out.
   await first.route("**/chat/rooms/*/devices", async (route) => {
-    const response = await route.fetch();
-    const body = await response.json();
-    body.devices = (body.devices as { device: string }[]).filter((d) => own.includes(d.device));
-    await route.fulfill({ response, json: body });
+    // A request the page dropped (a reload) has nothing to answer.
+    try {
+      const response = await route.fetch();
+      const body = await response.json();
+      body.devices = (body.devices as { device: string }[]).filter((d) => own.includes(d.device));
+      await route.fulfill({ response, json: body });
+    } catch {
+      await route.abort().catch(() => undefined);
+    }
   });
   await first.reload();
   await expect(a.getByText(en.endToEnd)).toBeVisible();
