@@ -1,17 +1,31 @@
 // QR codes for verification (ISO/IEC 18004): bytes in byte mode, error
-// correction level M, the smallest version that holds them, the mask with
-// the lowest penalty. Written here (no dependency in the web client, as
-// olm.ts); the phones' tests read its codes back with an independent
-// decoder. No DOM: plain TypeScript, so Node runs it.
+// correction level M (the others for tests), the smallest version that
+// holds them, the mask with the lowest penalty. Written here (no dependency
+// in the web client, as olm.ts); the phones' tests read its codes back with
+// an independent decoder, and qrscan.ts reads codes with the same tables.
+// No DOM: plain TypeScript, so Node runs it.
 
-/** Error-correction codewords per block, level M, by version (1–40). */
-const ECC_M = [-1, 10, 16, 26, 18, 24, 16, 18, 22, 22, 26, 30, 22, 22, 24, 24, 28, 28, 26, 26, 26, 26, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28];
-/** Error-correction blocks, level M, by version. */
-const BLOCKS_M = [-1, 1, 1, 1, 2, 2, 4, 4, 4, 5, 5, 5, 8, 9, 9, 10, 10, 11, 13, 14, 16, 17, 17, 18, 20, 21, 23, 25, 26, 28, 29, 31, 33, 35, 37, 38, 40, 43, 45, 47, 49];
-/** Level M's two format bits. */
-const FORMAT_M = 0;
+export type Level = "L" | "M" | "Q" | "H";
 
-function rawModules(ver: number): number {
+/** Error-correction codewords per block, by level and version (1–40). */
+export const ECC: Record<Level, readonly number[]> = {
+  L: [-1, 7, 10, 15, 20, 26, 18, 20, 24, 30, 18, 20, 24, 26, 30, 22, 24, 28, 30, 28, 28, 28, 28, 30, 30, 26, 28, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30],
+  M: [-1, 10, 16, 26, 18, 24, 16, 18, 22, 22, 26, 30, 22, 22, 24, 24, 28, 28, 26, 26, 26, 26, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28],
+  Q: [-1, 13, 22, 18, 26, 18, 24, 18, 22, 20, 24, 28, 26, 24, 20, 30, 24, 28, 28, 26, 30, 28, 30, 30, 30, 30, 28, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30],
+  H: [-1, 17, 28, 22, 16, 22, 28, 26, 26, 24, 28, 24, 28, 22, 24, 24, 30, 28, 28, 26, 28, 30, 24, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30],
+};
+/** Error-correction blocks, by level and version. */
+export const BLOCKS: Record<Level, readonly number[]> = {
+  L: [-1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 4, 4, 4, 4, 4, 6, 6, 6, 6, 7, 8, 8, 9, 9, 10, 12, 12, 12, 13, 14, 15, 16, 17, 18, 19, 19, 20, 21, 22, 24, 25],
+  M: [-1, 1, 1, 1, 2, 2, 4, 4, 4, 5, 5, 5, 8, 9, 9, 10, 10, 11, 13, 14, 16, 17, 17, 18, 20, 21, 23, 25, 26, 28, 29, 31, 33, 35, 37, 38, 40, 43, 45, 47, 49],
+  Q: [-1, 1, 1, 2, 2, 4, 4, 6, 6, 8, 8, 8, 10, 12, 16, 12, 17, 16, 18, 21, 20, 23, 23, 25, 27, 29, 34, 34, 35, 38, 40, 43, 45, 48, 51, 53, 56, 59, 62, 65, 68],
+  H: [-1, 1, 1, 2, 4, 4, 4, 5, 6, 8, 8, 11, 11, 16, 16, 18, 16, 19, 21, 25, 25, 25, 34, 30, 32, 35, 37, 40, 42, 45, 48, 51, 54, 57, 60, 63, 66, 70, 74, 77, 81],
+};
+/** Each level's two format bits. */
+export const FORMAT_BITS: Record<Level, number> = { L: 1, M: 0, Q: 3, H: 2 };
+
+/** The modules that hold data and error correction (with the remainder bits). */
+export function rawModules(ver: number): number {
   let n = (16 * ver + 128) * ver + 64;
   if (ver >= 2) {
     const align = Math.floor(ver / 7) + 2;
@@ -21,8 +35,8 @@ function rawModules(ver: number): number {
   return n;
 }
 
-function dataCodewords(ver: number): number {
-  return Math.floor(rawModules(ver) / 8) - ECC_M[ver]! * BLOCKS_M[ver]!;
+function dataCodewords(ver: number, level: Level): number {
+  return Math.floor(rawModules(ver) / 8) - ECC[level][ver]! * BLOCKS[level][ver]!;
 }
 
 function alignmentPositions(ver: number): number[] {
@@ -77,9 +91,11 @@ class Grid {
   readonly size: number;
   readonly dark: boolean[][];
   readonly fixed: boolean[][];
+  readonly level: Level;
 
-  constructor(ver: number) {
+  constructor(ver: number, level: Level = "M") {
     this.ver = ver;
+    this.level = level;
     this.size = ver * 4 + 17;
     this.dark = Array.from({ length: this.size }, () => new Array<boolean>(this.size).fill(false));
     this.fixed = Array.from({ length: this.size }, () => new Array<boolean>(this.size).fill(false));
@@ -119,7 +135,7 @@ class Grid {
   }
 
   format(mask: number): void {
-    const data = (FORMAT_M << 3) | mask;
+    const data = (FORMAT_BITS[this.level] << 3) | mask;
     let rem = data;
     for (let i = 0; i < 10; i++) rem = (rem << 1) ^ ((rem >>> 9) * 0x537);
     const bits = ((data << 10) | rem) ^ 0x5412;
@@ -226,15 +242,22 @@ class Grid {
   }
 }
 
-/** A QR code of `bytes`: rows of modules, dark when true (no quiet zone). */
-export function qrCode(bytes: Uint8Array): boolean[][] {
+/** Which modules of a version's symbol are its patterns, format and version (not data). */
+export function functionModules(ver: number): boolean[][] {
+  const g = new Grid(ver);
+  g.patterns();
+  return g.fixed;
+}
+
+/** A QR code of `bytes`: rows of modules, dark when true (no quiet zone). Level M unless asked. */
+export function qrCode(bytes: Uint8Array, level: Level = "M"): boolean[][] {
   let ver = 1;
   for (; ver <= 40; ver++) {
     const countBits = ver <= 9 ? 8 : 16;
-    if (4 + countBits + bytes.length * 8 <= dataCodewords(ver) * 8 && bytes.length < 1 << countBits) break;
+    if (4 + countBits + bytes.length * 8 <= dataCodewords(ver, level) * 8 && bytes.length < 1 << countBits) break;
   }
   if (ver > 40) throw new Error("too long for a QR code");
-  const capacity = dataCodewords(ver) * 8;
+  const capacity = dataCodewords(ver, level) * 8;
   const bits: number[] = [];
   const put = (value: number, length: number) => {
     for (let i = length - 1; i >= 0; i--) bits.push((value >>> i) & 1);
@@ -249,8 +272,8 @@ export function qrCode(bytes: Uint8Array): boolean[][] {
   for (let pad = 0xec; data.length < capacity / 8; pad ^= 0xec ^ 0x11) data.push(pad);
 
   // Blocks, each with its error correction, interleaved.
-  const blocks = BLOCKS_M[ver]!;
-  const eccLen = ECC_M[ver]!;
+  const blocks = BLOCKS[level][ver]!;
+  const eccLen = ECC[level][ver]!;
   const raw = Math.floor(rawModules(ver) / 8);
   const shortBlocks = blocks - (raw % blocks);
   const shortLen = Math.floor(raw / blocks);
@@ -273,7 +296,7 @@ export function qrCode(bytes: Uint8Array): boolean[][] {
   let best: Grid | null = null;
   let bestPenalty = Infinity;
   for (let m = 0; m < 8; m++) {
-    const s = new Grid(ver);
+    const s = new Grid(ver, level);
     s.patterns();
     s.codewords(out);
     s.mask(m);

@@ -132,24 +132,50 @@ export interface VerificationView {
   device?: string;
   /**
    * requested: we asked; incoming: they ask; qr: our code is shown for the
-   * other device to scan (or emoji instead); scanned: the other device
-   * scanned it (does it say so?); waiting: keys are being agreed; emoji:
-   * compare; done; unsigned: the keys matched but nothing could be vouched
-   * for here (this browser holds no keys, or they had none to sign);
-   * cancelled.
+   * other device to scan (or emoji instead, or theirs scanned); ready: no
+   * code here, the other device shows one (scan it, or emoji); scanned:
+   * the other device scanned ours (does it say so?); waiting: keys are
+   * being agreed, or the other device is to confirm we scanned its code;
+   * emoji: compare; done; unsigned: the keys matched but nothing could be
+   * vouched for here (this browser holds no keys, or they had none to
+   * sign); cancelled.
    */
-  state: "requested" | "incoming" | "qr" | "scanned" | "waiting" | "emoji" | "done" | "unsigned" | "cancelled";
+  state: "requested" | "incoming" | "qr" | "ready" | "scanned" | "waiting" | "emoji" | "done" | "unsigned" | "cancelled";
   emoji?: number[];
   /** The code's modules, dark when true, while it is shown. */
   qr?: boolean[][];
+  /** The other device shows a code this browser's camera can scan (Sealer.scanCode). */
+  canScan?: boolean;
+  /** We scanned the other device's code: it is to say so on its screen. */
+  scannedTheirs?: boolean;
   reason?: string;
 }
 
-/** The ways this browser verifies: emoji, and showing a QR code to a phone's camera. */
+/** The ways this browser verifies: emoji, showing a QR code to the other
+ * device's camera, and (with a camera of its own) scanning the other's. */
 const QR_SHOW = "m.qr_code.show.v1";
 const QR_SCAN = "m.qr_code.scan.v1";
 const RECIPROCATE = "m.reciprocate.v1";
-const METHODS = [sas.SAS, QR_SHOW, RECIPROCATE];
+
+/** Said when a scanned code's keys are not the ones the server has (the verification stops). */
+export const CODE_MISMATCH = "The code's keys are not the ones the server has.";
+
+/** The parts of a verification code (Matrix's format: MATRIX, 2, the mode, the transaction, two keys, a secret). */
+export function parseCode(bytes: Uint8Array): { mode: number; id: string; first: Uint8Array; second: Uint8Array; secret: Uint8Array } | null {
+  const head = new TextEncoder().encode("MATRIX");
+  if (bytes.length < 10 || !head.every((b, i) => bytes[i] === b) || bytes[6] !== 0x02 || bytes[7]! > 2) return null;
+  const length = (bytes[8]! << 8) | bytes[9]!;
+  const at = 10 + length;
+  // The secret: at least 8 bytes (Matrix's minimum).
+  if (bytes.length < at + 64 + 8) return null;
+  let id: string;
+  try {
+    id = new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(10, at));
+  } catch {
+    return null;
+  }
+  return { mode: bytes[7]!, id, first: bytes.slice(at, at + 32), second: bytes.slice(at + 32, at + 64), secret: bytes.slice(at + 64) };
+}
 
 /** What a shown code vouches for, fixed when it was made: what is signed once the other device scanned it. */
 interface ShownCode {
@@ -166,6 +192,8 @@ interface Verification {
   sasStarted?: boolean;
   theirMethods?: string[];
   code?: ShownCode;
+  /** Their code, scanned here: what it proved, signed once they say done. */
+  scanned?: ShownCode["sign"];
   start?: Record<string, unknown>;
   commitment?: string;
   ours?: sas.Ephemeral;
@@ -962,6 +990,12 @@ export class Sealer {
   private verifications = new Map<string, Verification>();
   /** Told whenever a verification changes (the screen shows it). */
   onVerification?: (v: VerificationView) => void;
+  /** This browser can scan the other device's code (it has a camera API; the screen asks for the camera). */
+  camera = typeof navigator !== "undefined" && typeof navigator.mediaDevices?.getUserMedia === "function";
+
+  private methods(): string[] {
+    return this.camera ? [sas.SAS, QR_SHOW, QR_SCAN, RECIPROCATE] : [sas.SAS, QR_SHOW, RECIPROCATE];
+  }
 
   private changed(v: Verification): void {
     this.onVerification?.({ ...v.view, emoji: v.view.emoji ? [...v.view.emoji] : undefined });
@@ -986,7 +1020,7 @@ export class Sealer {
       const id = sas.transactionId();
       const v: Verification = { view: { id, user, state: "requested" }, started: true };
       this.verifications.set(id, v);
-      await this.sendVerification(a, user, "*", "m.key.verification.request", { from_device: a.device, methods: METHODS, transaction_id: id, timestamp: Date.now() });
+      await this.sendVerification(a, user, "*", "m.key.verification.request", { from_device: a.device, methods: this.methods(), transaction_id: id, timestamp: Date.now() });
       this.changed(v);
       return id;
     });
@@ -999,18 +1033,21 @@ export class Sealer {
       if (!v || v.view.state !== "incoming" || !v.view.device) return;
       const a = await this.account();
       v.view.state = "waiting";
-      await this.sendVerification(a, v.view.user, v.view.device, "m.key.verification.ready", { from_device: a.device, methods: METHODS, transaction_id: id });
-      // Their camera can read a code: show one (emoji stay a choice).
+      await this.sendVerification(a, v.view.user, v.view.device, "m.key.verification.ready", { from_device: a.device, methods: this.methods(), transaction_id: id });
+      v.view.canScan = this.camera && !!v.theirMethods?.includes(QR_SHOW);
+      // Their camera can read a code: show one (emoji stay a choice); they
+      // show one: scan it, or emoji; else they start the emoji.
       if (v.theirMethods?.includes(QR_SCAN)) await this.showCode(a, v);
+      else if (v.view.canScan) v.view.state = "ready";
       this.changed(v);
     });
   }
 
-  /** Emoji, chosen over the code shown. */
+  /** Emoji, chosen over the codes. */
   startEmoji(id: string): Promise<void> {
     return this.run(async () => {
       const v = this.verifications.get(id);
-      if (!v || v.view.state !== "qr" || !v.view.device) return;
+      if (!v || (v.view.state !== "qr" && v.view.state !== "ready") || !v.view.device) return;
       await this.startSas(await this.account(), v);
       this.changed(v);
     });
@@ -1099,9 +1136,94 @@ export class Sealer {
     v.view.state = "qr";
   }
 
-  /** No code possible (this browser lacks the keys one needs): emoji, started here. */
+  /** No code possible here (this browser lacks the keys one needs): theirs
+   * to scan, if they show one; else emoji, started here. */
   private async emojiInstead(a: Account, v: Verification): Promise<void> {
-    await this.startSas(a, v);
+    if (v.view.canScan) v.view.state = "ready";
+    else await this.startSas(a, v);
+  }
+
+  /**
+   * The other device's code, scanned here (its bytes, from qrscan.ts).
+   * False when it is not a code for this verification (scanning goes on).
+   * Its keys are checked as matrix-sdk-crypto checks them: mode 0 (another
+   * person) their master key, then ours; mode 1 (one's own device that
+   * trusts the master key) our master key, then this device's key; mode 2
+   * (one's own device that does not) that device's key, then our master
+   * key. A mismatch stops the verification. Then the secret goes back
+   * (m.reciprocate.v1), and what the code proved (their master key, or
+   * their device in mode 2; nothing new in mode 1, where the other device
+   * vouches for this one) is signed when they say done.
+   */
+  scanCode(id: string, bytes: Uint8Array): Promise<boolean> {
+    return this.run(async () => {
+      const v = this.verifications.get(id);
+      const code = parseCode(bytes);
+      if (!v || !code || code.id !== id || !v.view.device || !v.view.canScan || (v.view.state !== "qr" && v.view.state !== "ready")) return false;
+      const a = await this.account();
+      const device = v.view.device;
+      const other = v.view.user;
+      const own = other === this.me;
+      if (own === (code.mode === 0)) return this.cancel(a, v, "m.key_mismatch", CODE_MISMATCH).then(() => true);
+      const mine = await this.trustKeys();
+      type Keys = { devices?: { device: string; deviceKeys: Record<string, unknown> }[]; crossSigning?: Record<string, { master?: Record<string, unknown> }> };
+      const theirs = await call<Keys>("GET", `/chat/keys?user=${enc(other)}`);
+      const masterOf = (keys: Keys, user: string): [string, Uint8Array, Record<string, unknown>] | null => {
+        try {
+          const o = keys.crossSigning?.[user]?.master;
+          const k = crossKey(o, user, "master");
+          return k && o ? [k[0], k[1], o] : null;
+        } catch {
+          return null;
+        }
+      };
+      // Our master key: the one this browser holds, else the server's.
+      const ourMaster = mine?.master.publicKey ?? (own ? masterOf(theirs, this.me) : masterOf(await call<Keys>("GET", `/chat/keys?user=${enc(this.me)}`), this.me))?.[1];
+      const theirMaster = masterOf(theirs, other);
+      const plain = (o: Record<string, unknown>) => {
+        const c = { ...o };
+        delete c.signatures;
+        delete c.unsigned;
+        return c;
+      };
+      let sign: ShownCode["sign"] | null = null;
+      if (code.mode === 0) {
+        if (theirMaster && ourMaster && sameBytes(code.first, theirMaster[1]) && sameBytes(code.second, ourMaster))
+          sign = { kind: "master", keyId: theirMaster[0], key: olm.b64(theirMaster[1]), object: plain(theirMaster[2]) };
+      } else if (code.mode === 1) {
+        if (ourMaster && sameBytes(code.first, ourMaster) && sameBytes(code.second, a.signing.publicKey)) sign = { kind: "none" };
+      } else {
+        // Only a key the device signed itself is taken as its key.
+        const d = theirs.devices?.find((x) => x.device === device);
+        const ed = d ? await selfSigned(d.deviceKeys, this.me, device).catch(() => null) : null;
+        if (d && ed && ourMaster && sameBytes(code.first, olm.unb64(ed)) && sameBytes(code.second, ourMaster)) sign = { kind: "device", object: plain(d.deviceKeys) };
+      }
+      if (!sign) {
+        await this.cancel(a, v, "m.key_mismatch", CODE_MISMATCH);
+        return true;
+      }
+      await this.sendVerification(a, other, device, "m.key.verification.start", { from_device: a.device, method: RECIPROCATE, secret: olm.b64(code.secret), transaction_id: id });
+      // Our own code is no longer the one in play.
+      v.code = undefined;
+      v.view.qr = undefined;
+      v.scanned = sign;
+      v.view.scannedTheirs = true;
+      v.view.state = "waiting";
+      this.changed(v);
+      return true;
+    });
+  }
+
+  /** What a code proved, signed with this browser's keys: how many signatures the server kept. */
+  private async signProved(sign: ShownCode["sign"], user: string, device: string): Promise<number> {
+    const mine = await this.trustKeys();
+    if (mine && sign.kind === "device") {
+      return (await call<{ kept: number }>("POST", "/chat/signatures", { [this.me]: { [device]: await trust.signDevice(this.me, sign.object, mine.selfSigning) } })).kept;
+    }
+    if (mine && sign.kind === "master") {
+      return (await call<{ kept: number }>("POST", "/chat/signatures", { [user]: { [sign.key]: await trust.signUser(this.me, sign.object, mine.userSigning) } })).kept;
+    }
+    return 0;
   }
 
   /** The other device scanned the code and says so on its screen: whether it does. */
@@ -1111,14 +1233,7 @@ export class Sealer {
       if (!v || v.view.state !== "scanned" || !v.code || !v.view.device) return;
       const a = await this.account();
       if (!yes) return this.cancel(a, v, "m.key_mismatch", "The other device did not confirm the code.");
-      const mine = await this.trustKeys();
-      const sign = v.code.sign;
-      let kept = 0;
-      if (mine && sign.kind === "device") {
-        kept = (await call<{ kept: number }>("POST", "/chat/signatures", { [this.me]: { [v.view.device]: await trust.signDevice(this.me, sign.object, mine.selfSigning) } })).kept;
-      } else if (mine && sign.kind === "master") {
-        kept = (await call<{ kept: number }>("POST", "/chat/signatures", { [v.view.user]: { [sign.key]: await trust.signUser(this.me, sign.object, mine.userSigning) } })).kept;
-      }
+      const kept = await this.signProved(v.code.sign, v.view.user, v.view.device);
       // The other side may still vouch for this device: it hears done.
       await this.sendVerification(a, v.view.user, v.view.device, "m.key.verification.done", { transaction_id: id });
       v.view.state = kept > 0 ? "done" : "unsigned";
@@ -1182,8 +1297,11 @@ export class Sealer {
       v.view.device = senderDevice;
       v.view.state = "waiting";
       v.theirMethods = (c.methods as string[] | undefined) ?? [];
-      // Their camera can read a code: show one, emoji stay a choice; else emoji now.
+      v.view.canScan = this.camera && v.theirMethods.includes(QR_SHOW);
+      // Their camera can read a code: show one, emoji stay a choice; they
+      // show one: scan it, or emoji; else emoji now.
       if (v.theirMethods.includes(QR_SCAN)) await this.showCode(a, v);
+      else if (v.view.canScan) v.view.state = "ready";
       else await this.startSas(a, v);
       return this.changed(v);
     }
@@ -1196,7 +1314,7 @@ export class Sealer {
       v.view.qr = undefined;
       return this.changed(v);
     }
-    if (type === "m.key.verification.start" && !v.sasStarted && (v.view.state === "waiting" || v.view.state === "qr")) {
+    if (type === "m.key.verification.start" && !v.sasStarted && !v.scanned && (v.view.state === "waiting" || v.view.state === "qr" || v.view.state === "ready")) {
       v.view.state = "waiting";
       v.view.qr = undefined;
       v.code = undefined;
@@ -1232,7 +1350,14 @@ export class Sealer {
       v.theirMac = c as Verification["theirMac"];
       return this.finish(a, v);
     }
-    if (type === "m.key.verification.done") return;
+    if (type === "m.key.verification.done" && v.scanned && v.view.state === "waiting") {
+      // They confirmed we scanned their code: sign what it proved, say done.
+      const kept = await this.signProved(v.scanned, v.view.user, senderDevice);
+      v.scanned = undefined;
+      await this.sendVerification(a, sender, senderDevice, "m.key.verification.done", { transaction_id: id });
+      v.view.state = kept > 0 ? "done" : "unsigned";
+      return this.changed(v);
+    }
   }
 
   /** Both sides vouched: check theirs, sign what was verified, say done. */

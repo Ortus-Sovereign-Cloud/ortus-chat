@@ -1,4 +1,5 @@
-// The browser's end-to-end rooms (src/e2e.ts, its Sealer, as it is) as one
+// The browser's end-to-end rooms (src/e2e.ts, its Sealer, as it is; and
+// src/qrscan.ts reading the phones' codes drawn as a camera sees them) as one
 // side of a conversation with the phones' crate (phones/e2e/tests drive it
 // over stdin and stdout, one JSON object per line). ortus-kit is
 // kit-bridge.ts here, and IndexedDB a small one in memory. Run by Node 23.5
@@ -72,6 +73,18 @@ const database = {
 };
 
 const { Sealer } = await import("../src/e2e.ts");
+const { decodeQr } = await import("../src/qrscan.ts");
+const { render } = await import("./render.ts");
+const { b64 } = await import("../src/olm.ts");
+
+/** A code's modules (`width` a row, dark when true) as a camera sees them, read back by the browser's scanner. */
+function scan(c: Record<string, any>): Uint8Array | null {
+  const width = c.width as number;
+  const flat = c.modules as boolean[];
+  const rows = Array.from({ length: width }, (_, y) => flat.slice(y * width, (y + 1) * width));
+  return decodeQr(render(rows, { scale: c.scale ?? 5, angle: c.angle ?? 9, skew: c.skew ?? 0.02, noise: c.noise ?? 20, seed: 7 }));
+}
+
 const first = await next();
 const sealer = new Sealer(first.me);
 // The latest of each verification, as the screen would show it.
@@ -123,6 +136,17 @@ for (;;) {
     } else if (c.cmd === "confirmScanned") {
       await sealer.confirmScanned(c.id, c.yes);
       say({ result: null });
+    } else if (c.cmd === "camera") {
+      // The page has a camera (Node has none): it offers to scan codes.
+      sealer.camera = !!c.on;
+      say({ result: null });
+    } else if (c.cmd === "decode") {
+      const bytes = scan(c);
+      say({ result: bytes ? b64(bytes) : null });
+    } else if (c.cmd === "scanCode") {
+      const bytes = scan(c);
+      if (!bytes) throw new Error("the code was not read");
+      say({ result: await sealer.scanCode(c.id, bytes) });
     } else if (c.cmd === "quit") {
       process.exit(0);
     }

@@ -44,8 +44,11 @@ test("two browsers of one person verify each other by emoji", async ({ page: own
   const theirs = b.getByRole("dialog", { name: en.verifyTitle });
   await theirs.getByRole("button", { name: en.verifyAccept }).click({ timeout: 20_000 });
 
-  // The same emoji on both screens; both say so.
+  // Both can scan (a camera API) and show codes: the first chooses emoji.
   const ours = a.getByRole("dialog", { name: en.verifyTitle });
+  await ours.getByRole("button", { name: en.verifyUseEmoji }).click({ timeout: 20_000 });
+
+  // The same emoji on both screens; both say so.
   const emojiOf = async (p: Page, dialog: typeof ours) => {
     await expect(dialog.getByTestId("verify-emoji")).toBeVisible({ timeout: 20_000 });
     return (await dialog.getByTestId("verify-emoji").textContent())?.trim();

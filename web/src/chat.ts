@@ -4,6 +4,7 @@
 import { ApiError, LitElement, LocalizeController, call, controls, css, customElement, html, nothing, state, type TemplateResult } from "ortus-kit";
 import { ESCROW_NOT_ACCEPTED, ESCROW_UNSIGNED, Sealer, type EscrowInfo, type RecoveryState, type Sealed, type VerificationView } from "./e2e.js";
 import { EMOJI } from "./verify.js";
+import { decodeQr } from "./qrscan.js";
 
 /** A verification QR code as SVG: dark modules on white, with the quiet zone (cameras need both, in any theme). */
 function qrSvg(modules: boolean[][], label: string) {
@@ -297,6 +298,15 @@ export class OrtusChatMain extends LitElement {
         height: auto;
         margin: 8px auto;
         border-radius: 8px;
+      }
+      .scan {
+        display: block;
+        width: min(320px, 100%);
+        aspect-ratio: 4 / 3;
+        margin: 8px auto;
+        border-radius: 8px;
+        background: #000;
+        object-fit: cover;
       }
       .emoji {
         display: flex;
@@ -789,6 +799,11 @@ export class OrtusChatMain extends LitElement {
   @state() private verification: VerificationView | null = null;
   @state() private unverifiedOpen = false;
   private verifier = 0;
+  /** The camera, while the other device's code is scanned (its tracks always stopped after). */
+  @state() private scanning = "";
+  @state() private scanNote = "";
+  private stream: MediaStream | null = null;
+  private scanTimer = 0;
   /** End-to-end rooms on this browser. */
   private sealer: Sealer | null = null;
   private events: EventSource | null = null;
@@ -818,6 +833,7 @@ export class OrtusChatMain extends LitElement {
       this.poller = 0;
       window.clearInterval(this.verifier);
       this.verifier = 0;
+      this.stopScan();
     }, 0);
   }
 
@@ -991,6 +1007,8 @@ export class OrtusChatMain extends LitElement {
       this.sealer = new Sealer(r.me);
       this.sealer.onVerification = (v) => {
         this.verification = v;
+        // The camera only while their code can still be scanned.
+        if (this.scanning && (v.id !== this.scanning || (v.state !== "qr" && v.state !== "ready"))) this.stopScan();
         if (v.state === "done" && this.current) void this.syncKeys(this.current);
       };
       // Verification requests come to this device as to-device messages.
@@ -1146,6 +1164,74 @@ export class OrtusChatMain extends LitElement {
     }
   }
 
+  /**
+   * Scans the other device's code: the back camera, a frame every 150 ms
+   * (at most 800 pixels a side) read by qrscan.ts, until a code of this
+   * verification is taken, or the dialog moves on or closes.
+   */
+  private async startScan(id: string): Promise<void> {
+    this.stopScan();
+    this.scanNote = "";
+    let stream: MediaStream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" }, audio: false });
+    } catch (e) {
+      this.scanNote = t(this.localize, (e as { name?: string })?.name === "NotAllowedError" ? "verifyCameraRefused" : "verifyCameraFailed");
+      return;
+    }
+    const v = this.verification;
+    if (!v || v.id !== id || (v.state !== "qr" && v.state !== "ready")) {
+      stream.getTracks().forEach((track) => track.stop());
+      return;
+    }
+    this.stream = stream;
+    this.scanning = id;
+    await this.updateComplete;
+    const video = this.renderRoot.querySelector<HTMLVideoElement>("video.scan");
+    if (!video || this.stream !== stream) return this.stopScan();
+    video.srcObject = stream;
+    await video.play().catch(() => undefined);
+    const canvas = document.createElement("canvas");
+    const context = canvas.getContext("2d", { willReadFrequently: true });
+    const tick = async (): Promise<void> => {
+      this.scanTimer = 0;
+      if (this.stream !== stream) return;
+      if (context && video.readyState >= 2 && video.videoWidth > 0) {
+        const scale = Math.min(1, 800 / Math.max(video.videoWidth, video.videoHeight));
+        canvas.width = Math.round(video.videoWidth * scale);
+        canvas.height = Math.round(video.videoHeight * scale);
+        context.drawImage(video, 0, 0, canvas.width, canvas.height);
+        const bytes = decodeQr(context.getImageData(0, 0, canvas.width, canvas.height));
+        if (bytes) {
+          if (await this.sealer?.scanCode(id, bytes).catch(() => false)) return this.stopScan();
+          this.scanNote = t(this.localize, "verifyScanOther");
+        }
+      }
+      if (this.stream === stream) this.scanTimer = window.setTimeout(() => void tick(), 150);
+    };
+    void tick();
+  }
+
+  private stopScan(): void {
+    window.clearTimeout(this.scanTimer);
+    this.scanTimer = 0;
+    this.stream?.getTracks().forEach((track) => track.stop());
+    this.stream = null;
+    this.scanning = "";
+  }
+
+  /** Scanning the other device's code: the camera, or the button that opens it. */
+  private scanPart(v: VerificationView) {
+    if (!v.canScan) return nothing;
+    const note = this.scanNote ? html`<p role="status" class="note">${this.scanNote}</p>` : nothing;
+    if (this.scanning === v.id)
+      return html`<p>${t(this.localize, "verifyScanLead")}</p>
+        <video class="scan" data-testid="verify-camera" aria-label=${t(this.localize, "verifyCameraLabel")} muted playsinline></video>
+        ${note}
+        <div class="row"><button type="button" class="button" @click=${() => this.stopScan()}>${t(this.localize, "verifyScanStop")}</button></div>`;
+    return html`${note}<div class="row"><button type="button" class="button" @click=${() => void this.startScan(v.id)}>${t(this.localize, "verifyScanTheirs")}</button></div>`;
+  }
+
   private verifyDialogs() {
     const v = this.verification;
     const name = (user: string) => (user === this.me ? t(this.localize, "yourOtherDevice") : (this.people[user]?.name ?? user));
@@ -1166,6 +1252,8 @@ export class OrtusChatMain extends LitElement {
         </dialog>`
       : nothing}${v
       ? html`<dialog class="modal" aria-label=${t(this.localize, "verifyTitle")} @close=${() => {
+          this.stopScan();
+          this.scanNote = "";
           if (this.verification && this.verification.state !== "done" && this.verification.state !== "unsigned" && this.verification.state !== "cancelled") void this.sealer?.cancelVerification(this.verification.id);
           this.verification = null;
         }}>
@@ -1178,15 +1266,22 @@ export class OrtusChatMain extends LitElement {
                     <div class="row"><button class="button">${t(this.localize, "verifyDecline")}</button>
                     <button type="button" class="button primary" @click=${() => void this.sealer?.acceptVerification(v.id)}>${t(this.localize, "verifyAccept")}</button></div>`
                 : v.state === "qr" && v.qr
-                  ? html`<p>${t(this.localize, "verifyScanThis")}</p>
-                      ${qrSvg(v.qr, t(this.localize, "verifyCodeLabel"))}
+                  ? html`${this.scanning === v.id
+                        ? nothing
+                        : html`<p>${t(this.localize, "verifyScanThis")}</p>
+                            ${qrSvg(v.qr, t(this.localize, "verifyCodeLabel"))}`}
+                      ${this.scanPart(v)}
+                      <div class="row"><button type="button" class="button" @click=${() => void this.sealer?.startEmoji(v.id)}>${t(this.localize, "verifyUseEmoji")}</button></div>`
+                : v.state === "ready"
+                  ? html`<p>${t(this.localize, "verifyChoose")}</p>
+                      ${this.scanPart(v)}
                       <div class="row"><button type="button" class="button" @click=${() => void this.sealer?.startEmoji(v.id)}>${t(this.localize, "verifyUseEmoji")}</button></div>`
                 : v.state === "scanned"
                   ? html`<p>${t(this.localize, "verifyScanned")}</p>
                       <div class="row"><button type="button" class="button" @click=${() => void this.sealer?.confirmScanned(v.id, false)}>${t(this.localize, "verifyScannedNo")}</button>
                       <button type="button" class="button primary" @click=${() => void this.sealer?.confirmScanned(v.id, true)}>${t(this.localize, "verifyScannedYes")}</button></div>`
                 : v.state === "waiting"
-                  ? html`<p role="status">${t(this.localize, "verifyWaiting")}</p>`
+                  ? html`<p role="status">${t(this.localize, v.scannedTheirs ? "verifyScannedWait" : "verifyWaiting")}</p>`
                   : v.state === "emoji"
                     ? html`<p>${t(this.localize, "verifyCompare")}</p>
                         <p class="emoji" data-testid="verify-emoji">${(v.emoji ?? []).map((n) => html`<span>${EMOJI[n]}</span>`)}</p>
@@ -1197,7 +1292,7 @@ export class OrtusChatMain extends LitElement {
                       : v.state === "unsigned"
                         ? html`<p role="status">${t(this.localize, "verifyUnsigned")}</p>`
                       : html`<p role="status">${t(this.localize, "verifyCancelled", { reason: v.reason ?? "" })}</p>`}
-            ${v.state === "done" || v.state === "unsigned" || v.state === "cancelled" || v.state === "requested" || v.state === "waiting" || v.state === "qr" ? html`<button class="button">${t(this.localize, "close")}</button>` : nothing}
+            ${v.state === "done" || v.state === "unsigned" || v.state === "cancelled" || v.state === "requested" || v.state === "waiting" || v.state === "qr" || v.state === "ready" ? html`<button class="button">${t(this.localize, "close")}</button>` : nothing}
           </form>
         </dialog>`
       : nothing}`;

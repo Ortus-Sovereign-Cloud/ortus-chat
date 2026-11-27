@@ -113,8 +113,10 @@ Routes (signed in, own data only unless said):
   backup; signs this device).
 - **Verification**: to-device `m.key.verification.*` messages over the
   existing to-device routes. SAS (`m.sas.v1`: X25519, HKDF-SHA-256, the
-  64 emoji) first; QR (`m.qr_code.scan.v1`, `m.reciprocate.v1`) shown on
-  the browser and scanned by a phone.
+  64 emoji) first; QR (`m.qr_code.show.v1`, `m.qr_code.scan.v1`,
+  `m.reciprocate.v1`) both ways: shown on the browser and scanned by a
+  phone, or shown on a phone (or another browser) and scanned by the
+  browser's camera.
 - Rooms show a shield per member: verified (cross-signed), unverified
   device, changed identity; sending still goes to every device.
 - New room keys are backed up as they are made and received.
@@ -187,9 +189,46 @@ Recovery, a shield on rooms and members, the verification sheets.
   before served as unsigned), `escrow.spec` (the key changing while the
   person looks is refused until they look again), `trust_more.rs` (a key
   the server swapped in is refused; a changed key refused until accepted).
-- Not yet: the browser scanning a phone's code (no camera API it can rely
-  on: a phone shows its code to another phone, and emoji between a phone
-  and a browser work both ways).
+- The browser scans codes too (27 November 2026): it offers
+  `m.qr_code.scan.v1` when the page has a camera API
+  (`navigator.mediaDevices.getUserMedia`), and the verify dialog offers
+  "Scan their code" when the other device can show one: the back camera
+  in a `<video>`, a frame every 150 ms (at most 800 pixels a side) on a
+  canvas, read by `web/src/qrscan.ts`, the tracks stopped once a code is
+  taken, on stop, close or any other step; a refused camera is said, and
+  emoji stay a choice. When the browser cannot show a code (or the other
+  device cannot scan) but can scan theirs, it waits in `ready` for the
+  person to scan or choose emoji, instead of starting emoji. The decoder
+  is written here (the payload is binary: BarcodeDetector gives text and
+  is missing on Linux and Windows desktops): a local threshold, the
+  finder patterns, version from their distance (and from version
+  information), the alignment pattern, a perspective transform, format
+  information by nearest code, unmasking, the blocks de-interleaved,
+  Reed-Solomon for every level, raw bytes back (numeric, alphanumeric,
+  ECI and kanji segments tolerated). `Sealer.scanCode(id, bytes)` checks
+  what matrix-sdk-crypto checks on a scan: the transaction (another
+  verification's code is passed over), the mode for the person (0 another
+  person; 1 and 2 one's own device), mode 0 their master key and then
+  ours, mode 1 our master key and then this device's key, mode 2 that
+  device's self-signed key and then our master key (ours: the one this
+  browser holds, else the server's); a mismatch cancels
+  (`m.key_mismatch`). Then `m.key.verification.start` with
+  `m.reciprocate.v1` and the secret, and, when the other device says
+  done, what the code proved is signed as after emoji (their master key
+  with the user-signing key; their device, self-signed, with the
+  self-signing key; nothing new in mode 1, where the other device vouches
+  for this one) and done goes back. Tests: `web/unit/qrscan.test.ts`
+  (`npm test`: random payloads of 50–300 bytes at every level drawn
+  turned 5–15°, in perspective, with noise, and read back exactly;
+  versions 1–15; Reed-Solomon to ecc/2 errors; damaged format bits);
+  `phones/e2e/tests/trust_scan.rs` (the phone's own codes, made by the
+  qrcode crate, drawn as a camera sees them and scanned by the browser in
+  all three modes, both sides done and vouching; a code with a changed
+  key cancels; the qrcode crate's codes at levels L, M, Q and H, versions
+  1 to past 15, with digit and letter segments, read back exactly);
+  `scan.spec` (two browsers, a fake camera filming the other's code; a
+  refused camera). `verify.spec` now chooses emoji (both browsers show
+  codes).
 
 ## Order and tests
 
