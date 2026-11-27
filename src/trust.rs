@@ -6,6 +6,7 @@
 //! checks every signature before keeping it, and holds no private key in
 //! the clear.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use ortus_core::api::{answer, body, ok, ApiError, Method, Route};
@@ -415,18 +416,34 @@ async fn own_device_keys(s: &dyn AsyncStore, user: &str) -> Vec<(String, String)
 async fn with_signatures(
     s: &dyn AsyncStore,
     instance: &Instance,
-    mut object: Value,
+    object: Value,
     user: &str,
     key: &str,
     viewer: &str,
 ) -> Value {
-    let rows = s
+    let rows: Signatures = s
         .query(
             "SELECT signer_user, signer_key, signature FROM chat_key_signatures WHERE target_user = $1 AND target_key = $2 AND (signer_user = $1 OR signer_user = $3)",
             &[user.into(), key.into(), viewer.into()],
         )
         .await
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|r| Some((r.text(0)?.to_string(), r.text(1)?.to_string(), r.text(2)?.to_string())))
+        .collect();
+    add_signatures(instance, object, &rows)
+}
+
+/// Kept signatures: (signer, signer's key, signature).
+type Signatures = Vec<(String, String, String)>;
+
+/// A signed object with these kept signatures (signer, signer's key,
+/// signature) added.
+fn add_signatures(
+    instance: &Instance,
+    mut object: Value,
+    rows: &[(String, String, String)],
+) -> Value {
     if rows.is_empty() {
         return object;
     }
@@ -439,10 +456,7 @@ async fn with_signatures(
     if !all.is_object() {
         *all = json!({});
     }
-    for r in &rows {
-        let (Some(signer), Some(signer_key), Some(sig)) = (r.text(0), r.text(1), r.text(2)) else {
-            continue;
-        };
+    for (signer, signer_key, sig) in rows {
         let Some(all) = all.as_object_mut() else {
             break;
         };
@@ -451,7 +465,7 @@ async fn with_signatures(
             *by = json!({});
         }
         if let Some(by) = by.as_object_mut() {
-            by.insert(signer_key.to_string(), json!(sig));
+            by.insert(signer_key.clone(), json!(sig));
         }
     }
     object
@@ -467,18 +481,71 @@ pub async fn for_devices(
     devices: &mut [Value],
 ) -> Value {
     let s = instance.store.as_ref();
+    // Two queries for the whole room, not a few per member and device:
+    // everyone's cross-signing keys, and the signatures on their keys by
+    // themselves or by the viewer.
+    let mut cross: HashMap<(String, String), Value> = HashMap::new();
+    let mut signatures: HashMap<(String, String), Signatures> = HashMap::new();
+    for chunk in members.chunks(256) {
+        let (list, values) = ortus_core::storage::any_of(1, chunk);
+        for r in s
+            .query(
+                &format!(
+                    "SELECT user_id, kind, key FROM chat_cross_signing WHERE user_id IN ({list})"
+                ),
+                &values,
+            )
+            .await
+            .unwrap_or_default()
+        {
+            if let (Some(user), Some(kind), Some(key)) = (
+                r.text(0),
+                r.text(1),
+                r.text(2).and_then(|t| serde_json::from_str(t).ok()),
+            ) {
+                cross.insert((user.to_string(), kind.to_string()), key);
+            }
+        }
+        let (list, mut values) = ortus_core::storage::any_of(2, chunk);
+        values.insert(0, viewer.into());
+        for r in s
+            .query(
+                &format!("SELECT target_user, target_key, signer_user, signer_key, signature FROM chat_key_signatures WHERE target_user IN ({list}) AND (signer_user = target_user OR signer_user = $1)"),
+                &values,
+            )
+            .await
+            .unwrap_or_default()
+        {
+            if let (Some(user), Some(key), Some(signer), Some(signer_key), Some(sig)) = (r.text(0), r.text(1), r.text(2), r.text(3), r.text(4)) {
+                signatures
+                    .entry((user.to_string(), key.to_string()))
+                    .or_default()
+                    .push((signer.to_string(), signer_key.to_string(), sig.to_string()));
+            }
+        }
+    }
+    let signed_on = |user: &str, key: &str| {
+        signatures
+            .get(&(user.to_string(), key.to_string()))
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    };
     let mut people = Map::new();
+    let mut seen = std::collections::HashSet::new();
     for user in members {
+        if !seen.insert(user) {
+            continue;
+        }
         let owner = mx(instance, user);
         let mut keys = Map::new();
-        let master = cross_key(s, user, "master").await.ok().flatten();
-        let master_id = master.as_ref().and_then(ed25519);
-        if let Some(key) = &master {
+        let master = cross.get(&(user.clone(), "master".into()));
+        let master_id = master.and_then(ed25519);
+        if let Some(key) = master {
             let public = master_id.clone().map(|(_, p)| p).unwrap_or_default();
             let key = served(key, &owner, None);
             keys.insert(
                 "master".into(),
-                with_signatures(s, instance, key, user, &public, viewer).await,
+                add_signatures(instance, key, signed_on(user, &public)),
             );
         }
         let by = master_id.as_ref().map(|(id, _)| id.as_str());
@@ -487,8 +554,8 @@ pub async fn for_devices(
             kinds.push(("user_signing", "userSigning"));
         }
         for (kind, name) in kinds {
-            if let Some(key) = cross_key(s, user, kind).await.ok().flatten() {
-                keys.insert(name.into(), served(&key, &owner, by));
+            if let Some(key) = cross.get(&(user.clone(), kind.to_string())) {
+                keys.insert(name.into(), served(key, &owner, by));
             }
         }
         if !keys.is_empty() {
@@ -503,7 +570,7 @@ pub async fn for_devices(
             continue;
         };
         let keys = d["deviceKeys"].take();
-        d["deviceKeys"] = with_signatures(s, instance, keys, &user, &device, viewer).await;
+        d["deviceKeys"] = add_signatures(instance, keys, signed_on(&user, &device));
         if let Some(obj) = d.as_object_mut() {
             obj.remove("userId");
         }
@@ -741,9 +808,12 @@ async fn delete_version(
     Ok(ok(&json!({})))
 }
 
+/// How good a copy of a room key is: verified, first index, forwards.
+type Rank = (bool, i64, i64);
+
 /// Whether `new` is a better copy of a room key than `old` (Matrix's
 /// rules): verified first, then the lower first index, then fewer forwards.
-fn better(new: (bool, i64, i64), old: (bool, i64, i64)) -> bool {
+fn better(new: Rank, old: Rank) -> bool {
     if new.0 != old.0 {
         return new.0;
     }
@@ -799,12 +869,12 @@ async fn put_keys(request: &Request, instance: &Arc<Instance>) -> Result<Respons
         .first()
         .and_then(|r| r.int(0))
         .unwrap_or(0);
-    let mut changed = 0;
-    let mut seen = 0;
+    // The upload's keys, then the copies already kept of them in a few
+    // queries (not one per key), then the better ones written in a few.
+    let mut uploaded: Vec<(String, String, String, Rank)> = Vec::new();
     for (room, r) in input["rooms"].as_object().into_iter().flatten() {
         for (session, data) in r["sessions"].as_object().into_iter().flatten() {
-            seen += 1;
-            if seen > MAX_KEYS_PER_UPLOAD {
+            if uploaded.len() >= MAX_KEYS_PER_UPLOAD {
                 return Err(bad("At most a thousand room keys at once."));
             }
             let text = data["session_data"].to_string();
@@ -816,35 +886,76 @@ async fn put_keys(request: &Request, instance: &Arc<Instance>) -> Result<Respons
                 data["first_message_index"].as_i64().unwrap_or(i64::MAX),
                 data["forwarded_count"].as_i64().unwrap_or(i64::MAX),
             );
-            let old = tx
-                .query(
-                    "SELECT verified, first_index, forwarded FROM chat_backup_keys WHERE user_id = $1 AND version = $2 AND room = $3 AND session = $4",
-                    &[me.id.as_str().into(), version.into(), room.as_str().into(), session.as_str().into()],
-                )
-                .await?
-                .first()
-                .map(|r| (r.int(0).unwrap_or(0) != 0, r.int(1).unwrap_or(0), r.int(2).unwrap_or(0)));
-            if old.is_some_and(|old| !better(new, old)) {
-                continue;
-            }
-            if old.is_none() {
-                count += 1;
-                if count > MAX_BACKUP_KEYS {
-                    return Err(full("At most 100000 room keys in one backup."));
-                }
-            }
-            tx.execute(
-                "DELETE FROM chat_backup_keys WHERE user_id = $1 AND version = $2 AND room = $3 AND session = $4",
-                &[me.id.as_str().into(), version.into(), room.as_str().into(), session.as_str().into()],
-            )
-            .await?;
-            tx.execute(
-                "INSERT INTO chat_backup_keys (user_id, version, room, session, data, first_index, forwarded, verified) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-                &[me.id.as_str().into(), version.into(), room.as_str().into(), session.as_str().into(), text.as_str().into(), new.1.into(), new.2.into(), i64::from(new.0).into()],
-            )
-            .await?;
-            changed += 1;
+            uploaded.push((room.clone(), session.clone(), text, new));
         }
+    }
+    let sessions: Vec<&str> = uploaded
+        .iter()
+        .map(|(_, session, _, _)| session.as_str())
+        .collect();
+    let mut kept: HashMap<(String, String), Rank> = HashMap::new();
+    for chunk in sessions.chunks(256) {
+        let (list, mut values) = ortus_core::storage::any_of(3, chunk);
+        values.splice(0..0, [me.id.as_str().into(), version.into()]);
+        for r in tx
+            .query(
+                &format!("SELECT room, session, verified, first_index, forwarded FROM chat_backup_keys WHERE user_id = $1 AND version = $2 AND session IN ({list})"),
+                &values,
+            )
+            .await?
+        {
+            if let (Some(room), Some(session)) = (r.text(0), r.text(1)) {
+                kept.insert(
+                    (room.to_string(), session.to_string()),
+                    (r.int(2).unwrap_or(0) != 0, r.int(3).unwrap_or(0), r.int(4).unwrap_or(0)),
+                );
+            }
+        }
+    }
+    let mut better_ones = Vec::new();
+    for (room, session, text, new) in &uploaded {
+        let old = kept.get(&(room.clone(), session.clone())).copied();
+        if old.is_some_and(|old| !better(*new, old)) {
+            continue;
+        }
+        if old.is_none() {
+            count += 1;
+            if count > MAX_BACKUP_KEYS {
+                return Err(full("At most 100000 room keys in one backup."));
+            }
+        }
+        better_ones.push((room, session, text, new));
+    }
+    let changed = better_ones.len();
+    for chunk in better_ones.chunks(100) {
+        let mut rows = Vec::new();
+        let mut values: Vec<ortus_core::storage::Value> =
+            vec![me.id.as_str().into(), version.into()];
+        for (room, session, text, new) in chunk {
+            let n = values.len();
+            rows.push(format!(
+                "($1, $2, ${}, ${}, ${}, ${}, ${}, ${})",
+                n + 1,
+                n + 2,
+                n + 3,
+                n + 4,
+                n + 5,
+                n + 6
+            ));
+            values.extend([
+                room.as_str().into(),
+                session.as_str().into(),
+                text.as_str().into(),
+                new.1.into(),
+                new.2.into(),
+                i64::from(new.0).into(),
+            ]);
+        }
+        tx.execute(
+            &format!("INSERT INTO chat_backup_keys (user_id, version, room, session, data, first_index, forwarded, verified) VALUES {} ON CONFLICT (user_id, version, room, session) DO UPDATE SET data = excluded.data, first_index = excluded.first_index, forwarded = excluded.forwarded, verified = excluded.verified", rows.join(", ")),
+            &values,
+        )
+        .await?;
     }
     if changed > 0 {
         tx.execute(

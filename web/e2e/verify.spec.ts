@@ -4,6 +4,7 @@
 // then signed by the first's self-signing key, and the warning goes.
 import { expect, test, type Page } from "@playwright/test";
 import en from "../src/locales/en.js";
+import { axe } from "./axe.js";
 
 const headers = { "X-Requested-With": "ortus" };
 
@@ -26,6 +27,7 @@ test("two browsers of one person verify each other by emoji", async ({ page: own
   const setUp = a.getByRole("dialog", { name: en.recoveryTitle });
   await setUp.getByRole("button", { name: en.recoverySetUp }).click();
   await expect(setUp.getByTestId("recovery-key")).toBeVisible();
+  expect(await axe(first), "the recovery key shown").toEqual([]);
   await setUp.getByRole("button", { name: en.recoverySaved }).click();
 
   // A second browser: the first sees it as unverified.
@@ -40,9 +42,13 @@ test("two browsers of one person verify each other by emoji", async ({ page: own
 
   // The first asks, the second accepts.
   await warning.click();
+  await expect(a.getByRole("dialog", { name: en.unverifiedTitle })).toBeVisible();
+  expect(await axe(first), "the unverified devices").toEqual([]);
   await a.getByRole("dialog", { name: en.unverifiedTitle }).getByRole("button", { name: en.verify }).click();
   const theirs = b.getByRole("dialog", { name: en.verifyTitle });
-  await theirs.getByRole("button", { name: en.verifyAccept }).click({ timeout: 20_000 });
+  await expect(theirs.getByRole("button", { name: en.verifyAccept })).toBeVisible({ timeout: 20_000 });
+  expect(await axe(second), "a request to verify").toEqual([]);
+  await theirs.getByRole("button", { name: en.verifyAccept }).click();
 
   // Both can scan (a camera API) and show codes: the first chooses emoji.
   const ours = a.getByRole("dialog", { name: en.verifyTitle });
@@ -56,6 +62,7 @@ test("two browsers of one person verify each other by emoji", async ({ page: own
   const shown = await emojiOf(first, ours);
   expect(shown).toBeTruthy();
   expect(await emojiOf(second, theirs)).toBe(shown);
+  expect(await axe(first), "the emoji").toEqual([]);
   await ours.getByRole("button", { name: en.verifySame }).click();
   await theirs.getByRole("button", { name: en.verifySame }).click();
   await expect(ours.getByRole("status")).toHaveText(en.verifyDone, { timeout: 20_000 });

@@ -5,6 +5,7 @@
 // the history from the backup, and is vouched for afterwards.
 import { expect, test } from "@playwright/test";
 import en from "../src/locales/en.js";
+import { axe } from "./axe.js";
 
 const headers = { "X-Requested-With": "ortus" };
 
@@ -55,6 +56,7 @@ test("recovery: a new browser reads the history with the recovery key, and is vo
   await asking.getByLabel(en.recoveryKeyLabel).fill("EsTx not a key at all");
   await asking.getByRole("button", { name: en.recoveryEnter }).click();
   await expect(asking.getByRole("status")).toHaveText(en.recoveryWrong);
+  expect(await axe(second), "a wrong recovery key").toEqual([]);
   await asking.getByLabel(en.recoveryKeyLabel).fill(key);
   await asking.getByRole("button", { name: en.recoveryEnter }).click();
   await expect(asking.getByRole("status")).toContainText(en.recoveryRestored.split("{count}")[0]!.trim());

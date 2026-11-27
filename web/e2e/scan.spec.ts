@@ -5,6 +5,7 @@
 // the warning goes. The frames go through the page's own decoder (qrscan.ts).
 import { expect, test } from "@playwright/test";
 import en from "../src/locales/en.js";
+import { axe } from "./axe.js";
 
 const headers = { "X-Requested-With": "ortus" };
 
@@ -83,6 +84,7 @@ test("a browser scans the code another browser of the person shows", async ({ pa
   // The second shows its code; the first's camera films it.
   const code = theirs.getByTestId("verify-qr");
   await expect(code).toBeVisible({ timeout: 20_000 });
+  expect(await axe(second), "the code shown").toEqual([]);
   const [d, size] = await code.evaluate((svg) => [svg.querySelector("path")!.getAttribute("d")!, Number(svg.getAttribute("viewBox")!.split(" ")[2])] as const);
   await first.evaluate(([d, size]) => (window as unknown as { __showToCamera: (d: string, size: number) => void }).__showToCamera(d, size), [d, size] as const);
   const ours = a.getByRole("dialog", { name: en.verifyTitle });

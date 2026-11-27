@@ -1269,3 +1269,239 @@ fn trust_limits_and_step_up() {
         assert!(out["sealed"].is_null(), "{name}: {out}");
     }
 }
+
+/// A room's devices with who vouches for whom cost the same few database
+/// statements for two members or eight (it was a few a member and device).
+#[test]
+fn a_rooms_devices_cost_the_same_for_two_or_eight() {
+    std::env::set_var("ORTUS_SERVER_TIMING", "1");
+    for (name, instance, _keep) in common::installations() {
+        for app in instance.apps.clone() {
+            app.provide(&instance, &instance.services);
+        }
+        let client = TestClient::new(ortus_core::app(Arc::clone(&instance)));
+        let owner = signed_in(&instance, "olena@ministry.example", Role::Owner);
+        call(
+            &client,
+            &owner,
+            "PATCH",
+            "/chat/policy",
+            Some(json!({"encryptedRooms": true})),
+        );
+        let statements = |size: usize| -> u32 {
+            let people: Vec<(String, String)> = (0..size)
+                .map(|i| {
+                    let email = format!("p{size}x{i}@ministry.example");
+                    (signed_in(&instance, &email, Role::Member), email)
+                })
+                .collect();
+            let members: Vec<&String> = people[1..].iter().map(|(_, e)| e).collect();
+            let (status, room) = call(
+                &client,
+                &people[0].0,
+                "POST",
+                "/chat/rooms",
+                Some(
+                    json!({"kind": "private", "name": format!("team {size}"), "encrypted": true, "members": members}),
+                ),
+            );
+            assert_eq!(200, status, "{name}: {room}");
+            let room = room["id"].as_str().unwrap().to_string();
+            for (token, _) in &people[1..] {
+                call(
+                    &client,
+                    token,
+                    "POST",
+                    &format!("/chat/rooms/{room}/join"),
+                    None,
+                );
+            }
+            let mut ids = Vec::new();
+            for (i, (token, _)) in people.iter().enumerate() {
+                let user = call(&client, token, "GET", "/chat/rooms", None).1["me"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                let account = Account::new();
+                let device = format!("D{i}");
+                let keys = device_keys(&account, &user, &device);
+                assert_eq!(
+                    200,
+                    call(
+                        &client,
+                        token,
+                        "PUT",
+                        &format!("/chat/devices/{device}"),
+                        Some(json!({"deviceKeys": keys}))
+                    )
+                    .0
+                );
+                let me = Identity::new();
+                assert_eq!(
+                    200,
+                    call(
+                        &client,
+                        token,
+                        "PUT",
+                        "/chat/cross-signing",
+                        Some(me.upload(&user))
+                    )
+                    .0
+                );
+                let signed = sign(&me.ssk, keys, &user, &Identity::id(&me.ssk));
+                assert_eq!(
+                    1,
+                    call(
+                        &client,
+                        token,
+                        "POST",
+                        "/chat/signatures",
+                        Some(json!({ &user: { &device: signed } }))
+                    )
+                    .1["kept"]
+                );
+                ids.push((user, me));
+            }
+            // The first person vouches for everyone else.
+            let (first, me) = &ids[0];
+            let mut vouch = json!({});
+            for (user, them) in &ids[1..] {
+                let public = them.master.public_key().to_base64();
+                vouch[user][&public] = sign(
+                    &me.usk,
+                    cross_key(user, "master", &them.master),
+                    first,
+                    &Identity::id(&me.usk),
+                );
+            }
+            assert_eq!(
+                size - 1,
+                call(
+                    &client,
+                    &people[0].0,
+                    "POST",
+                    "/chat/signatures",
+                    Some(vouch)
+                )
+                .1["kept"]
+                    .as_u64()
+                    .unwrap() as usize
+            );
+            let r = client
+                .get(&format!("/api/v1/chat/rooms/{room}/devices"))
+                .header("Authorization", &format!("Bearer {}", people[0].0))
+                .send();
+            assert_eq!(200, r.status(), "{name}");
+            let body: Value = serde_json::from_slice(r.body_bytes()).unwrap();
+            assert_eq!(size, body["devices"].as_array().unwrap().len(), "{name}");
+            for d in body["devices"].as_array().unwrap() {
+                assert_eq!(
+                    2,
+                    d["deviceKeys"]["signatures"]
+                        .as_object()
+                        .unwrap()
+                        .values()
+                        .next()
+                        .unwrap()
+                        .as_object()
+                        .unwrap()
+                        .len(),
+                    "{name}: the device's and the self-signing key's: {d}"
+                );
+            }
+            for (user, _) in &ids[1..] {
+                assert!(
+                    body["crossSigning"][user]["master"]["signatures"][first].is_object(),
+                    "{name}: vouched for {user}"
+                );
+            }
+            let timing = r
+                .header("Server-Timing")
+                .expect("Server-Timing")
+                .to_string();
+            let (_, rest) = timing.split_once("desc=\"").expect(&timing);
+            rest.split(' ').next().unwrap().parse().unwrap()
+        };
+        let (two, eight) = (statements(2), statements(8));
+        assert_eq!(
+            two, eight,
+            "{name}: statements for two members and for eight"
+        );
+    }
+}
+
+/// A backup upload costs the same few statements for five room keys or
+/// five hundred (it was three a key).
+#[test]
+fn a_backup_upload_costs_the_same_for_five_or_five_hundred() {
+    std::env::set_var("ORTUS_SERVER_TIMING", "1");
+    for (name, instance, _keep) in common::installations() {
+        for app in instance.apps.clone() {
+            app.provide(&instance, &instance.services);
+        }
+        let client = TestClient::new(ortus_core::app(Arc::clone(&instance)));
+        let token = signed_in(&instance, "olena@ministry.example", Role::Member);
+        let (status, made) = call(
+            &client,
+            &token,
+            "POST",
+            "/chat/backup/version",
+            Some(
+                json!({"algorithm": "m.megolm_backup.v1.curve25519-aes-sha2", "authData": {"public_key": "A".repeat(43)}}),
+            ),
+        );
+        assert_eq!(200, status, "{name}: {made}");
+        let version = made["version"].as_str().unwrap().to_string();
+        let mut next = 0;
+        let mut upload = |n: usize| -> u32 {
+            let mut sessions = json!({});
+            for _ in 0..n {
+                next += 1;
+                sessions[format!("session{next}")] = json!({"first_message_index": 0, "forwarded_count": 0, "is_verified": false, "session_data": {"ciphertext": "x"}});
+            }
+            let r = client
+                .put(&format!("/api/v1/chat/backup/keys?version={version}"))
+                .header("Authorization", &format!("Bearer {token}"))
+                .header("X-Requested-With", "ortus")
+                .header("Content-Type", "application/json")
+                .body_bytes(
+                    json!({"rooms": {"!room:ministry.example": {"sessions": sessions}}})
+                        .to_string()
+                        .into_bytes(),
+                )
+                .send();
+            assert_eq!(200, r.status(), "{name}: {}", r.body_text());
+            let timing = r
+                .header("Server-Timing")
+                .expect("Server-Timing")
+                .to_string();
+            let (_, rest) = timing.split_once("desc=\"").expect(&timing);
+            rest.split(' ').next().unwrap().parse().unwrap()
+        };
+        let (five, hundred) = (upload(5), upload(100));
+        let five_hundred = upload(500);
+        assert_eq!(
+            five, hundred,
+            "{name}: statements for five keys and a hundred"
+        );
+        assert!(
+            five_hundred <= five + 8,
+            "{name}: {five_hundred} statements for five hundred, {five} for five"
+        );
+        let (_, kept) = call(
+            &client,
+            &token,
+            "GET",
+            &format!("/chat/backup/keys?version={version}"),
+            None,
+        );
+        assert_eq!(
+            605,
+            kept["rooms"]["!room:ministry.example"]["sessions"]
+                .as_object()
+                .unwrap()
+                .len(),
+            "{name}"
+        );
+    }
+}

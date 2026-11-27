@@ -9,6 +9,7 @@
 import { readFile } from "node:fs/promises";
 import { expect, test, type Browser, type Page } from "@playwright/test";
 import en from "../src/locales/en.js";
+import { axe } from "./axe.js";
 
 const headers = { "X-Requested-With": "ortus" };
 /** As the screens show it: the first 24 characters in groups of four. */
@@ -77,6 +78,7 @@ test("an administrator recovers a person's recovery key with the escrow file", a
   expect(policy.escrow.signerMaster.usage).toEqual(["master"]);
   expect(policy.escrowUnsigned).toBe(false);
   expect(JSON.stringify(policy)).not.toContain(first.private);
+  expect(await axe(page), "the escrow key, administered").toEqual([]);
 
   // A person opens recovery: the key's fingerprint and who set it.
   const { page: person, email } = await invited(owner, browser, "Taras Melnyk");
@@ -89,6 +91,7 @@ test("an administrator recovers a person's recovery key with the escrow file", a
   await expect(shown).toContainText(escrowFingerprint(first.public));
   await expect(shown).toContainText(`(${en.escrowSignerUnverified})`);
   await expect(dialog.getByText(en.recoveryEscrowChanged)).toHaveCount(0);
+  expect(await axe(person), "recovery with the escrow key shown").toEqual([]);
 
   // Meanwhile the key changes: what she was shown is not what set-up would use.
   expect((await page.request.patch("/api/v1/chat/policy", { headers, data: { escrow: null } })).status()).toBe(200);
