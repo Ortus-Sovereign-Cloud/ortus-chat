@@ -80,7 +80,7 @@ the main thread):
 
     OrtusE2e.open(storeDir, passphrase, user, device, serverName, transport)
     inbox() -> Inbox {messages, roomKeys}
-    decrypt(room, messageJson) -> Opened {text, thread?}   // the message as the chat API gives it
+    decrypt(room, messageJson) -> Opened {text, thread?, fromBackup}   // the message as the chat API gives it
     send(room, text, thread?) -> message id
     forget()
     protocol Transport { http(method, path, body?) -> HttpResponse {status, body} }   // path under /api/v1, JSON text

@@ -118,6 +118,12 @@ fn store_err(e: impl fmt::Display) -> Error {
 pub struct Opened {
     pub text: String,
     pub thread: Option<String>,
+    /// Its room key came from the key backup (or another import), not from
+    /// the sender over Olm: the backup is not authenticated (the server
+    /// knows its public key and can write to it), so who sent it is a claim
+    /// that could not be confirmed. Show it as such. False once the sender's
+    /// own key for the session has come.
+    pub from_backup: bool,
 }
 
 /// What `inbox()` took in.
@@ -1367,6 +1373,7 @@ impl Inner {
         Ok(Opened {
             text: text.to_string(),
             thread,
+            from_backup: session.has_been_imported(),
         })
     }
 

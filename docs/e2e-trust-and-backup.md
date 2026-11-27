@@ -45,8 +45,10 @@ everyone. After this stage:
 - **Escrow**: the organisation's X25519 public key in chat's policy (set
   by an administrator, whose browser makes the pair and gives the private
   half as a file to keep offline: the server never sees it). Each
-  person's recovery key is also sealed to it (ECDH + HKDF + AES-GCM) and
-  stored as their account data `ortus.escrow`. With the private half, an
+  person's recovery key is also sealed to it, in the backup's own
+  format (`curve25519-aes-sha2`, libolm's PkEncryption: an ephemeral
+  Curve25519 key, ECDH, HKDF-SHA-256, AES-256-CBC, and its truncated
+  HMAC-SHA-256 MAC), and stored as their account data `ortus.escrow`. With the private half, an
   administrator can open a person's secret storage. The escrow is shown to
   people when they set up recovery ("your organisation can recover your
   history").
@@ -141,6 +143,14 @@ Recovery, a shield on rooms and members, the verification sheets.
   decoder (rqrr) and scanned by a phone; a phone verifying another
   person's device), the browser flows (`recovery`, `escrow`, `verify`
   specs), the server's checks (`tests/trust.rs`).
+- Messages opened with a room key restored from the backup are shown as
+  "sender could not be confirmed": the backup is not authenticated (the
+  server knows its public key and can write entries to it), so what an
+  entry says of its sender is a claim. The phones' crate marks them
+  (`Opened.from_backup`, for the apps to show; false again once the
+  sender's own key for that session arrives over Olm), and takes an entry
+  only under its session's own id (its Ed25519 key), so no entry stands in
+  for another session (`phones/e2e/tests/backup.rs`).
 - Not yet: the browser scanning a phone's code (no camera API it can rely
   on: a phone shows its code to another phone, and emoji between a phone
   and a browser work both ways).

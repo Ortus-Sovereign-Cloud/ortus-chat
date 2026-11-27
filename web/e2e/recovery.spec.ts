@@ -60,6 +60,8 @@ test("recovery: a new browser reads the history with the recovery key, and is vo
   await expect(asking.getByRole("status")).toContainText(en.recoveryRestored.split("{count}")[0]!.trim());
   await asking.getByRole("button", { name: en.close }).click();
   await expect(chat.getByText("Before the new laptop")).toBeVisible({ timeout: 20_000 });
+  // Only the backup vouches for its key (anyone can add to a backup): said so.
+  await expect(chat.getByText(en.fromBackup)).toBeVisible();
 
   // Vouched for now: the warning goes.
   await second.reload();

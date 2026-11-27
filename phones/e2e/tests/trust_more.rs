@@ -2,7 +2,8 @@
 //! recovery set up on a phone (the browser recovers with its key, and the
 //! organisation's escrow copy opens to it); a QR code the browser shows,
 //! read back by an independent decoder and scanned by a phone; a phone
-//! verifying another person's device.
+//! verifying another person's device; two people's requests with one id,
+//! neither acted on.
 
 mod common;
 
@@ -439,5 +440,69 @@ fn a_set_up_cut_half_way_is_finished_or_given_way() {
         );
         assert!(!phone.e2e.recovery_state().unwrap().set, "{n}");
         assert!(phone.e2e.set_up_recovery().is_ok(), "{n}: tried again");
+    }
+}
+
+/// A verification request, as `from`'s device `device` would send one to
+/// Olena's phone, with the id its sender chose.
+fn request_to(w: &World, from: &Person, device: &str, to: &Person, id: &str) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    w.ok(
+        from,
+        "POST",
+        "/chat/verification",
+        Some(
+            json!({"user": to.me, "device": "PHONEA", "fromDevice": device,
+            "type": "m.key.verification.request",
+            "content": {"from_device": device, "methods": ["m.sas.v1"],
+                "timestamp": now, "transaction_id": id}}),
+        ),
+    );
+}
+
+#[test]
+fn two_verifications_with_one_id_are_neither_acted_on() {
+    for w in World::all() {
+        let n = &w.name;
+        let olena = w.person("olena@ministry.example", true);
+        let taras = w.person("taras@ministry.example", false);
+        let marek = w.person("marek@ministry.example", false);
+        w.sealed_room(
+            &olena,
+            &[
+                (&taras, "taras@ministry.example"),
+                (&marek, "marek@ministry.example"),
+            ],
+        );
+        let phone = w.phone(&olena, "PHONEA");
+        let _t = w.phone(&taras, "PHONET");
+        let _m = w.phone(&marek, "PHONEM");
+
+        // One request: listed, and its id names it.
+        request_to(&w, &taras, "PHONET", &olena, "ONLYONE");
+        let state = phone_state(&phone, "ONLYONE").map(|v| (v.user, v.state));
+        assert_eq!(
+            Some((taras.me.clone(), "incoming".to_string())),
+            state,
+            "{n}"
+        );
+
+        // Two people's requests with one id: neither is listed nor acted on.
+        request_to(&w, &taras, "PHONET", &olena, "THESAME");
+        request_to(&w, &marek, "PHONEM", &olena, "THESAME");
+        let listed = phone.e2e.verifications().unwrap();
+        assert!(listed.iter().all(|v| v.id != "THESAME"), "{n}: {listed:?}");
+        assert!(listed.iter().any(|v| v.id == "ONLYONE"), "{n}: {listed:?}");
+        assert!(
+            matches!(
+                phone.e2e.accept_verification("THESAME"),
+                Err(ortus_e2e::Error::Refused(_))
+            ),
+            "{n}: ambiguous"
+        );
+        phone.e2e.accept_verification("ONLYONE").unwrap();
     }
 }

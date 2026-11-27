@@ -328,9 +328,16 @@ async fn forget_device(s: &dyn AsyncStore, user: &str, device: &str) -> Result<(
         "DELETE FROM chat_one_time_keys WHERE user_id = $1 AND device = $2",
         "DELETE FROM chat_fallback_keys WHERE user_id = $1 AND device = $2",
         "DELETE FROM chat_to_device WHERE user_id = $1 AND device = $2",
+        // Signatures on the device, and those it made (on its person's master key).
+        "DELETE FROM chat_key_signatures WHERE target_user = $1 AND target_key = $2",
     ] {
         s.execute(sql, &[user.into(), device.into()]).await?;
     }
+    s.execute(
+        "DELETE FROM chat_key_signatures WHERE signer_user = $1 AND signer_key = $2",
+        &[user.into(), format!("ed25519:{device}").into()],
+    )
+    .await?;
     Ok(())
 }
 

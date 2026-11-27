@@ -64,6 +64,8 @@ interface Message {
   sealed?: Sealed | null;
   /** A sealed message this device cannot open. */
   locked?: boolean;
+  /** Opened with a key from the backup only: the sender is not confirmed. */
+  fromBackup?: boolean;
   /** Posted by an incoming hook (an alert source). */
   hook?: { name: string; alert: boolean } | null;
 }
@@ -362,6 +364,13 @@ export class OrtusChatMain extends LitElement {
       .msg p.gone {
         color: var(--ortus-text-3);
         font-style: italic;
+      }
+      .msg p.from-backup {
+        font-size: 13px;
+      }
+      .unchecked {
+        color: var(--ortus-amber, #f5a35b);
+        font-size: 14px;
       }
       .mention {
         color: var(--ortus-accent);
@@ -763,6 +772,10 @@ export class OrtusChatMain extends LitElement {
   @state() private inCall = 0;
   /** End-to-end trust: devices in the open sealed room nobody vouched for, and recovery. */
   @state() private unverified: { user: string; device: string }[] = [];
+  /** The sealer's count of confirmed backup sessions when messages were last opened. */
+  private confirmedSeen = 0;
+  /** The open sealed room's devices could not be checked. */
+  @state() private devicesUnchecked = false;
   @state() private recovery: RecoveryState | null = null;
   @state() private recoveryOpen = false;
   @state() private recoveryKey = "";
@@ -920,7 +933,8 @@ export class OrtusChatMain extends LitElement {
       // Members' new devices get the room key from this one; this one may
       // have been given it meanwhile.
       await this.syncKeys(this.current);
-      if (this.messages.some((m) => m.locked)) await this.loadMessages(this.current);
+      // Locked ones may open now; ones from the backup may be confirmed.
+      if (this.messages.some((m) => m.locked) || (this.messages.some((m) => m.fromBackup) && (this.sealer?.confirmed ?? 0) !== this.confirmedSeen)) await this.loadMessages(this.current);
     }
   }
 
@@ -1042,7 +1056,14 @@ export class OrtusChatMain extends LitElement {
     void this.sealer?.pin(room).catch(() => undefined);
     await this.sealer?.sync(room, roomId).catch(() => undefined);
     if (this.current === room && this.sealer) {
-      this.unverified = await this.sealer.unverified(room).catch(() => []);
+      // Not knowing is said, never taken as nobody unverified.
+      try {
+        this.unverified = await this.sealer.unverified(room);
+        this.devicesUnchecked = false;
+      } catch {
+        this.unverified = [];
+        this.devicesUnchecked = true;
+      }
       this.recovery = await this.sealer.recoveryState().catch(() => null);
     }
   }
@@ -1099,7 +1120,7 @@ export class OrtusChatMain extends LitElement {
         </dialog>`
       : nothing}${v
       ? html`<dialog class="modal" aria-label=${t(this.localize, "verifyTitle")} @close=${() => {
-          if (this.verification && this.verification.state !== "done" && this.verification.state !== "cancelled") void this.sealer?.cancelVerification(this.verification.id);
+          if (this.verification && this.verification.state !== "done" && this.verification.state !== "unsigned" && this.verification.state !== "cancelled") void this.sealer?.cancelVerification(this.verification.id);
           this.verification = null;
         }}>
           <form method="dialog">
@@ -1127,8 +1148,10 @@ export class OrtusChatMain extends LitElement {
                         <button type="button" class="button primary" @click=${() => void this.sealer?.confirmEmoji(v.id, true)}>${t(this.localize, "verifySame")}</button></div>`
                     : v.state === "done"
                       ? html`<p role="status">${t(this.localize, "verifyDone")}</p>`
+                      : v.state === "unsigned"
+                        ? html`<p role="status">${t(this.localize, "verifyUnsigned")}</p>`
                       : html`<p role="status">${t(this.localize, "verifyCancelled", { reason: v.reason ?? "" })}</p>`}
-            ${v.state === "done" || v.state === "cancelled" || v.state === "requested" || v.state === "waiting" || v.state === "qr" ? html`<button class="button">${t(this.localize, "close")}</button>` : nothing}
+            ${v.state === "done" || v.state === "unsigned" || v.state === "cancelled" || v.state === "requested" || v.state === "waiting" || v.state === "qr" ? html`<button class="button">${t(this.localize, "close")}</button>` : nothing}
           </form>
         </dialog>`
       : nothing}`;
@@ -1166,12 +1189,13 @@ export class OrtusChatMain extends LitElement {
   /** Sealed messages opened on this device (or marked as not readable). */
   private async reveal(list: Message[]): Promise<Message[]> {
     const sealer = this.sealer;
+    this.confirmedSeen = sealer?.confirmed ?? 0;
     return Promise.all(
       list.map(async (m) => {
         if (!m.sealed || m.deleted || !sealer) return m;
         const roomId = this.rooms.find((r) => r.id === m.room)?.roomId ?? "";
-        const text = await sealer.open(m.room, roomId, m.sealed, m.sender, m.id, m.thread);
-        return text === null ? { ...m, text: "", locked: true } : { ...m, text, locked: false };
+        const opened = await sealer.open(m.room, roomId, m.sealed, m.sender, m.id, m.thread);
+        return opened === null ? { ...m, text: "", locked: true, fromBackup: false } : { ...m, text: opened.text, locked: false, fromBackup: opened.fromBackup };
       }),
     );
   }
@@ -1431,7 +1455,7 @@ export class OrtusChatMain extends LitElement {
     // @Name of a mentioned person stands out.
     const names = (m.mentions ?? []).map((id) => `@${this.name(id).split(" ")[0]}`);
     const parts = names.length ? m.text.split(new RegExp(`(${names.map((n) => n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})`)) : [m.text];
-    return html`<p>${parts.map((p) => (names.includes(p) ? html`<span class="mention">${p}</span>` : p))}${m.editedAt ? html` <small class="muted">${t(this.localize, "edited")}</small>` : nothing}</p>`;
+    return html`<p>${parts.map((p) => (names.includes(p) ? html`<span class="mention">${p}</span>` : p))}${m.editedAt ? html` <small class="muted">${t(this.localize, "edited")}</small>` : nothing}</p>${m.fromBackup ? html`<p class="gone from-backup">${t(this.localize, "fromBackup")}</p>` : nothing}`;
   }
 
   private message(m: Message, inThread = false): TemplateResult {
@@ -1581,6 +1605,9 @@ export class OrtusChatMain extends LitElement {
                 ${room.label ? html`<span class="label">${room.label.toUpperCase()}</span>` : nothing}
                 <span class="muted">${t(this.localize, "members", { count: this.members.filter((m) => m.state === "join").length })}</span>
                 ${room.encrypted ? html`<span class="e2e">🔒 ${t(this.localize, "endToEnd")}</span>` : nothing}
+                ${room.encrypted && this.devicesUnchecked
+                  ? html`<span role="status" class="unchecked">⚠ ${t(this.localize, "devicesUnchecked")}</span>`
+                  : nothing}
                 ${room.encrypted && this.unverified.length
                   ? html`<span role="status"><button class="unverified" title=${this.unverified.map((d) => `${this.people[d.user]?.name ?? d.user} · ${d.device}`).join("\n")} @click=${() => (this.unverifiedOpen = true)}>⚠ ${t(this.localize, "unverifiedDevices", { count: this.unverified.length })}</button></span>`
                   : nothing}

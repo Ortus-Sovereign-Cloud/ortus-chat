@@ -73,6 +73,11 @@ pub const MIGRATIONS: &[Migration] = &[Migration {
 pub const BACKUP: &str = "m.megolm_backup.v1.curve25519-aes-sha2";
 const MAX_DATA: usize = 64 * 1024;
 const MAX_KEYS_PER_UPLOAD: usize = 1000;
+/// What one person may keep: account data types, backups not deleted, and
+/// room keys in one backup.
+const MAX_ACCOUNT_TYPES: i64 = 50;
+const MAX_BACKUP_VERSIONS: usize = 10;
+const MAX_BACKUP_KEYS: i64 = 100_000;
 
 fn mx(instance: &Instance, user: &str) -> String {
     store::mxid(user, &store::server_name(instance))
@@ -80,6 +85,15 @@ fn mx(instance: &Instance, user: &str) -> String {
 
 fn bad(message: &str) -> ApiError {
     ApiError::bad_request(message.to_string())
+}
+
+/// More than one person may keep of something.
+fn full(message: &str) -> ApiError {
+    ApiError {
+        status: 413,
+        code: "storage_limit",
+        message: message.to_string(),
+    }
 }
 
 /// The one Ed25519 key of a cross-signing key object: (key id, public).
@@ -92,6 +106,31 @@ fn ed25519(key: &Value) -> Option<(String, String)> {
     let public = public.as_str()?;
     (id == &format!("ed25519:{public}") && public.len() == 43)
         .then(|| (id.clone(), public.to_string()))
+}
+
+/// A cross-signing key rebuilt from its signed fields (user_id, usage and
+/// one Ed25519 key): (fields, key id, public). An upload with anything
+/// else in what was signed is refused.
+fn signed_fields(key: &Value, owner: &str, usage: &str) -> Option<(Value, String, String)> {
+    if key["user_id"] != owner || key["usage"] != json!([usage]) {
+        return None;
+    }
+    let (id, public) = ed25519(key)?;
+    let fields = json!({"user_id": owner, "usage": [usage], "keys": {id.clone(): public}});
+    (plain(key) == fields).then_some((fields, id, public))
+}
+
+/// A kept cross-signing key as served: its signed fields, and the master
+/// key's signature on it when `by` is the master key's id. Other
+/// signatures are served only from those the server checked.
+fn served(key: &Value, owner: &str, by: Option<&str>) -> Value {
+    let mut out = plain(key);
+    if let Some(by) = by {
+        if let Some(sig) = key["signatures"][owner][by].as_str() {
+            out["signatures"] = json!({ owner: { by: sig } });
+        }
+    }
+    out
 }
 
 /// A person's cross-signing key of a kind, as kept.
@@ -129,31 +168,32 @@ async fn put_cross_signing(
     let input: CrossSigning = body(request)?;
     let my = mx(instance, &me.id);
     let s = instance.store.as_ref();
-    let shaped = |key: &Value, usage: &str| -> Option<(String, String)> {
-        (key["user_id"] == my.as_str() && key["usage"] == json!([usage]))
-            .then(|| ed25519(key))
-            .flatten()
-    };
-    let Some((master_id, master_public)) = shaped(&input.master, "master") else {
+    // Only the signed fields are kept: the master key without signatures
+    // (others come through POST /chat/signatures, checked), the other two
+    // with the master key's signature only.
+    let Some((master, master_id, master_public)) = signed_fields(&input.master, &my, "master")
+    else {
         return Err(bad(
-            "The master key is this person's one Ed25519 key, for usage master.",
+            "The master key is this person's one Ed25519 key, for usage master, and nothing else.",
         ));
     };
-    let mut kept = vec![("master", input.master.clone(), master_public.clone())];
+    let mut kept = vec![("master", master, master_public.clone())];
     for (kind, key) in [
         ("self_signing", &input.self_signing),
         ("user_signing", &input.user_signing),
     ] {
         if let Some(key) = key {
-            let Some((_, public)) = shaped(key, kind) else {
-                return Err(bad("A self-signing or user-signing key is this person's one Ed25519 key, for its usage."));
+            let Some((mut fields, _, public)) = signed_fields(key, &my, kind) else {
+                return Err(bad("A self-signing or user-signing key is this person's one Ed25519 key, for its usage, and nothing else."));
             };
             if !matrix::verify_json(key, &my, &master_id, &master_public) {
                 return Err(bad(
                     "A self-signing or user-signing key is signed by the master key.",
                 ));
             }
-            kept.push((kind, key.clone(), public));
+            let sig = key["signatures"][&my][&master_id].clone();
+            fields["signatures"] = json!({ &my: { &master_id: sig } });
+            kept.push((kind, fields, public));
         }
     }
     let old = cross_key(s, &me.id, "master").await?;
@@ -387,11 +427,32 @@ async fn with_signatures(
         )
         .await
         .unwrap_or_default();
+    if rows.is_empty() {
+        return object;
+    }
+    // Whatever shape it was kept in, never a panic: a signatures field
+    // that is not an object counts as none.
+    let Some(map) = object.as_object_mut() else {
+        return object;
+    };
+    let all = map.entry("signatures").or_insert_with(|| json!({}));
+    if !all.is_object() {
+        *all = json!({});
+    }
     for r in &rows {
         let (Some(signer), Some(signer_key), Some(sig)) = (r.text(0), r.text(1), r.text(2)) else {
             continue;
         };
-        object["signatures"][mx(instance, signer)][signer_key] = json!(sig);
+        let Some(all) = all.as_object_mut() else {
+            break;
+        };
+        let by = all.entry(mx(instance, signer)).or_insert_with(|| json!({}));
+        if !by.is_object() {
+            *by = json!({});
+        }
+        if let Some(by) = by.as_object_mut() {
+            by.insert(signer_key.to_string(), json!(sig));
+        }
     }
     object
 }
@@ -408,25 +469,30 @@ pub async fn for_devices(
     let s = instance.store.as_ref();
     let mut people = Map::new();
     for user in members {
+        let owner = mx(instance, user);
         let mut keys = Map::new();
-        for (kind, name) in [("master", "master"), ("self_signing", "selfSigning")] {
-            if let Some(key) = cross_key(s, user, kind).await.ok().flatten() {
-                let id = ed25519(&key).map(|(_, p)| p).unwrap_or_default();
-                let key = if kind == "master" {
-                    with_signatures(s, instance, key, user, &id, viewer).await
-                } else {
-                    key
-                };
-                keys.insert(name.into(), key);
-            }
+        let master = cross_key(s, user, "master").await.ok().flatten();
+        let master_id = master.as_ref().and_then(ed25519);
+        if let Some(key) = &master {
+            let public = master_id.clone().map(|(_, p)| p).unwrap_or_default();
+            let key = served(key, &owner, None);
+            keys.insert(
+                "master".into(),
+                with_signatures(s, instance, key, user, &public, viewer).await,
+            );
         }
+        let by = master_id.as_ref().map(|(id, _)| id.as_str());
+        let mut kinds = vec![("self_signing", "selfSigning")];
         if user == viewer {
-            if let Some(key) = cross_key(s, user, "user_signing").await.ok().flatten() {
-                keys.insert("userSigning".into(), key);
+            kinds.push(("user_signing", "userSigning"));
+        }
+        for (kind, name) in kinds {
+            if let Some(key) = cross_key(s, user, kind).await.ok().flatten() {
+                keys.insert(name.into(), served(&key, &owner, by));
             }
         }
         if !keys.is_empty() {
-            people.insert(mx(instance, user), Value::Object(keys));
+            people.insert(owner, Value::Object(keys));
         }
     }
     for d in devices.iter_mut() {
@@ -497,6 +563,18 @@ async fn put_account_data(
     }
     let s = instance.store.as_ref();
     let mut tx = s.begin().await?;
+    let others = tx
+        .query(
+            "SELECT CAST(COUNT(*) AS BIGINT) FROM chat_account_data WHERE user_id = $1 AND kind <> $2",
+            &[me.id.as_str().into(), kind.into()],
+        )
+        .await?
+        .first()
+        .and_then(|r| r.int(0))
+        .unwrap_or(0);
+    if others >= MAX_ACCOUNT_TYPES {
+        return Err(full("At most 50 types of account data per person."));
+    }
     tx.execute(
         "DELETE FROM chat_account_data WHERE user_id = $1 AND kind = $2",
         &[me.id.as_str().into(), kind.into()],
@@ -553,19 +631,59 @@ async fn post_version(request: &Request, instance: &Arc<Instance>) -> Result<Res
         ));
     }
     let s = instance.store.as_ref();
-    let next = s
-        .query("SELECT CAST(COALESCE(MAX(version), 0) AS BIGINT) FROM chat_backup_versions WHERE user_id = $1", &[me.id.as_str().into()])
-        .await?
-        .first()
-        .and_then(|r| r.int(0))
-        .unwrap_or(0)
-        + 1;
-    s.execute(
-        "INSERT INTO chat_backup_versions (user_id, version, algorithm, auth_data, etag) VALUES ($1, $2, $3, $4, 0)",
-        &[me.id.as_str().into(), next.into(), input.algorithm.as_str().into(), input.auth_data.to_string().into()],
-    )
-    .await?;
-    Ok(ok(&json!({"version": next.to_string()})))
+    // Two made at once may pick the same number: the one that loses tries
+    // again with the next.
+    for _ in 0..5 {
+        let mut tx = s.begin().await?;
+        let next = tx
+            .query("SELECT CAST(COALESCE(MAX(version), 0) AS BIGINT) FROM chat_backup_versions WHERE user_id = $1", &[me.id.as_str().into()])
+            .await?
+            .first()
+            .and_then(|r| r.int(0))
+            .unwrap_or(0)
+            + 1;
+        let made = tx
+            .execute(
+                "INSERT INTO chat_backup_versions (user_id, version, algorithm, auth_data, etag) VALUES ($1, $2, $3, $4, 0) ON CONFLICT (user_id, version) DO NOTHING",
+                &[me.id.as_str().into(), next.into(), input.algorithm.as_str().into(), input.auth_data.to_string().into()],
+            )
+            .await?;
+        if made == 0 {
+            tx.rollback().await?;
+            continue;
+        }
+        // Deleted backups older than this one go (this one keeps the
+        // number taken), and only the newest few are kept.
+        tx.execute(
+            "DELETE FROM chat_backup_versions WHERE user_id = $1 AND version < $2 AND deleted IS NOT NULL",
+            &[me.id.as_str().into(), next.into()],
+        )
+        .await?;
+        let old: Vec<i64> = tx
+            .query(
+                "SELECT version FROM chat_backup_versions WHERE user_id = $1 AND deleted IS NULL ORDER BY version DESC",
+                &[me.id.as_str().into()],
+            )
+            .await?
+            .iter()
+            .skip(MAX_BACKUP_VERSIONS)
+            .filter_map(|r| r.int(0))
+            .collect();
+        for version in old {
+            for sql in [
+                "DELETE FROM chat_backup_keys WHERE user_id = $1 AND version = $2",
+                "DELETE FROM chat_backup_versions WHERE user_id = $1 AND version = $2",
+            ] {
+                tx.execute(sql, &[me.id.as_str().into(), version.into()])
+                    .await?;
+            }
+        }
+        tx.commit().await?;
+        return Ok(ok(&json!({"version": next.to_string()})));
+    }
+    Err(ApiError::conflict(
+        "Another backup was being made at the same time: try again.",
+    ))
 }
 
 async fn version_json(
@@ -645,13 +763,42 @@ async fn put_keys(request: &Request, instance: &Arc<Instance>) -> Result<Respons
     let current = current_version(s, &me.id)
         .await?
         .ok_or_else(|| ApiError::not_found("Not there."))?;
+    let wrong = || ApiError {
+        status: 403,
+        code: "wrong_backup_version",
+        message: "That is not the current backup version.".into(),
+    };
     if current.0 != version {
-        return Err(ApiError {
-            status: 403,
-            code: "wrong_backup_version",
-            message: "That is not the current backup version.".into(),
-        });
+        return Err(wrong());
     }
+    // One transaction: a refused upload leaves nothing behind. Taking the
+    // backup's row first makes uploads to it wait for each other.
+    let mut tx = s.begin().await?;
+    tx.execute(
+        "UPDATE chat_backup_versions SET etag = etag WHERE user_id = $1 AND version = $2 AND deleted IS NULL",
+        &[me.id.as_str().into(), version.into()],
+    )
+    .await?;
+    let newest = tx
+        .query(
+            "SELECT CAST(MAX(version) AS BIGINT) FROM chat_backup_versions WHERE user_id = $1 AND deleted IS NULL",
+            &[me.id.as_str().into()],
+        )
+        .await?
+        .first()
+        .and_then(|r| r.int(0));
+    if newest != Some(version) {
+        return Err(wrong());
+    }
+    let mut count = tx
+        .query(
+            "SELECT CAST(COUNT(*) AS BIGINT) FROM chat_backup_keys WHERE user_id = $1 AND version = $2",
+            &[me.id.as_str().into(), version.into()],
+        )
+        .await?
+        .first()
+        .and_then(|r| r.int(0))
+        .unwrap_or(0);
     let mut changed = 0;
     let mut seen = 0;
     for (room, r) in input["rooms"].as_object().into_iter().flatten() {
@@ -669,7 +816,7 @@ async fn put_keys(request: &Request, instance: &Arc<Instance>) -> Result<Respons
                 data["first_message_index"].as_i64().unwrap_or(i64::MAX),
                 data["forwarded_count"].as_i64().unwrap_or(i64::MAX),
             );
-            let old = s
+            let old = tx
                 .query(
                     "SELECT verified, first_index, forwarded FROM chat_backup_keys WHERE user_id = $1 AND version = $2 AND room = $3 AND session = $4",
                     &[me.id.as_str().into(), version.into(), room.as_str().into(), session.as_str().into()],
@@ -680,12 +827,18 @@ async fn put_keys(request: &Request, instance: &Arc<Instance>) -> Result<Respons
             if old.is_some_and(|old| !better(new, old)) {
                 continue;
             }
-            s.execute(
+            if old.is_none() {
+                count += 1;
+                if count > MAX_BACKUP_KEYS {
+                    return Err(full("At most 100000 room keys in one backup."));
+                }
+            }
+            tx.execute(
                 "DELETE FROM chat_backup_keys WHERE user_id = $1 AND version = $2 AND room = $3 AND session = $4",
                 &[me.id.as_str().into(), version.into(), room.as_str().into(), session.as_str().into()],
             )
             .await?;
-            s.execute(
+            tx.execute(
                 "INSERT INTO chat_backup_keys (user_id, version, room, session, data, first_index, forwarded, verified) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
                 &[me.id.as_str().into(), version.into(), room.as_str().into(), session.as_str().into(), text.as_str().into(), new.1.into(), new.2.into(), i64::from(new.0).into()],
             )
@@ -694,12 +847,13 @@ async fn put_keys(request: &Request, instance: &Arc<Instance>) -> Result<Respons
         }
     }
     if changed > 0 {
-        s.execute(
+        tx.execute(
             "UPDATE chat_backup_versions SET etag = etag + 1 WHERE user_id = $1 AND version = $2",
             &[me.id.as_str().into(), version.into()],
         )
         .await?;
     }
+    tx.commit().await?;
     let after = current_version(s, &me.id)
         .await?
         .ok_or_else(|| ApiError::not_found("Not there."))?;
@@ -871,12 +1025,16 @@ async fn post_verification(
  * does is recorded.
  */
 async fn get_escrow(request: &Request, instance: &Arc<Instance>) -> Result<Response, ApiError> {
-    let me = crate::api::signed(request, instance).await?;
+    let session = ortus_core::auth::current(request, instance)
+        .await
+        .ok_or_else(ApiError::sign_in)?;
+    let me = session.user.clone();
     if me.role < ortus_core::auth::accounts::Role::Admin {
         return Err(ApiError::forbidden());
     }
-    let email = crate::api::query(request, "email").unwrap_or_default();
     let s = instance.store.as_ref();
+    ortus_core::auth::step_up::require(s, &session).await?;
+    let email = crate::api::query(request, "email").unwrap_or_default();
     let user = ortus_core::people::id_by_email(s, email.trim())
         .await?
         .ok_or_else(|| ApiError::not_found("Nobody here has that address."))?;
@@ -890,13 +1048,15 @@ async fn get_escrow(request: &Request, instance: &Arc<Instance>) -> Result<Respo
         .first()
         .and_then(|r| r.text(0))
         .ok_or_else(|| ApiError::not_found("This person has no escrow copy: they have not set up recovery since the escrow key was made."))?;
-    ortus_core::auth::audit(
-        instance,
+    // Recorded before the copy leaves; unrecorded, it does not.
+    let event =
         ortus_core::audit::Event::new("chat.escrow_copy_taken", ortus_core::audit::Outcome::Done)
             .by(&me.id)
-            .on(&user),
-    )
-    .await;
+            .on(&user);
+    if let Err(e) = ortus_core::audit::record(s, &event, now()).await {
+        eprintln!("ortus-chat: audit: could not record {}: {e}", event.action);
+        return Err(ApiError::internal());
+    }
     Ok(ok(
         &serde_json::from_str::<Value>(content).unwrap_or(Value::Null)
     ))

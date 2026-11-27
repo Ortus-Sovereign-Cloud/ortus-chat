@@ -112,6 +112,9 @@ pub struct Opened {
     pub text: String,
     /// The root message of its thread, as sealed by its sender.
     pub thread: Option<String>,
+    /// Its room key came from the key backup, not from the sender: show the
+    /// sender as one that could not be confirmed.
+    pub from_backup: bool,
 }
 
 /// What `inbox()` took in.
@@ -210,6 +213,7 @@ impl OrtusE2e {
         Ok(Opened {
             text: o.text,
             thread: o.thread,
+            from_backup: o.from_backup,
         })
     }
 

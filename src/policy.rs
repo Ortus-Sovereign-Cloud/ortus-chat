@@ -66,7 +66,10 @@ struct Change {
 }
 
 async fn set(request: &Request, instance: &Arc<Instance>) -> Result<Response, ApiError> {
-    let me = crate::api::signed(request, instance).await?;
+    let session = ortus_core::auth::current(request, instance)
+        .await
+        .ok_or_else(ApiError::sign_in)?;
+    let me = session.user.clone();
     if me.role < Role::Admin {
         return Err(ApiError::forbidden());
     }
@@ -84,6 +87,13 @@ async fn set(request: &Request, instance: &Arc<Instance>) -> Result<Response, Ap
         }
     }
     let s = instance.store.as_ref();
+    // Whoever holds the escrow key's private half can open everyone's
+    // recovery keys: changing it needs a recent, strong sign-in.
+    if let Some(key) = &input.escrow_key {
+        if escrow_key(instance).await.unwrap_or_default() != *key {
+            ortus_core::auth::step_up::require(s, &session).await?;
+        }
+    }
     let mut tx = s.begin().await?;
     if let Some(allowed) = input.encrypted_rooms {
         tx.execute(

@@ -653,3 +653,467 @@ fn trust_and_backup() {
         );
     }
 }
+
+/// Runs SQL straight on the store: rows of a query as [text, int], or none.
+fn sql(instance: &ortus_core::instance::Instance, query: &str, params: &[&str]) -> Vec<Value> {
+    let params: Vec<ortus_core::storage::Value> = params.iter().map(|p| (*p).into()).collect();
+    let store = instance.store.as_ref();
+    if !query.starts_with("SELECT") {
+        ortus_core::runtime::block_on(store.execute(query, &params)).unwrap();
+        return Vec::new();
+    }
+    ortus_core::runtime::block_on(store.query(query, &params))
+        .unwrap()
+        .iter()
+        .map(|r| json!([r.text(0), r.int(0)]))
+        .collect()
+}
+
+fn user_id(instance: &ortus_core::instance::Instance, email: &str) -> String {
+    ortus_core::runtime::block_on(ortus_core::people::id_by_email(
+        instance.store.as_ref(),
+        email,
+    ))
+    .unwrap()
+    .unwrap()
+}
+
+/// What a person uploads is kept as signed and checked, malformed
+/// signatures break nobody's view, a forgotten device takes its
+/// signatures with it, what one person keeps is capped, and the escrow
+/// needs a recent, strong sign-in.
+#[test]
+fn trust_limits_and_step_up() {
+    for (name, instance, _keep) in common::installations() {
+        for app in instance.apps.clone() {
+            app.provide(&instance, &instance.services);
+        }
+        let client = TestClient::new(ortus_core::app(Arc::clone(&instance)));
+        let olena = signed_in(&instance, "olena@ministry.example", Role::Owner);
+        let marek = signed_in(&instance, "marek@ministry.example", Role::Member);
+        let (olena_id, marek_id) = (
+            user_id(&instance, "olena@ministry.example"),
+            user_id(&instance, "marek@ministry.example"),
+        );
+        call(
+            &client,
+            &olena,
+            "PATCH",
+            "/chat/policy",
+            Some(json!({"encryptedRooms": true})),
+        );
+        let (_, room) = call(
+            &client,
+            &olena,
+            "POST",
+            "/chat/rooms",
+            Some(
+                json!({"kind": "private", "name": "sealed", "encrypted": true, "members": ["marek@ministry.example"]}),
+            ),
+        );
+        let room = room["id"].as_str().unwrap().to_string();
+        call(
+            &client,
+            &marek,
+            "POST",
+            &format!("/chat/rooms/{room}/join"),
+            None,
+        );
+        let mx = |token: &str| {
+            call(&client, token, "GET", "/chat/rooms", None).1["me"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let (olena_mx, marek_mx) = (mx(&olena), mx(&marek));
+        let (laptop, his) = (Account::new(), Account::new());
+        for (token, account, user, device) in [
+            (&olena, &laptop, &olena_mx, "LAPTOP"),
+            (&marek, &his, &marek_mx, "HIS"),
+        ] {
+            assert_eq!(
+                200,
+                call(
+                    &client,
+                    token,
+                    "PUT",
+                    &format!("/chat/devices/{device}"),
+                    Some(json!({"deviceKeys": device_keys(account, user, device)}))
+                )
+                .0,
+                "{name}"
+            );
+        }
+
+        // Cross-signing keys are kept as signed: anything else in what was
+        // signed is refused, signatures that are not the master key's go.
+        let hers = Identity::new();
+        let mut extra = hers.upload(&olena_mx);
+        extra["master"]["note"] = json!("more");
+        assert_eq!(
+            400,
+            call(&client, &olena, "PUT", "/chat/cross-signing", Some(extra)).0,
+            "{name}: a field that is not signed"
+        );
+        let eve = format!("@eve:{}", olena_mx.split(':').nth(1).unwrap());
+        let mut upload = hers.upload(&olena_mx);
+        upload["master"]["signatures"] = json!({ &eve: { "ed25519:EVE": "forged" } });
+        upload["selfSigning"]["signatures"][&eve] = json!({ "ed25519:EVE": "forged" });
+        upload["userSigning"]["signatures"][&olena_mx]["ed25519:OTHER"] = json!(1);
+        let (status, out) = call(&client, &olena, "PUT", "/chat/cross-signing", Some(upload));
+        assert_eq!(200, status, "{name}: {out}");
+        let his_identity = Identity::new();
+        let mut upload = his_identity.upload(&marek_mx);
+        upload["master"]["signatures"] = json!(1);
+        assert_eq!(
+            200,
+            call(&client, &marek, "PUT", "/chat/cross-signing", Some(upload)).0,
+            "{name}: a malformed signatures field is dropped"
+        );
+        let (status, mine) = call(
+            &client,
+            &olena,
+            "GET",
+            &format!("/chat/keys?user={olena_mx}"),
+            None,
+        );
+        assert_eq!(200, status, "{name}: {mine}");
+        let me = &mine["crossSigning"][&olena_mx];
+        assert!(me["master"]["signatures"][&eve].is_null(), "{name}: {mine}");
+        assert!(
+            me["selfSigning"]["signatures"][&eve].is_null(),
+            "{name}: {mine}"
+        );
+        assert!(
+            me["userSigning"]["signatures"][&olena_mx]["ed25519:OTHER"].is_null(),
+            "{name}: {mine}"
+        );
+        assert!(
+            me["selfSigning"]["signatures"][&olena_mx][Identity::id(&hers.master)].is_string(),
+            "{name}: the master key's signature stays: {mine}"
+        );
+
+        // She vouches for Marek; his master key as kept from before (a
+        // non-object signatures field, a forged one) breaks nothing.
+        let his_master_id = his_identity.master.public_key().to_base64();
+        let vouched = sign(
+            &hers.usk,
+            cross_key(&marek_mx, "master", &his_identity.master),
+            &olena_mx,
+            &Identity::id(&hers.usk),
+        );
+        let (_, out) = call(
+            &client,
+            &olena,
+            "POST",
+            "/chat/signatures",
+            Some(json!({ &marek_mx: { &his_master_id: vouched } })),
+        );
+        assert_eq!(1, out["kept"].as_i64().unwrap(), "{name}: {out}");
+        for broken in [
+            json!(1),
+            json!("x"),
+            json!({ &olena_mx: 1 }),
+            json!({ &eve: { "ed25519:EVE": "forged" } }),
+        ] {
+            let mut kept = cross_key(&marek_mx, "master", &his_identity.master);
+            kept["signatures"] = broken;
+            sql(
+                &instance,
+                "UPDATE chat_cross_signing SET key = $1 WHERE user_id = $2 AND kind = 'master'",
+                &[&kept.to_string(), &marek_id],
+            );
+            let (status, devices) = call(
+                &client,
+                &olena,
+                "GET",
+                &format!("/chat/rooms/{room}/devices"),
+                None,
+            );
+            assert_eq!(200, status, "{name}: {devices}");
+            let master = &devices["crossSigning"][&marek_mx]["master"];
+            assert!(
+                master["signatures"][&olena_mx][Identity::id(&hers.usk)].is_string(),
+                "{name}: {devices}"
+            );
+            assert!(master["signatures"][&eve].is_null(), "{name}: {devices}");
+            assert_eq!(
+                200,
+                call(
+                    &client,
+                    &olena,
+                    "GET",
+                    &format!("/chat/keys?user={marek_mx}"),
+                    None
+                )
+                .0,
+                "{name}"
+            );
+        }
+
+        // A device forgotten takes the signatures on it: the same id with
+        // new keys is not signed.
+        let ssk_id = Identity::id(&hers.ssk);
+        let on_laptop = sign(
+            &hers.ssk,
+            device_keys(&laptop, &olena_mx, "LAPTOP"),
+            &olena_mx,
+            &ssk_id,
+        );
+        let (_, out) = call(
+            &client,
+            &olena,
+            "POST",
+            "/chat/signatures",
+            Some(json!({ &olena_mx: { "LAPTOP": on_laptop } })),
+        );
+        assert_eq!(1, out["kept"].as_i64().unwrap(), "{name}: {out}");
+        assert_eq!(
+            200,
+            call(&client, &olena, "DELETE", "/chat/devices/LAPTOP", None).0
+        );
+        assert!(
+            sql(
+                &instance,
+                "SELECT target_key FROM chat_key_signatures WHERE target_user = $1 AND target_key = 'LAPTOP'",
+                &[&olena_id],
+            )
+            .is_empty(),
+            "{name}: its signatures went"
+        );
+        let new_laptop = Account::new();
+        call(
+            &client,
+            &olena,
+            "PUT",
+            "/chat/devices/LAPTOP",
+            Some(json!({"deviceKeys": device_keys(&new_laptop, &olena_mx, "LAPTOP")})),
+        );
+        let (_, devices) = call(
+            &client,
+            &olena,
+            "GET",
+            &format!("/chat/rooms/{room}/devices"),
+            None,
+        );
+        let laptop_now = devices["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["device"] == "LAPTOP")
+            .cloned()
+            .unwrap();
+        assert!(
+            laptop_now["deviceKeys"]["signatures"][&olena_mx][&ssk_id].is_null(),
+            "{name}: {laptop_now}"
+        );
+
+        // Account data: at most 50 types per person; one kept can change.
+        let anna = signed_in(&instance, "anna@ministry.example", Role::Member);
+        for n in 0..50 {
+            assert_eq!(
+                200,
+                call(
+                    &client,
+                    &anna,
+                    "PUT",
+                    &format!("/chat/account-data/t.{n}"),
+                    Some(json!({"n": n}))
+                )
+                .0,
+                "{name}"
+            );
+        }
+        let (status, out) = call(
+            &client,
+            &anna,
+            "PUT",
+            "/chat/account-data/t.50",
+            Some(json!({"n": 50})),
+        );
+        assert_eq!(
+            (413, "storage_limit"),
+            (status, out["error"]["code"].as_str().unwrap_or_default()),
+            "{name}: {out}"
+        );
+        assert_eq!(
+            200,
+            call(
+                &client,
+                &anna,
+                "PUT",
+                "/chat/account-data/t.0",
+                Some(json!({"n": "again"}))
+            )
+            .0,
+            "{name}: one already kept"
+        );
+
+        // Backups: the newest ten are kept, a number is never used twice.
+        let new_version = || {
+            let (status, made) = call(
+                &client,
+                &marek,
+                "POST",
+                "/chat/backup/version",
+                Some(
+                    json!({"algorithm": "m.megolm_backup.v1.curve25519-aes-sha2", "authData": {"public_key": "A".repeat(43)}}),
+                ),
+            );
+            assert_eq!(200, status, "{name}: {made}");
+            made["version"].as_str().unwrap().to_string()
+        };
+        let key = |session: &str| json!({"rooms": {&room: {"sessions": {session: {"first_message_index": 0, "forwarded_count": 0, "is_verified": true, "session_data": {"ciphertext": "c", "ephemeral": "e", "mac": "m"}}}}}});
+        let first = new_version();
+        assert_eq!(
+            200,
+            call(
+                &client,
+                &marek,
+                "PUT",
+                &format!("/chat/backup/keys?version={first}"),
+                Some(key("S1"))
+            )
+            .0
+        );
+        for _ in 0..11 {
+            new_version();
+        }
+        assert!(
+            call(
+                &client,
+                &marek,
+                "GET",
+                &format!("/chat/backup/keys?version={first}"),
+                None
+            )
+            .1["rooms"]
+                .as_object()
+                .unwrap()
+                .is_empty(),
+            "{name}: the oldest went"
+        );
+        let kept = sql(
+            &instance,
+            "SELECT CAST(COUNT(*) AS BIGINT) FROM chat_backup_versions WHERE user_id = $1",
+            &[&marek_id],
+        );
+        assert_eq!(json!(10), kept[0][1], "{name}");
+        let last = new_version();
+        assert_eq!(
+            200,
+            call(
+                &client,
+                &marek,
+                "DELETE",
+                &format!("/chat/backup/version/{last}"),
+                None
+            )
+            .0
+        );
+        let after = new_version();
+        assert!(
+            after.parse::<i64>().unwrap() > last.parse::<i64>().unwrap(),
+            "{name}: {after} after {last}"
+        );
+
+        // Room keys in one backup: at most 100000, and a refused upload
+        // keeps none of its keys.
+        sql(
+            &instance,
+            &format!("INSERT INTO chat_backup_keys (user_id, version, room, session, data, first_index, forwarded, verified) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 99999) SELECT $1, {after}, 'R', 'S' || CAST(i AS TEXT), '{{}}', 0, 0, 0 FROM n"),
+            &[&marek_id],
+        );
+        let two = json!({"rooms": {&room: {"sessions": {
+            "N1": key("N1")["rooms"][&room]["sessions"]["N1"],
+            "N2": key("N2")["rooms"][&room]["sessions"]["N2"],
+        }}}});
+        let (status, out) = call(
+            &client,
+            &marek,
+            "PUT",
+            &format!("/chat/backup/keys?version={after}"),
+            Some(two),
+        );
+        assert_eq!(413, status, "{name}: {out}");
+        assert_eq!(
+            99999,
+            call(&client, &marek, "GET", "/chat/backup/version", None).1["count"],
+            "{name}: nothing of it kept"
+        );
+
+        // The escrow: changing its key and taking a copy need a recent,
+        // strong sign-in; the same key again does not.
+        let weak = ortus_core::runtime::block_on(ortus_core::auth::sessions::start(
+            instance.store.as_ref(),
+            &olena_id,
+            "password",
+            "",
+            "",
+            ortus_core::auth::sessions::Lifetime::default(),
+            ortus_core::program::now_ms(),
+        ))
+        .unwrap();
+        let escrow = "B".repeat(43);
+        let (status, out) = call(
+            &client,
+            &weak,
+            "PATCH",
+            "/chat/policy",
+            Some(json!({"escrowKey": escrow})),
+        );
+        assert_eq!(
+            (403, "step_up"),
+            (status, out["error"]["code"].as_str().unwrap_or_default()),
+            "{name}: {out}"
+        );
+        assert_eq!(
+            200,
+            call(
+                &client,
+                &olena,
+                "PATCH",
+                "/chat/policy",
+                Some(json!({"escrowKey": escrow}))
+            )
+            .0,
+            "{name}"
+        );
+        assert_eq!(
+            200,
+            call(
+                &client,
+                &weak,
+                "PATCH",
+                "/chat/policy",
+                Some(json!({"escrowKey": escrow, "encryptedRooms": true}))
+            )
+            .0,
+            "{name}: no change to the key"
+        );
+        assert_eq!(200, call(&client, &marek, "PUT", "/chat/account-data/ortus.escrow", Some(json!({"key": escrow, "sealed": {"ephemeral": "e", "ciphertext": "c", "mac": "m"}}))).0);
+        let marek_escrow = "/chat/admin/escrow?email=marek@ministry.example";
+        let (status, out) = call(&client, &weak, "GET", marek_escrow, None);
+        assert_eq!(
+            (403, "step_up"),
+            (status, out["error"]["code"].as_str().unwrap_or_default()),
+            "{name}: {out}"
+        );
+        let taken = |instance: &ortus_core::instance::Instance| {
+            sql(
+                instance,
+                "SELECT CAST(COUNT(*) AS BIGINT) FROM core_audit WHERE action = 'chat.escrow_copy_taken'",
+                &[],
+            )[0][1]
+                .clone()
+        };
+        assert_eq!(json!(0), taken(&instance), "{name}");
+        assert_eq!(200, call(&client, &olena, "GET", marek_escrow, None).0);
+        assert_eq!(json!(1), taken(&instance), "{name}: recorded");
+        // Unrecorded, the copy does not leave.
+        sql(&instance, "DROP TABLE core_audit_head", &[]);
+        let (status, out) = call(&client, &olena, "GET", marek_escrow, None);
+        assert_eq!(500, status, "{name}: {out}");
+        assert!(out["sealed"].is_null(), "{name}: {out}");
+    }
+}

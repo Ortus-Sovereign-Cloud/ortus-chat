@@ -91,7 +91,8 @@ for (;;) {
       await sealer.send(c.room, c.roomId, c.text, c.thread ?? undefined);
       say({ result: null });
     } else if (c.cmd === "open") {
-      say({ result: await sealer.open(c.room, c.roomId, c.message.sealed, c.message.sender, c.message.id, c.message.thread ?? null) });
+      // The text only (the phones' tests read it as before).
+      say({ result: (await sealer.open(c.room, c.roomId, c.message.sealed, c.message.sender, c.message.id, c.message.thread ?? null))?.text ?? null });
     } else if (c.cmd === "setUpRecovery") {
       say({ result: await sealer.setUpRecovery() });
     } else if (c.cmd === "unverified") {

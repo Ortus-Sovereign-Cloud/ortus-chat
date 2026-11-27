@@ -15,6 +15,7 @@ use matrix_sdk_crypto::store::types::{BackupDecryptionKey, CrossSigningKeyExport
 use matrix_sdk_crypto::types::requests::{
     AnyOutgoingRequest, OutgoingVerificationRequest, ToDeviceRequest,
 };
+use matrix_sdk_crypto::types::EventEncryptionAlgorithm;
 use matrix_sdk_crypto::{Verification, VerificationRequest};
 use ruma::api::client::backup::add_backup_keys;
 use ruma::api::client::keys::upload_signatures;
@@ -500,7 +501,23 @@ impl Inner {
                 };
                 let opened: std::result::Result<_, DecryptionError> =
                     key.decrypt_session_data(sealed);
-                if let Ok(room_key) = opened {
+                let Ok(room_key) = opened else {
+                    continue;
+                };
+                // The backup is not authenticated (the server knows its
+                // public key) and the SDK files an entry under the id it is
+                // given: a session is taken only under its own id (its
+                // Ed25519 signing key), so no entry stands in for another
+                // device's session. What it claims of its sender stays a
+                // claim: messages it opens say they came from the backup.
+                let own_id = vodozemac::megolm::InboundGroupSession::import(
+                    &room_key.session_key,
+                    vodozemac::megolm::SessionConfig::version_1(),
+                )
+                .session_id();
+                if room_key.algorithm == EventEncryptionAlgorithm::MegolmV1AesSha2
+                    && &own_id == session
+                {
                     keys.push(ExportedRoomKey::from_backed_up_room_key(
                         room.clone(),
                         session.clone(),
@@ -679,7 +696,7 @@ impl Inner {
     /// Takes in what came, moves each verification on, and answers how they stand.
     pub(crate) async fn verifications(&mut self) -> Result<Vec<VerificationView>> {
         self.take_inbox().await?;
-        for r in self.requests() {
+        for r in self.unambiguous() {
             let id = r.flow_id().as_str().to_string();
             // Ours, and the other side said ready: start the emoji, unless
             // a QR code is possible (the person chooses: scan, show or emoji).
@@ -707,7 +724,7 @@ impl Inner {
             }
         }
         self.flush().await?;
-        Ok(self.requests().iter().map(|r| self.view(r)).collect())
+        Ok(self.unambiguous().iter().map(|r| self.view(r)).collect())
     }
 
     /// Asks one's own other devices to verify with this one.
@@ -834,11 +851,35 @@ impl Inner {
         self.flush().await
     }
 
+    /// The verification `id` names. Ids are chosen by whoever starts one
+    /// (and pass through the server), so two people's requests can share
+    /// one: then neither is acted on by id, rather than the wrong one.
     fn request(&self, id: &str) -> Result<VerificationRequest> {
-        self.requests()
+        let mut found = self
+            .requests()
             .into_iter()
-            .find(|r| r.flow_id().as_str() == id)
-            .ok_or_else(|| Error::Invalid("No such verification.".into()))
+            .filter(|r| r.flow_id().as_str() == id);
+        match (found.next(), found.next()) {
+            (Some(r), None) => Ok(r),
+            (None, _) => Err(Error::Invalid("No such verification.".into())),
+            (Some(_), Some(_)) => Err(Error::Refused(
+                "Two verifications share this id: start a new one.".into(),
+            )),
+        }
+    }
+
+    /// The requests an id names alone: those listed, and moved on by
+    /// `verifications()` (one whose id another shares cannot be told
+    /// apart on the screen nor in the calls that take its id).
+    fn unambiguous(&self) -> Vec<VerificationRequest> {
+        let all = self.requests();
+        let mut ids: BTreeMap<String, usize> = BTreeMap::new();
+        for r in &all {
+            *ids.entry(r.flow_id().as_str().to_string()).or_default() += 1;
+        }
+        all.into_iter()
+            .filter(|r| ids[r.flow_id().as_str()] == 1)
+            .collect()
     }
 
     pub(crate) async fn accept_verification(&mut self, id: &str) -> Result<()> {

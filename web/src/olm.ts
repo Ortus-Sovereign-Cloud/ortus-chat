@@ -460,6 +460,15 @@ export function exportSessionKey(s: MegolmInbound): string {
   return b64(concat(new Uint8Array([1]), index, s.ratchet.parts, s.signingKey));
 }
 
+/** Whether an earlier session runs on to a later one: the same signing key,
+ * and its ratchet, advanced, is the later one's. */
+export async function leadsTo(earlier: MegolmInbound, later: MegolmInbound): Promise<boolean> {
+  if (!same(earlier.signingKey, later.signingKey) || earlier.ratchet.index > later.ratchet.index) return false;
+  const r: MegolmRatchet = { parts: new Uint8Array(earlier.ratchet.parts), index: earlier.ratchet.index };
+  if (later.ratchet.index > r.index) await advanceTo(r, later.ratchet.index);
+  return same(r.parts, later.ratchet.parts);
+}
+
 /** A session from Matrix's export format (a backup's). */
 export function importSessionKey(key: string): MegolmInbound {
   const data = unb64(key);
