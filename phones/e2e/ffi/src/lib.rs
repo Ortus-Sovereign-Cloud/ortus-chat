@@ -131,6 +131,23 @@ pub struct RecoveryState {
     pub here: bool,
 }
 
+/// The organisation's escrow key, shown before recovery is set up:
+/// "Your organisation can recover your history. Escrow key {fingerprint},
+/// set by {signer} ({signer_status})", and that it changed when `changed`.
+#[derive(uniffi::Record)]
+pub struct EscrowInfo {
+    /// The X25519 public key: pass it to `set_up_recovery` once the person saw it.
+    pub key: String,
+    /// The key's first 24 characters in groups of four.
+    pub fingerprint: String,
+    /// Who signed it (their Matrix id).
+    pub signer: String,
+    /// you, verified (by this person) or unverified.
+    pub signer_status: String,
+    /// Not the key accepted at this phone's last set-up.
+    pub changed: bool,
+}
+
 /// A device nobody vouched for.
 #[derive(uniffi::Record)]
 pub struct DeviceRef {
@@ -244,10 +261,24 @@ impl OrtusE2e {
         Ok(self.inner.recover(&recovery_key)?)
     }
 
+    /// The organisation's escrow key, to show before set-up: none when
+    /// there is none; Invalid when no administrator signed it (set-up is
+    /// refused: they make it again).
+    pub fn escrow_info(&self) -> Result<Option<EscrowInfo>, E2eError> {
+        Ok(self.inner.escrow_info()?.map(|e| EscrowInfo {
+            key: e.key,
+            fingerprint: e.fingerprint,
+            signer: e.signer,
+            signer_status: e.signer_status,
+            changed: e.changed,
+        }))
+    }
+
     /// Sets recovery up from this phone (nobody set it up yet): the
-    /// recovery key, to show once.
-    pub fn set_up_recovery(&self) -> Result<String, E2eError> {
-        Ok(self.inner.set_up_recovery()?)
+    /// recovery key, to show once. With an escrow, `accepted_escrow_key` is
+    /// the key `escrow_info` showed the person; another (or none) is refused.
+    pub fn set_up_recovery(&self, accepted_escrow_key: Option<String>) -> Result<String, E2eError> {
+        Ok(self.inner.set_up_recovery(accepted_escrow_key)?)
     }
 
     /// Asks one device (a row of a room's unverified devices) to verify: its id.

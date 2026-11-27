@@ -23,7 +23,14 @@ export default defineConfig({
   reporter: [["list"]],
   globalSetup: "./e2e/global-setup.ts",
   use: { baseURL: `http://localhost:${port}`, viewport: { width: 1440, height: 900 }, colorScheme: "dark", timezoneId: "UTC", storageState: "test-results/owner.json" },
-  projects: [{ name: "chromium", use: { browserName: "chromium" } }],
+  // The escrow spec last, alone: it sets and changes the organisation's
+  // escrow key, which a recovery set-up meanwhile would see change, and it
+  // gives the owner cross-signing keys the other specs do not expect. It
+  // needs the owner's strong sign-in from set-up (ten minutes).
+  projects: [
+    { name: "chromium", testIgnore: /escrow\.spec\.ts/, use: { browserName: "chromium" } },
+    { name: "escrow", testMatch: /escrow\.spec\.ts/, dependencies: ["chromium"], use: { browserName: "chromium" } },
+  ],
   webServer: [
     {
       command: `rm -rf test-results/data && ${binary}`,

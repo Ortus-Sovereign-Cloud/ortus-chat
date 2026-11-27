@@ -80,30 +80,94 @@ fn other_device(w: &World, who: &Person, me: &str, not: &str) -> String {
         .expect("another device")
 }
 
+/// An administrator's browser (recovery set up there) signs an escrow key
+/// with its master key and sets it.
+fn make_escrow(w: &World, admin: &Person, browser: &mut Browser, public: &str) {
+    let signed = browser.ask(json!({"cmd": "signWithMaster", "value": {
+        "user_id": admin.me, "usage": ["ortus.escrow"], "public_key": public}}));
+    assert!(signed["signatures"].is_object(), "{}: {signed}", w.name);
+    w.ok(
+        admin,
+        "PATCH",
+        "/chat/policy",
+        Some(json!({ "escrow": signed })),
+    );
+}
+
+/// An administrator with recovery set up in a browser, to sign escrow keys.
+fn administrator(w: &World) -> (Person, Browser) {
+    let admin = w.person("admin@ministry.example", true);
+    let mut browser = Browser::start(w, &admin);
+    browser.ask(json!({"cmd": "ready"}));
+    let key = browser.ask(json!({"cmd": "setUpRecovery"}));
+    assert!(
+        key.is_string(),
+        "{}: the administrator sets up: {key}",
+        w.name
+    );
+    (admin, browser)
+}
+
 #[test]
 fn recovery_set_up_on_a_phone_opens_in_the_browser_and_in_escrow() {
     for w in World::all() {
         let n = &w.name;
         let olena = w.person("olena@ministry.example", true);
         let (room, _) = w.sealed_room(&olena, &[]);
-        // The organisation's escrow key (its private half stays with the administrator).
+        // The organisation's escrow key (its private half stays with the
+        // administrator), signed by the administrator's master key.
         let escrow = vodozemac::Curve25519SecretKey::new();
-        let escrow_public = vodozemac::Curve25519PublicKey::from(&escrow);
-        w.ok(
-            &olena,
-            "PATCH",
-            "/chat/policy",
-            Some(json!({"escrowKey": escrow_public.to_base64()})),
-        );
+        let escrow_public = vodozemac::Curve25519PublicKey::from(&escrow).to_base64();
+        let (admin, mut admins) = administrator(&w);
+        make_escrow(&w, &admin, &mut admins, &escrow_public);
 
         let phone = w.phone(&olena, "PHONEA");
         let sent = phone.e2e.send(&room, "Written on the phone", None).unwrap();
         assert!(!phone.e2e.recovery_state().unwrap().set, "{n}");
-        let key = phone.e2e.set_up_recovery().expect("set up on the phone");
+        // What the person is shown before confirming.
+        let info = phone.e2e.escrow_info().unwrap().expect("an escrow");
+        assert_eq!(escrow_public, info.key, "{n}");
+        assert_eq!(admin.me, info.signer, "{n}");
+        assert_eq!(
+            "unverified", info.signer_status,
+            "{n}: she never verified the administrator"
+        );
+        assert!(!info.changed, "{n}");
+        assert_eq!(
+            ortus_e2e::escrow_fingerprint(&escrow_public),
+            info.fingerprint,
+            "{n}"
+        );
+        assert_eq!(29, info.fingerprint.len(), "{n}: six groups of four");
+        assert!(
+            phone.e2e.set_up_recovery(None).is_err(),
+            "{n}: not without accepting the key"
+        );
+        assert!(
+            phone.e2e.set_up_recovery(Some("A".repeat(43))).is_err(),
+            "{n}: not another key"
+        );
+        assert!(
+            !phone.e2e.recovery_state().unwrap().set,
+            "{n}: nothing made"
+        );
+        let key = phone
+            .e2e
+            .set_up_recovery(Some(info.key.clone()))
+            .expect("set up on the phone");
         assert!(key.starts_with("Es"), "{n}: {key}");
         let state = phone.e2e.recovery_state().unwrap();
         assert!(state.set && state.here, "{n}: {state:?}");
-        assert!(phone.e2e.set_up_recovery().is_err(), "{n}: only once");
+        assert!(
+            phone.e2e.set_up_recovery(Some(info.key.clone())).is_err(),
+            "{n}: only once"
+        );
+        // The browser sees the same escrow; the administrator's own is "you".
+        let theirs = Browser::start(&w, &olena).ask(json!({"cmd": "escrowInfo"}));
+        assert_eq!(json!(escrow_public), theirs["key"], "{n}: {theirs}");
+        assert_eq!(json!("unverified"), theirs["signerStatus"], "{n}");
+        let own = admins.ask(json!({"cmd": "escrowInfo"}));
+        assert_eq!(json!("you"), own["signerStatus"], "{n}: {own}");
 
         // The escrow copy opens to the recovery key with the private half.
         let copy = w.ok(&olena, "GET", "/chat/account-data/ortus.escrow", None);
@@ -120,7 +184,7 @@ fn recovery_set_up_on_a_phone_opens_in_the_browser_and_in_escrow() {
             )
             .unwrap(),
         };
-        let opened = vodozemac::pk_encryption::PkDecryption::from_key(escrow)
+        let opened = vodozemac::pk_encryption::PkDecryption::from_key(escrow.clone())
             .decrypt(&message)
             .expect("the escrow copy opens");
         assert_eq!(
@@ -268,7 +332,7 @@ fn a_phone_verifies_another_persons_device() {
         let phone = w.phone(&taras, "PHONET");
         phone
             .e2e
-            .set_up_recovery()
+            .set_up_recovery(None)
             .expect("taras sets up on his phone");
         phone.e2e.inbox().unwrap();
 
@@ -390,10 +454,10 @@ fn a_set_up_cut_half_way_is_finished_or_given_way() {
             failing_once(&w, &olena, "PUT", "/chat/account-data/m.megolm_backup.v1"),
         );
         let sent = phone.e2e.send(&room, "Before the cut", None).unwrap();
-        assert!(phone.e2e.set_up_recovery().is_err(), "{n}: cut");
+        assert!(phone.e2e.set_up_recovery(None).is_err(), "{n}: cut");
         let state = phone.e2e.recovery_state().unwrap();
         assert!(!state.set && !state.here, "{n}: not set up: {state:?}");
-        let key = phone.e2e.set_up_recovery().expect("tried again");
+        let key = phone.e2e.set_up_recovery(None).expect("tried again");
         assert!(phone.e2e.recovery_state().unwrap().here, "{n}");
         let mut browser = Browser::start(&w, &olena);
         browser.ask(json!({"cmd": "ready"}));
@@ -409,7 +473,7 @@ fn a_set_up_cut_half_way_is_finished_or_given_way() {
             "PHONET",
             failing_once(&w, &taras, "PUT", "/chat/account-data/m.megolm_backup.v1"),
         );
-        assert!(phone.e2e.set_up_recovery().is_err(), "{n}: cut");
+        assert!(phone.e2e.set_up_recovery(None).is_err(), "{n}: cut");
         let mut browser = Browser::start(&w, &taras);
         browser.ask(json!({"cmd": "ready"}));
         let key = browser.ask(json!({"cmd": "setUpRecovery"}));
@@ -435,11 +499,11 @@ fn a_set_up_cut_half_way_is_finished_or_given_way() {
             failing_once(&w, &iryna, "GET", "/chat/policy"),
         );
         assert!(
-            phone.e2e.set_up_recovery().is_err(),
+            phone.e2e.set_up_recovery(None).is_err(),
             "{n}: no policy, no set-up"
         );
         assert!(!phone.e2e.recovery_state().unwrap().set, "{n}");
-        assert!(phone.e2e.set_up_recovery().is_ok(), "{n}: tried again");
+        assert!(phone.e2e.set_up_recovery(None).is_ok(), "{n}: tried again");
     }
 }
 
@@ -504,5 +568,89 @@ fn two_verifications_with_one_id_are_neither_acted_on() {
             "{n}: ambiguous"
         );
         phone.e2e.accept_verification("ONLYONE").unwrap();
+    }
+}
+
+#[test]
+fn a_phone_refuses_an_escrow_key_nobody_signed_or_one_changed_until_accepted() {
+    for w in World::all() {
+        let n = &w.name;
+        let olena = w.person("olena@ministry.example", true);
+        let (room, _) = w.sealed_room(&olena, &[]);
+        let (admin, mut admins) = administrator(&w);
+        let first = vodozemac::Curve25519PublicKey::from(&vodozemac::Curve25519SecretKey::new())
+            .to_base64();
+        make_escrow(&w, &admin, &mut admins, &first);
+        let phone = w.phone(&olena, "PHONEA");
+        phone.e2e.send(&room, "Before", None).unwrap();
+
+        // The server swaps in a key of its own, unsigned: refused, nothing made.
+        let swapped = vodozemac::Curve25519PublicKey::from(&vodozemac::Curve25519SecretKey::new())
+            .to_base64();
+        w.sql(
+            "DELETE FROM chat_settings WHERE name IN ('escrow', 'escrow_signer')",
+            &[],
+        );
+        w.sql(
+            "UPDATE chat_settings SET value = $1 WHERE name = 'escrow_key'",
+            &[&swapped],
+        );
+        let unsigned = ortus_e2e::Error::Invalid(ortus_e2e::ESCROW_UNSIGNED.into());
+        assert_eq!(Err(unsigned.clone()), phone.e2e.escrow_info(), "{n}");
+        assert_eq!(
+            Err(unsigned),
+            phone.e2e.set_up_recovery(Some(swapped.clone())),
+            "{n}: even when accepted"
+        );
+        assert!(
+            !phone.e2e.recovery_state().unwrap().set,
+            "{n}: nothing made"
+        );
+        let escrow_copy = w.call(&olena, "GET", "/chat/account-data/ortus.escrow", None);
+        assert_eq!(404, escrow_copy.0, "{n}: no copy to the swapped key");
+
+        // Signed again: set up, and that key is kept as accepted.
+        make_escrow(&w, &admin, &mut admins, &first);
+        let info = phone.e2e.escrow_info().unwrap().expect("an escrow");
+        assert!(!info.changed, "{n}");
+        phone
+            .e2e
+            .set_up_recovery(Some(first.clone()))
+            .expect("set up");
+
+        // A new key later (recovery set up again, say after a reset): said
+        // to have changed, and refused until accepted.
+        let second = vodozemac::Curve25519PublicKey::from(&vodozemac::Curve25519SecretKey::new())
+            .to_base64();
+        make_escrow(&w, &admin, &mut admins, &second);
+        let (olena_id, _) = olena.ids();
+        w.sql(
+            "DELETE FROM chat_account_data WHERE kind = 'm.secret_storage.default_key' AND lower(user_id) = $1",
+            &[&olena_id],
+        );
+        let info = phone.e2e.escrow_info().unwrap().expect("an escrow");
+        assert_eq!(second, info.key, "{n}");
+        assert!(info.changed, "{n}: not the one accepted before");
+        assert_eq!(
+            Err(ortus_e2e::Error::Invalid(
+                ortus_e2e::ESCROW_NOT_ACCEPTED.into()
+            )),
+            phone.e2e.set_up_recovery(None),
+            "{n}"
+        );
+        assert!(
+            phone.e2e.set_up_recovery(Some(first.clone())).is_err(),
+            "{n}: the old key is not the one now"
+        );
+        phone
+            .e2e
+            .set_up_recovery(Some(second.clone()))
+            .expect("accepted");
+        let copy = w.ok(&olena, "GET", "/chat/account-data/ortus.escrow", None);
+        assert_eq!(json!(second), copy["key"], "{n}");
+        assert!(
+            !phone.e2e.escrow_info().unwrap().unwrap().changed,
+            "{n}: the new key is the accepted one now"
+        );
     }
 }

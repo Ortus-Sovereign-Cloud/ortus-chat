@@ -2,7 +2,7 @@
 // open room in the middle, a thread on the right with its recorded
 // decision, which can become a task. Everything new arrives live.
 import { ApiError, LitElement, LocalizeController, call, controls, css, customElement, html, nothing, state, type TemplateResult } from "ortus-kit";
-import { Sealer, type RecoveryState, type Sealed, type VerificationView } from "./e2e.js";
+import { ESCROW_NOT_ACCEPTED, ESCROW_UNSIGNED, Sealer, type EscrowInfo, type RecoveryState, type Sealed, type VerificationView } from "./e2e.js";
 import { EMOJI } from "./verify.js";
 
 /** A verification QR code as SVG: dark modules on white, with the quiet zone (cameras need both, in any theme). */
@@ -781,6 +781,10 @@ export class OrtusChatMain extends LitElement {
   @state() private recoveryKey = "";
   @state() private recoveryNote = "";
   @state() private recoveryBusy = false;
+  /** The organisation's escrow as set-up will use it, shown before the person confirms. */
+  @state() private escrow: EscrowInfo | null = null;
+  /** The escrow is being read: set-up waits for what it will show. */
+  @state() private escrowLoading = false;
   /** The verification on screen (by emoji), and the list of who is not vouched for. */
   @state() private verification: VerificationView | null = null;
   @state() private unverifiedOpen = false;
@@ -1068,18 +1072,60 @@ export class OrtusChatMain extends LitElement {
     }
   }
 
+  /** Set-up's refusals of the escrow, in the person's language. */
+  private escrowError(e: unknown): string {
+    const message = e instanceof Error ? e.message : String(e);
+    if (message === ESCROW_UNSIGNED) return t(this.localize, "recoveryEscrowUnsigned");
+    if (message === ESCROW_NOT_ACCEPTED) return t(this.localize, "recoveryEscrowNotShown");
+    return message;
+  }
+
+  private async openRecovery(): Promise<void> {
+    this.recoveryOpen = true;
+    await this.loadEscrow();
+  }
+
+  /** The escrow to show before set-up (none, or why set-up would be refused). */
+  private async loadEscrow(): Promise<void> {
+    this.escrow = null;
+    if (!this.sealer || this.recovery?.set) return;
+    this.escrowLoading = true;
+    try {
+      this.escrow = await this.sealer.escrowInfo();
+    } catch (e) {
+      this.recoveryNote = this.escrowError(e);
+    } finally {
+      this.escrowLoading = false;
+    }
+  }
+
   private async setUpRecovery(): Promise<void> {
     if (!this.sealer) return;
     this.recoveryBusy = true;
     this.recoveryNote = "";
     try {
-      this.recoveryKey = await this.sealer.setUpRecovery();
+      this.recoveryKey = await this.sealer.setUpRecovery(this.escrow?.key);
       this.recovery = await this.sealer.recoveryState();
     } catch (e) {
-      this.recoveryNote = e instanceof ApiError ? e.message : String(e);
+      this.recoveryNote = e instanceof ApiError ? e.message : this.escrowError(e);
+      // The escrow changed meanwhile: show the one set-up would use now.
+      if (e instanceof Error && e.message === ESCROW_NOT_ACCEPTED) {
+        const note = this.recoveryNote;
+        await this.loadEscrow();
+        this.recoveryNote = note;
+      }
     } finally {
       this.recoveryBusy = false;
     }
+  }
+
+  private escrowLines() {
+    const e = this.escrow;
+    if (!e) return nothing;
+    const status = t(this.localize, e.signerStatus === "you" ? "escrowSignerYou" : e.signerStatus === "verified" ? "escrowSignerVerified" : "escrowSignerUnverified");
+    const name = e.signer === this.me ? t(this.localize, "escrowSignerYou") : (this.people[e.signer]?.name ?? e.signer);
+    return html`<p data-testid="recovery-escrow">${t(this.localize, "recoveryEscrowInfo", { fingerprint: e.fingerprint, name, status })}</p>
+      ${e.changed ? html`<p class="note" role="alert">${t(this.localize, "recoveryEscrowChanged")}</p>` : nothing}`;
   }
 
   private async recoverWithKey(e: Event): Promise<void> {
@@ -1160,7 +1206,7 @@ export class OrtusChatMain extends LitElement {
   private recoveryDialog() {
     if (!this.recoveryOpen) return nothing;
     const r = this.recovery;
-    const close = () => ((this.recoveryOpen = false), (this.recoveryKey = ""), (this.recoveryNote = ""));
+    const close = () => ((this.recoveryOpen = false), (this.recoveryKey = ""), (this.recoveryNote = ""), (this.escrow = null));
     return html`<dialog class="modal recovery" aria-label=${t(this.localize, "recoveryTitle")} @close=${close}>
       <form method="dialog" @submit=${(e: Event) => (r?.set && !r.here ? this.recoverWithKey(e) : undefined)}>
         <h2>${t(this.localize, "recoveryTitle")}</h2>
@@ -1171,8 +1217,9 @@ export class OrtusChatMain extends LitElement {
               <div class="row"><button type="button" class="button primary" @click=${close}>${t(this.localize, "recoverySaved")}</button></div>`
           : !r?.set
             ? html`<p>${t(this.localize, "recoverySetUpLead")}</p>
+                ${this.escrowLines()}
                 <div class="row"><button type="button" class="button" @click=${close}>${t(this.localize, "cancel")}</button>
-                <button type="button" class="button primary" ?disabled=${this.recoveryBusy} @click=${() => void this.setUpRecovery()}>${t(this.localize, "recoverySetUp")}</button></div>`
+                <button type="button" class="button primary" ?disabled=${this.recoveryBusy || this.escrowLoading} @click=${() => void this.setUpRecovery()}>${t(this.localize, "recoverySetUp")}</button></div>`
             : !r.here
               ? html`<p>${t(this.localize, "recoveryEnterLead")}</p>
                   <label>${t(this.localize, "recoveryKeyLabel")}<input class="input" name="recoveryKey" autocomplete="off" spellcheck="false" required /></label>
@@ -1611,7 +1658,7 @@ export class OrtusChatMain extends LitElement {
                 ${room.encrypted && this.unverified.length
                   ? html`<span role="status"><button class="unverified" title=${this.unverified.map((d) => `${this.people[d.user]?.name ?? d.user} · ${d.device}`).join("\n")} @click=${() => (this.unverifiedOpen = true)}>⚠ ${t(this.localize, "unverifiedDevices", { count: this.unverified.length })}</button></span>`
                   : nothing}
-                ${room.encrypted ? html`<button class="button" @click=${() => (this.recoveryOpen = true)}>${t(this.localize, "recovery")}</button>` : nothing}
+                ${room.encrypted ? html`<button class="button" @click=${() => void this.openRecovery()}>${t(this.localize, "recovery")}</button>` : nothing}
                 ${room.federated
                   ? html`<span class="shared">${t(this.localize, "sharedWithPartners")} <code>${room.roomId ?? ""}</code></span>`
                   : this.federation && room.kind !== "direct" && !room.encrypted && this.isOwner()

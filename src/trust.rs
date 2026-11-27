@@ -1062,6 +1062,83 @@ async fn get_escrow(request: &Request, instance: &Arc<Instance>) -> Result<Respo
     ))
 }
 
+/// What the escrow object's signature covers: the organisation's escrow
+/// key, for usage ortus.escrow, made by this administrator.
+pub const ESCROW_USAGE: &str = "ortus.escrow";
+
+/// An administrator's signed escrow object, checked: exactly user_id (the
+/// caller), usage, an X25519 public key and the caller's current master
+/// key's signature. Answers it as kept (that one signature) and its key.
+pub async fn signed_escrow(
+    instance: &Instance,
+    user: &str,
+    escrow: &Value,
+) -> Result<(Value, String), ApiError> {
+    let shape = || {
+        bad("The escrow is {user_id, usage: [\"ortus.escrow\"], public_key, signatures}, signed by your master key.")
+    };
+    let owner = mx(instance, user);
+    let obj = escrow.as_object().ok_or_else(shape)?;
+    let mut fields: Vec<&str> = obj.keys().map(String::as_str).collect();
+    fields.sort_unstable();
+    if fields != ["public_key", "signatures", "usage", "user_id"]
+        || obj["user_id"] != owner.as_str()
+        || obj["usage"] != json!([ESCROW_USAGE])
+    {
+        return Err(shape());
+    }
+    let public = obj["public_key"].as_str().unwrap_or_default().to_string();
+    if public.len() != 43
+        || !public
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/')
+    {
+        return Err(bad(
+            "The escrow key is a Curve25519 public key (unpadded base64).",
+        ));
+    }
+    let master = cross_key(instance.store.as_ref(), user, "master")
+        .await?
+        .and_then(|m| ed25519(&m))
+        .ok_or_else(|| bad("Set up recovery first: the escrow is signed by your master key."))?;
+    if !matrix::verify_json(escrow, &owner, &master.0, &master.1) {
+        return Err(bad("The escrow is not signed by your current master key."));
+    }
+    let sig = escrow["signatures"][&owner][&master.0].clone();
+    let kept = json!({"user_id": owner, "usage": [ESCROW_USAGE], "public_key": public, "signatures": { &owner: { &master.0: sig } }});
+    Ok((kept, public))
+}
+
+/// A kept escrow object as served to `viewer`, with its signer's master key
+/// (`signerMaster`: its signatures by the signer and by the viewer); None
+/// when the signer's current master key does not verify it any more.
+pub async fn served_escrow(
+    instance: &Instance,
+    signer: &str,
+    escrow: &Value,
+    viewer: &str,
+) -> Option<Value> {
+    let s = instance.store.as_ref();
+    let owner = mx(instance, signer);
+    let key = cross_key(s, signer, "master").await.ok().flatten()?;
+    let (id, public) = ed25519(&key)?;
+    if escrow["user_id"] != owner.as_str() || !matrix::verify_json(escrow, &owner, &id, &public) {
+        return None;
+    }
+    let master = with_signatures(
+        s,
+        instance,
+        served(&key, &owner, None),
+        signer,
+        &public,
+        viewer,
+    )
+    .await;
+    let mut out = escrow.clone();
+    out["signerMaster"] = master;
+    Some(out)
+}
+
 // ---- routes ---------------------------------------------------------------
 
 macro_rules! handler {

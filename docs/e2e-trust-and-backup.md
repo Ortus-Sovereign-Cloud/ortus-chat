@@ -51,7 +51,21 @@ everyone. After this stage:
   HMAC-SHA-256 MAC), and stored as their account data `ortus.escrow`. With the private half, an
   administrator can open a person's secret storage. The escrow is shown to
   people when they set up recovery ("your organisation can recover your
-  history").
+  history"), with the key's fingerprint and who set it.
+  The key is **signed and pinned** (the owner's decision of 27 November
+  2026, after the security review: a server serving its own key would
+  otherwise open everyone's history). The administrator's browser signs
+  `{user_id, usage: ["ortus.escrow"], public_key}` with their master key
+  (Matrix's canonical-JSON signature, as cross-signing); the server keeps
+  it only from an administrator, as themselves, signed by their current
+  master key, and serves it with the signer's master key as this person
+  sees it (`signerMaster`, with their own user-signing signature on it if
+  they verified the signer). Browsers and phones check the signature and
+  the shape before sealing, refuse a key no administrator signed ("ask
+  them to make it again"), say whether the signer is the person, someone
+  they verified, or not verified by them, seal only to the key the person
+  was shown, and keep the key they accepted: a different one later is said
+  to have changed.
 - **Backup** (`m.megolm_backup.v1.curve25519-aes-sha2`): a Curve25519 key
   pair; each room key is encrypted to the public half and uploaded; the
   private half is in secret storage. `auth_data` carries the public key
@@ -83,8 +97,12 @@ Routes (signed in, own data only unless said):
   (`{rooms: {room: {sessions: {sessionId: keyData}}}}`); a key is replaced
   only by a better one (Matrix's rules: verified, lower first index, fewer
   forwards).
-- `PATCH /chat/policy` `{escrowKey}` (administrators); `GET /chat/policy`
-  gives it to everyone.
+- `PATCH /chat/policy` `{escrow}` (administrators): the escrow object
+  signed by the caller's current master key, or null to take it away (the
+  old `{escrowKey: ""}` still takes it away; a new key unsigned is
+  refused); a change needs a recent sign-in. `GET /chat/policy` gives
+  everyone `escrow` (with `signerMaster`), `escrowKey` (the public key, to
+  show) and `escrowUnsigned`.
 
 ## Browser (ortus-chat web)
 
@@ -151,6 +169,24 @@ Recovery, a shield on rooms and members, the verification sheets.
   sender's own key for that session arrives over Olm), and takes an entry
   only under its session's own id (its Ed25519 key), so no entry stands in
   for another session (`phones/e2e/tests/backup.rs`).
+- The escrow key signed and pinned (27 November 2026): `PATCH
+  /chat/policy {escrow}` takes the signed object only (exact shape, the
+  caller as `user_id`, their current master key's signature, kept with
+  that one signature); `GET` serves it with `signerMaster`, and serves a
+  key kept from before (or one whose signer's master key changed since) as
+  `escrow: null, escrowUnsigned: true`, which set-up refuses and Admin ›
+  Chat shows as "make it again". The browser (`Sealer.escrowInfo()`,
+  `setUpRecovery(acceptedEscrowKey)`, `signWithMaster`) and the phones
+  (`escrow_info()`, `set_up_recovery(accepted_escrow_key)`) check it the
+  same way before anything is made, and keep the accepted key (IndexedDB;
+  the crypto store's custom values). Set-up with an escrow goes on only
+  with the key the person was shown. Admin › Chat makes the key only in a
+  browser holding the master key (recovery set up or entered there).
+  Tests: `tests/trust.rs` (unsigned, another's or an old master key's
+  signature refused; served with the signer's master key; a key from
+  before served as unsigned), `escrow.spec` (the key changing while the
+  person looks is refused until they look again), `trust_more.rs` (a key
+  the server swapped in is refused; a changed key refused until accepted).
 - Not yet: the browser scanning a phone's code (no camera API it can rely
   on: a phone shows its code to another phone, and emoji between a phone
   and a browser work both ways).

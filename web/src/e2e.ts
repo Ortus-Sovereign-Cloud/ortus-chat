@@ -100,6 +100,30 @@ export interface RecoveryState {
   escrow: boolean;
 }
 
+/** The organisation's escrow key, as set-up shows it before the person confirms. */
+export interface EscrowInfo {
+  /** The X25519 public key (unpadded base64) recovery keys are sealed to. */
+  key: string;
+  /** The key in groups of four, for an administrator to confirm. */
+  fingerprint: string;
+  /** Who signed it (their Matrix id). */
+  signer: string;
+  /** you: signed by this person's own master key; verified: by someone this person verified; unverified: neither. */
+  signerStatus: "you" | "verified" | "unverified";
+  /** Not the key this browser accepted at the last set-up. */
+  changed: boolean;
+}
+
+/** Set-up refuses an escrow key no administrator signed. */
+export const ESCROW_UNSIGNED = "The organisation's escrow key is not signed by an administrator: ask them to make it again.";
+/** Set-up refuses an escrow key other than the one the person was shown. */
+export const ESCROW_NOT_ACCEPTED = "The organisation's escrow key is not the one you were shown: look at it again.";
+
+/** An escrow key's fingerprint: its first 24 characters in groups of four. */
+export function escrowFingerprint(key: string): string {
+  return (key.slice(0, 24).match(/.{1,4}/g) ?? []).join(" ");
+}
+
 /** A verification (by QR code or emoji), as the screen shows it. */
 export interface VerificationView {
   id: string;
@@ -670,14 +694,72 @@ export class Sealer {
   }
 
   /**
+   * The organisation's escrow from the policy, checked: signed by its
+   * signer's master key (as the server serves it to this person), for the
+   * escrow and nothing else. Null when there is none; an error when there
+   * is a key nobody (or no master key) signed.
+   */
+  private async escrow(): Promise<EscrowInfo | null> {
+    const policy = await call<{ escrowKey?: string | null; escrow?: Record<string, unknown> | null; escrowUnsigned?: boolean }>("GET", "/chat/policy");
+    if (!policy.escrow) {
+      if (policy.escrowKey || policy.escrowUnsigned) throw new Error(ESCROW_UNSIGNED);
+      return null;
+    }
+    const { signerMaster, ...escrow } = policy.escrow;
+    const signer = escrow.user_id;
+    const key = escrow.public_key;
+    const fields = Object.keys(escrow).sort().join(",");
+    const usage = escrow.usage;
+    const shaped =
+      typeof signer === "string" &&
+      typeof key === "string" &&
+      fields === "public_key,signatures,usage,user_id" &&
+      Array.isArray(usage) &&
+      usage.length === 1 &&
+      usage[0] === "ortus.escrow" &&
+      /^[A-Za-z0-9+/]{43}$/.test(key);
+    const master = shaped ? crossKey(signerMaster, signer, "master") : null;
+    if (!shaped || !master || !(await olm.verifyJson(escrow, signer, master[0], master[1]))) throw new Error(ESCROW_UNSIGNED);
+    const mine = await this.trustKeys().catch(() => null);
+    let signerStatus: EscrowInfo["signerStatus"] = "unverified";
+    if (mine && signer === this.me && sameBytes(master[1], mine.master.publicKey)) signerStatus = "you";
+    else if (mine && signer !== this.me && (await olm.verifyJson(signerMaster as Record<string, unknown>, this.me, trust.keyId(mine.userSigning), mine.userSigning.publicKey))) signerStatus = "verified";
+    const pinned = await get<string>(this.key("escrow", ""));
+    return { key, fingerprint: escrowFingerprint(key), signer, signerStatus, changed: pinned !== undefined && pinned !== key };
+  }
+
+  /** The organisation's escrow key, to show before set-up; null when there is none. Throws when it is not signed. */
+  escrowInfo(): Promise<EscrowInfo | null> {
+    return this.run(() => this.escrow());
+  }
+
+  /** Whether this browser holds the person's master key (recovery set up or entered here). */
+  async hasMasterKey(): Promise<boolean> {
+    return !!(await this.loadTrust().catch(() => undefined));
+  }
+
+  /** An object signed with this person's master key (the escrow an administrator makes). */
+  signWithMaster(value: Record<string, unknown>): Promise<Record<string, unknown>> {
+    return this.run(async () => {
+      const mine = await this.trustKeys();
+      if (!mine) throw new Error("This browser does not hold your master key: set up recovery here first.");
+      return trust.signObject(this.me, value, mine.master);
+    });
+  }
+
+  /**
    * Sets recovery up for the person (on their first device): cross-signing
    * keys, this device signed, a backup signed by the master key, the
    * secrets in secret storage under a new recovery key, and its escrow copy
-   * when the organisation has an escrow key. Answers the recovery key, to
-   * show once.
+   * when the organisation has an escrow key. With an escrow, set-up goes on
+   * only for the key the person was shown (`acceptedEscrowKey`), and never
+   * for one no administrator signed. Answers the recovery key, to show once.
    */
-  setUpRecovery(): Promise<string> {
+  setUpRecovery(acceptedEscrowKey?: string): Promise<string> {
     return this.run(async () => {
+      // The escrow first: refused before anything is made.
+      const escrow = await this.escrow();
+      if (escrow && escrow.key !== acceptedEscrowKey) throw new Error(ESCROW_NOT_ACCEPTED);
       const a = await this.account();
       const recovery = trust.newRecoveryKey();
       const cross = await trust.newCrossSigning();
@@ -693,13 +775,15 @@ export class Sealer {
         const secret = await trust.encryptSecret(recovery, name, olm.b64(seeds[k as keyof typeof seeds]));
         await call("PUT", `/chat/account-data/${name}`, { encrypted: { [keyId]: secret } });
       }
-      await call("PUT", "/chat/account-data/m.secret_storage.default_key", { key: keyId });
       const text = trust.encodeRecoveryKey(recovery);
-      const policy = await call<{ escrowKey?: string | null }>("GET", "/chat/policy");
-      if (policy.escrowKey) {
-        await call("PUT", "/chat/account-data/ortus.escrow", { key: policy.escrowKey, sealed: await trust.seal(olm.unb64(policy.escrowKey), text) });
+      if (escrow) {
+        await call("PUT", "/chat/account-data/ortus.escrow", { key: escrow.key, sealed: await trust.seal(olm.unb64(escrow.key), text) });
       }
+      // The default key last: a set-up cut half-way is not taken for one that finished.
+      await call("PUT", "/chat/account-data/m.secret_storage.default_key", { key: keyId });
       await this.saveTrust({ master: olm.b64(cross.master.seed), selfSigning: olm.b64(cross.selfSigning.seed), userSigning: olm.b64(cross.userSigning.seed), backup: olm.b64(backup.seed), version } satisfies Trust);
+      // The escrow key accepted here: a different one later is said to have changed.
+      if (escrow) await put(this.key("escrow", ""), escrow.key);
       await this.backUpAll();
       return text;
     });

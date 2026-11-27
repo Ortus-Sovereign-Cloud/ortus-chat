@@ -55,7 +55,7 @@ fn backup_keys_open_as_unconfirmed_and_forged_ones_are_skipped() {
         assert!(!o.from_backup, "{n}: shared by Taras");
 
         // Recovery on phone A; its room keys go to the backup.
-        let key = a.e2e.set_up_recovery().expect("set up");
+        let key = a.e2e.set_up_recovery(None).expect("set up");
         a.e2e.verifications().unwrap();
 
         // A new phone of Olena's: Taras has not shared with it yet.

@@ -105,7 +105,10 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 
 mod trust;
-pub use trust::{qr_payload, QrImage, RecoveryState, VerificationView};
+pub use trust::{
+    escrow_fingerprint, qr_payload, EscrowInfo, QrImage, RecoveryState, VerificationView,
+    ESCROW_NOT_ACCEPTED, ESCROW_UNSIGNED,
+};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -414,10 +417,19 @@ impl E2e {
         self.with(move |i| Box::pin(async move { i.recover(&key).await }))
     }
 
+    /// The organisation's escrow key, to show before set-up: None when
+    /// there is none; Invalid (ESCROW_UNSIGNED) when no administrator
+    /// signed it.
+    pub fn escrow_info(&self) -> Result<Option<EscrowInfo>> {
+        self.with(|i| Box::pin(i.escrow_info()))
+    }
+
     /// Sets recovery up from this phone (nobody set it up yet): answers the
-    /// recovery key, to show once.
-    pub fn set_up_recovery(&self) -> Result<String> {
-        self.with(|i| Box::pin(i.set_up_recovery()))
+    /// recovery key, to show once. With an escrow, only for the key the
+    /// person was shown (`accepted_escrow_key`, from `escrow_info`), and
+    /// never for one no administrator signed.
+    pub fn set_up_recovery(&self, accepted_escrow_key: Option<String>) -> Result<String> {
+        self.with(move |i| Box::pin(i.set_up_recovery(accepted_escrow_key)))
     }
 
     /// Asks one device (another person's, or one's own) to verify.

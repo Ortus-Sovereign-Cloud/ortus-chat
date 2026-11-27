@@ -1,8 +1,11 @@
 // Admin › Chat: whether end-to-end rooms may be made, the organisation's
-// escrow key (made in this browser: the server keeps only its public half;
-// the private half is a file the administrator keeps offline), and a
-// person's recovery key opened from their escrow copy with that file.
+// escrow key (made in this browser and signed with the administrator's
+// master key, so people's browsers and phones take only a key an
+// administrator vouched for; the server keeps only its public half; the
+// private half is a file the administrator keeps offline), and a person's
+// recovery key opened from their escrow copy with that file.
 import { LitElement, LocalizeController, ApiError, call, controls, css, customElement, html, nothing, state } from "ortus-kit";
+import { Sealer, escrowFingerprint } from "./e2e.js";
 import { ready, t } from "./i18n.js";
 import { b64, unb64 } from "./olm.js";
 import { unseal, x25519FromSeed, type Sealed } from "./trust.js";
@@ -60,6 +63,8 @@ export class OrtusChatAdmin extends LitElement {
   private readonly localize = new LocalizeController(this);
   @state() private encryptedRooms = false;
   @state() private escrowKey: string | null = null;
+  /** The key is there but no administrator signed it (kept from before): set-up refuses it. */
+  @state() private escrowUnsigned = false;
   @state() private note = "";
   @state() private recovered = "";
   @state() private busy = false;
@@ -70,9 +75,10 @@ export class OrtusChatAdmin extends LitElement {
   }
 
   private async load(): Promise<void> {
-    const p = await call<{ encryptedRooms: boolean; escrowKey?: string | null }>("GET", "/chat/policy");
+    const p = await call<{ encryptedRooms: boolean; escrowKey?: string | null; escrowUnsigned?: boolean }>("GET", "/chat/policy");
     this.encryptedRooms = p.encryptedRooms;
     this.escrowKey = p.escrowKey ?? null;
+    this.escrowUnsigned = !!p.escrowUnsigned;
   }
 
   private async setRooms(e: Event): Promise<void> {
@@ -81,20 +87,31 @@ export class OrtusChatAdmin extends LitElement {
     await this.load();
   }
 
-  /** A new escrow key: its private half goes to a file here, never to the server. */
+  /**
+   * A new escrow key, signed with this browser's master key (recovery set
+   * up or entered here): its private half goes to a file here, never to
+   * the server. Changing it asks for a recent sign-in (the kit's call).
+   */
   private async makeEscrow(): Promise<void> {
     this.busy = true;
     this.note = "";
     try {
+      const { me } = await call<{ me: string }>("GET", "/chat/rooms");
+      const sealer = new Sealer(me);
+      if (!(await sealer.hasMasterKey())) {
+        this.note = t(this.localize, "escrowNoMaster");
+        return;
+      }
       const key = await x25519FromSeed(crypto.getRandomValues(new Uint8Array(32)));
       const file: EscrowFile = { kind: "ortus-escrow-key", public: b64(key.publicKey), private: b64(key.seed) };
+      const escrow = await sealer.signWithMaster({ user_id: me, usage: ["ortus.escrow"], public_key: file.public });
       const url = URL.createObjectURL(new Blob([JSON.stringify(file, null, 2)], { type: "application/json" }));
       const a = document.createElement("a");
       a.href = url;
       a.download = "ortus-escrow-key.json";
       a.click();
       URL.revokeObjectURL(url);
-      await call("PATCH", "/chat/policy", { escrowKey: file.public });
+      await call("PATCH", "/chat/policy", { escrow });
       await this.load();
       this.note = t(this.localize, "escrowMade");
     } catch (e) {
@@ -141,8 +158,13 @@ export class OrtusChatAdmin extends LitElement {
         <h2>${t(this.localize, "escrowTitle")}</h2>
         <p>${t(this.localize, "escrowLead")}</p>
         ${this.escrowKey
-          ? html`<p>${t(this.localize, "escrowSet")} <code>${this.escrowKey.slice(0, 12)}…</code></p>`
-          : html`<div class="row"><button class="button primary" ?disabled=${this.busy} @click=${this.makeEscrow}>${t(this.localize, "escrowMake")}</button></div>`}
+          ? html`<p>${t(this.localize, "escrowSet")} <code>${this.escrowKey.slice(0, 12)}…</code></p>
+              <p>${t(this.localize, "escrowFingerprint")} <code data-testid="escrow-fingerprint">${escrowFingerprint(this.escrowKey)}</code></p>`
+          : nothing}
+        ${this.escrowUnsigned ? html`<p class="warning" role="alert">${t(this.localize, "escrowUnsignedNotice")}</p>` : nothing}
+        ${!this.escrowKey || this.escrowUnsigned
+          ? html`<div class="row"><button class="button primary" ?disabled=${this.busy} @click=${this.makeEscrow}>${t(this.localize, this.escrowUnsigned ? "escrowMakeAgain" : "escrowMake")}</button></div>`
+          : nothing}
       </section>
       ${this.escrowKey
         ? html`<section>

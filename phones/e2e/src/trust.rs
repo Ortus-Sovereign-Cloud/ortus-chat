@@ -40,6 +40,55 @@ pub struct RecoveryState {
     pub here: bool,
 }
 
+/// The organisation's escrow key, as set-up shows it before the person confirms.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EscrowInfo {
+    /// The X25519 public key (unpadded base64) recovery keys are sealed to.
+    pub key: String,
+    /// The key in groups of four, for an administrator to confirm.
+    pub fingerprint: String,
+    /// Who signed it (their Matrix id).
+    pub signer: String,
+    /// you (this person's own master key), verified (someone this person
+    /// verified) or unverified.
+    pub signer_status: String,
+    /// Not the key this phone accepted at the last set-up.
+    pub changed: bool,
+}
+
+/// Set-up refuses an escrow key no administrator signed.
+pub const ESCROW_UNSIGNED: &str =
+    "The organisation's escrow key is not signed by an administrator: ask them to make it again.";
+/// Set-up refuses an escrow key other than the one the person was shown.
+pub const ESCROW_NOT_ACCEPTED: &str =
+    "The organisation's escrow key is not the one you were shown: look at it again.";
+/// Where the escrow key accepted at set-up is kept.
+const ESCROW_PIN: &str = "ortus.escrow.accepted";
+
+/// An escrow key's fingerprint: its first 24 characters in groups of four.
+pub fn escrow_fingerprint(key: &str) -> String {
+    let head: Vec<char> = key.chars().take(24).collect();
+    head.chunks(4)
+        .map(|c| c.iter().collect::<String>())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// A cross-signing key object's one Ed25519 key, for `user` and `usage`: (key id, public).
+fn cross_key(o: &Value, user: &str, usage: &str) -> Option<(String, String)> {
+    if o["user_id"] != user || o["usage"] != json!([usage]) {
+        return None;
+    }
+    let keys = o["keys"].as_object()?;
+    if keys.len() != 1 {
+        return None;
+    }
+    let (id, public) = keys.iter().next()?;
+    let public = public.as_str()?;
+    (id == &format!("ed25519:{public}") && unb64(public).is_some_and(|b| b.len() == 32))
+        .then(|| (id.clone(), public.to_string()))
+}
+
 /// A verification (by QR code or emoji), as the screen shows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerificationView {
@@ -210,15 +259,100 @@ impl Inner {
         Ok(theirs.as_deref() == Some(ours.trim_end_matches('=')))
     }
 
+    /// The organisation's escrow from the policy, checked as the browser
+    /// checks it: signed by its signer's master key (as the server serves
+    /// it to this person), for the escrow and nothing else. None when there
+    /// is none; Invalid when there is a key nobody (or no master key) signed.
+    async fn escrow(&mut self) -> Result<Option<EscrowInfo>> {
+        let policy = self.http("GET", "/chat/policy", None).await?;
+        let unsigned = || Error::Invalid(ESCROW_UNSIGNED.into());
+        let Some(served) = policy["escrow"].as_object().cloned() else {
+            if policy["escrowKey"].is_string() || policy["escrowUnsigned"] == true {
+                return Err(unsigned());
+            }
+            return Ok(None);
+        };
+        let mut escrow = served;
+        let master = escrow.remove("signerMaster").unwrap_or(Value::Null);
+        let escrow = Value::Object(escrow);
+        let mut fields: Vec<&str> = escrow
+            .as_object()
+            .map(|o| o.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        fields.sort_unstable();
+        let signer = escrow["user_id"].as_str().unwrap_or_default().to_string();
+        let key = escrow["public_key"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let shaped = fields == ["public_key", "signatures", "usage", "user_id"]
+            && escrow["usage"] == json!(["ortus.escrow"])
+            && key.len() == 43
+            && unb64(&key).is_some_and(|b| b.len() == 32);
+        let Some((_, master_public)) = cross_key(&master, &signer, "master")
+            .filter(|_| shaped)
+            .filter(|(id, public)| crate::verify_json(&escrow, &signer, id, public))
+        else {
+            return Err(unsigned());
+        };
+        // Who vouches for the signer: oneself (one's own master key, held
+        // here), or one's user-signing key (held here) on theirs.
+        let held = self
+            .machine
+            .export_cross_signing_keys()
+            .await
+            .map_err(crate::store_err)?;
+        let public_of = |seed: Option<String>| {
+            seed.and_then(|s| vodozemac::Ed25519SecretKey::from_base64(&s).ok())
+                .map(|k| k.public_key().to_base64())
+        };
+        let own_master = public_of(held.as_ref().and_then(|k| k.master_key.clone()));
+        let own_usk = public_of(held.as_ref().and_then(|k| k.user_signing_key.clone()));
+        let me = self.me.to_string();
+        let trim = |k: &str| k.trim_end_matches('=').to_string();
+        let status =
+            if signer == me && own_master.as_deref().map(trim) == Some(trim(&master_public)) {
+                "you"
+            } else if signer != me
+                && own_usk.as_ref().is_some_and(|usk| {
+                    crate::verify_json(&master, &me, &format!("ed25519:{}", trim(usk)), usk)
+                })
+            {
+                "verified"
+            } else {
+                "unverified"
+            };
+        let pinned: Option<String> = self.custom(ESCROW_PIN).await?;
+        Ok(Some(EscrowInfo {
+            fingerprint: escrow_fingerprint(&key),
+            changed: pinned.is_some_and(|p| p != key),
+            key,
+            signer,
+            signer_status: status.into(),
+        }))
+    }
+
+    pub(crate) async fn escrow_info(&mut self) -> Result<Option<EscrowInfo>> {
+        self.escrow().await
+    }
+
     /// Sets recovery up from this phone (the person's first device to do
     /// so): cross-signing keys, this device signed, a backup the master key
     /// signed, the secrets in secret storage under a new recovery key, and
     /// its escrow copy when the organisation has an escrow key. The same
     /// formats as the browser's. Answers the recovery key, to show once.
-    pub(crate) async fn set_up_recovery(&mut self) -> Result<String> {
+    pub(crate) async fn set_up_recovery(&mut self, accepted: Option<String>) -> Result<String> {
         let me = self.me.to_string();
         if self.recovery_state().await?.set {
             return Err(Error::Invalid("Recovery is already set up for you.".into()));
+        }
+        // The escrow first: refused before anything is made. Not reached,
+        // not set up: never without the escrow copy the organisation asked for.
+        let escrow = self.escrow().await?;
+        if let Some(e) = &escrow {
+            if accepted.as_deref() != Some(e.key.as_str()) {
+                return Err(Error::Invalid(ESCROW_NOT_ACCEPTED.into()));
+            }
         }
         self.read_keys_of(&me).await?;
         let theirs = self
@@ -325,11 +459,9 @@ impl Inner {
             .await?;
         }
         let text = key.to_base58();
-        // The organisation's escrow copy, as the browser seals it.
-        // Not reached, not set up: never without the escrow copy the organisation asked for.
-        let policy = self.http("GET", "/chat/policy", None).await?;
-        if let Some(escrow) = policy["escrowKey"].as_str() {
-            let public = vodozemac::Curve25519PublicKey::from_base64(escrow)
+        // The organisation's escrow copy, as the browser seals it, to the key checked above.
+        if let Some(e) = &escrow {
+            let public = vodozemac::Curve25519PublicKey::from_base64(&e.key)
                 .map_err(|e| Error::Invalid(format!("the escrow key: {e}")))?;
             let m = vodozemac::pk_encryption::PkEncryption::from_key(public)
                 .encrypt(text.as_bytes())
@@ -339,7 +471,7 @@ impl Inner {
             self.http(
                 "PUT",
                 "/chat/account-data/ortus.escrow",
-                Some(json!({"key": escrow, "sealed": {
+                Some(json!({"key": e.key, "sealed": {
                     "ephemeral": m.ephemeral_key.to_base64(),
                     "ciphertext": b64(&m.ciphertext),
                     "mac": b64(&m.mac),
@@ -353,6 +485,10 @@ impl Inner {
             Some(json!({"key": key_id})),
         )
         .await?;
+        // The escrow key accepted here: a different one later is said to have changed.
+        if let Some(e) = &escrow {
+            self.set_custom(ESCROW_PIN, &e.key).await?;
+        }
         // Every room key this phone holds, into the backup.
         for _ in 0..100 {
             if !self.back_up_some().await? {

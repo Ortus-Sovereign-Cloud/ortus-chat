@@ -103,6 +103,16 @@ impl Identity {
     }
 }
 
+/// The organisation's escrow key, signed by an administrator's master key.
+fn escrow_object(user: &str, public: &str, master: &Ed25519SecretKey) -> Value {
+    sign(
+        master,
+        json!({"user_id": user, "usage": ["ortus.escrow"], "public_key": public}),
+        user,
+        &Identity::id(master),
+    )
+}
+
 #[test]
 fn trust_and_backup() {
     for (name, instance, _keep) in common::installations() {
@@ -510,49 +520,71 @@ fn trust_and_backup() {
             "{name}"
         );
 
-        // The escrow key: administrators set it, everyone reads it.
+        // The escrow key: administrators set it, signed by their current
+        // master key; everyone reads it, with the signer's master key.
         let escrow = "B".repeat(43);
+        let signed = escrow_object(&olena_mx, &escrow, &hers.master);
+        let patch =
+            |token: &str, body: Value| call(&client, token, "PATCH", "/chat/policy", Some(body));
+        assert_eq!(403, patch(&marek, json!({"escrow": signed})).0, "{name}");
         assert_eq!(
-            403,
-            call(
-                &client,
-                &marek,
-                "PATCH",
-                "/chat/policy",
-                Some(json!({"escrowKey": escrow}))
+            400,
+            patch(&olena, json!({"escrowKey": escrow})).0,
+            "{name}: a new key unsigned"
+        );
+        let mut short = escrow_object(&olena_mx, "short", &hers.master);
+        short["public_key"] = json!("short");
+        assert_eq!(400, patch(&olena, json!({"escrow": short})).0, "{name}");
+        assert_eq!(
+            400,
+            patch(
+                &olena,
+                json!({"escrow": escrow_object(&olena_mx, &escrow, &his_identity.master)})
             )
             .0,
-            "{name}"
+            "{name}: not her master key"
         );
         assert_eq!(
             400,
-            call(
-                &client,
+            patch(
                 &olena,
-                "PATCH",
-                "/chat/policy",
-                Some(json!({"escrowKey": "short"}))
+                json!({"escrow": escrow_object(&marek_mx, &escrow, &hers.master)})
             )
             .0,
-            "{name}"
+            "{name}: signed as someone else"
+        );
+        let mut extra = escrow_object(&olena_mx, &escrow, &hers.master);
+        extra["note"] = json!("more");
+        assert_eq!(
+            400,
+            patch(&olena, json!({"escrow": extra})).0,
+            "{name}: a field more"
+        );
+        let mut forged = signed.clone();
+        forged["public_key"] = json!("C".repeat(43));
+        assert_eq!(
+            400,
+            patch(&olena, json!({"escrow": forged})).0,
+            "{name}: the key changed after signing"
+        );
+        let (status, out) = patch(&olena, json!({"escrow": signed}));
+        assert_eq!(200, status, "{name}: {out}");
+        let (_, policy) = call(&client, &marek, "GET", "/chat/policy", None);
+        assert_eq!(escrow, policy["escrowKey"], "{name}");
+        assert_eq!(json!(false), policy["escrowUnsigned"], "{name}");
+        let served = &policy["escrow"];
+        assert_eq!(escrow, served["public_key"], "{name}: {policy}");
+        assert_eq!(
+            signed["signatures"], served["signatures"],
+            "{name}: as signed"
         );
         assert_eq!(
-            200,
-            call(
-                &client,
-                &olena,
-                "PATCH",
-                "/chat/policy",
-                Some(json!({"escrowKey": escrow}))
-            )
-            .0,
-            "{name}"
+            cross_key(&olena_mx, "master", &hers.master)["keys"],
+            served["signerMaster"]["keys"],
+            "{name}: her master key, to check it with"
         );
-        assert_eq!(
-            escrow,
-            call(&client, &marek, "GET", "/chat/policy", None).1["escrowKey"],
-            "{name}"
-        );
+        assert_eq!(json!(["master"]), served["signerMaster"]["usage"], "{name}");
+        assert_eq!(olena_mx, served["signerMaster"]["user_id"], "{name}");
         assert_eq!(
             true,
             call(&client, &marek, "GET", "/chat/policy", None).1["encryptedRooms"],
@@ -650,6 +682,113 @@ fn trust_and_backup() {
             )
             .0,
             "{name}: administrators only"
+        );
+
+        // Marek vouched for her: the master key served to him with the escrow carries his signature.
+        let vouched = sign(
+            &his_identity.usk,
+            cross_key(&olena_mx, "master", &hers.master),
+            &marek_mx,
+            &Identity::id(&his_identity.usk),
+        );
+        let master_id = hers.master.public_key().to_base64();
+        let (status, out) = call(
+            &client,
+            &marek,
+            "POST",
+            "/chat/signatures",
+            Some(json!({ &olena_mx: { &master_id: vouched } })),
+        );
+        assert_eq!(
+            (200, 1),
+            (status, out["kept"].as_i64().unwrap_or(0)),
+            "{name}: {out}"
+        );
+        let (_, policy) = call(&client, &marek, "GET", "/chat/policy", None);
+        assert!(
+            policy["escrow"]["signerMaster"]["signatures"][&marek_mx]
+                [Identity::id(&his_identity.usk)]
+            .is_string(),
+            "{name}: {policy}"
+        );
+        // The same signed key again needs nothing; removing it takes it away.
+        assert_eq!(200, patch(&olena, json!({"escrow": signed})).0, "{name}");
+
+        // A new master key: the escrow its old one signed is unsigned now,
+        // and a new escrow signed by the old one is refused.
+        let next = Identity::new();
+        assert_eq!(
+            200,
+            call(
+                &client,
+                &olena,
+                "PUT",
+                "/chat/cross-signing",
+                Some(next.upload(&olena_mx))
+            )
+            .0,
+            "{name}"
+        );
+        let (_, policy) = call(&client, &marek, "GET", "/chat/policy", None);
+        assert!(policy["escrow"].is_null(), "{name}: {policy}");
+        assert_eq!(json!(true), policy["escrowUnsigned"], "{name}");
+        assert_eq!(escrow, policy["escrowKey"], "{name}: still shown");
+        let other = "D".repeat(43);
+        assert_eq!(
+            400,
+            patch(
+                &olena,
+                json!({"escrow": escrow_object(&olena_mx, &other, &hers.master)})
+            )
+            .0,
+            "{name}: signed by a master key that is not hers any more"
+        );
+        assert_eq!(
+            200,
+            patch(
+                &olena,
+                json!({"escrow": escrow_object(&olena_mx, &other, &next.master)})
+            )
+            .0,
+            "{name}"
+        );
+        assert_eq!(
+            json!(false),
+            call(&client, &marek, "GET", "/chat/policy", None).1["escrowUnsigned"],
+            "{name}"
+        );
+
+        // A key kept before escrows were signed: served as unsigned.
+        sql(
+            &instance,
+            "DELETE FROM chat_settings WHERE name IN ('escrow', 'escrow_signer')",
+            &[],
+        );
+        let (_, policy) = call(&client, &marek, "GET", "/chat/policy", None);
+        assert!(policy["escrow"].is_null(), "{name}: {policy}");
+        assert_eq!(json!(true), policy["escrowUnsigned"], "{name}");
+        assert_eq!(other, policy["escrowKey"], "{name}");
+        // Removing: null, or the old empty key.
+        assert_eq!(200, patch(&olena, json!({"escrowKey": ""})).0, "{name}");
+        let (_, policy) = call(&client, &marek, "GET", "/chat/policy", None);
+        assert!(
+            policy["escrowKey"].is_null() && policy["escrow"].is_null(),
+            "{name}: {policy}"
+        );
+        assert_eq!(json!(false), policy["escrowUnsigned"], "{name}");
+        assert_eq!(
+            200,
+            patch(
+                &olena,
+                json!({"escrow": escrow_object(&olena_mx, &other, &next.master)})
+            )
+            .0,
+            "{name}"
+        );
+        assert_eq!(200, patch(&olena, json!({"escrow": null})).0, "{name}");
+        assert!(
+            call(&client, &marek, "GET", "/chat/policy", None).1["escrowKey"].is_null(),
+            "{name}"
         );
     }
 }
@@ -1055,12 +1194,13 @@ fn trust_limits_and_step_up() {
         ))
         .unwrap();
         let escrow = "B".repeat(43);
+        let signed = escrow_object(&olena_mx, &escrow, &hers.master);
         let (status, out) = call(
             &client,
             &weak,
             "PATCH",
             "/chat/policy",
-            Some(json!({"escrowKey": escrow})),
+            Some(json!({"escrow": signed})),
         );
         assert_eq!(
             (403, "step_up"),
@@ -1074,7 +1214,7 @@ fn trust_limits_and_step_up() {
                 &olena,
                 "PATCH",
                 "/chat/policy",
-                Some(json!({"escrowKey": escrow}))
+                Some(json!({"escrow": signed}))
             )
             .0,
             "{name}"
@@ -1086,10 +1226,22 @@ fn trust_limits_and_step_up() {
                 &weak,
                 "PATCH",
                 "/chat/policy",
-                Some(json!({"escrowKey": escrow, "encryptedRooms": true}))
+                Some(json!({"escrow": signed, "encryptedRooms": true}))
             )
             .0,
             "{name}: no change to the key"
+        );
+        let (status, out) = call(
+            &client,
+            &weak,
+            "PATCH",
+            "/chat/policy",
+            Some(json!({"escrow": null})),
+        );
+        assert_eq!(
+            (403, "step_up"),
+            (status, out["error"]["code"].as_str().unwrap_or_default()),
+            "{name}: taking it away is a change: {out}"
         );
         assert_eq!(200, call(&client, &marek, "PUT", "/chat/account-data/ortus.escrow", Some(json!({"key": escrow, "sealed": {"ephemeral": "e", "ciphertext": "c", "mac": "m"}}))).0);
         let marek_escrow = "/chat/admin/escrow?email=marek@ministry.example";

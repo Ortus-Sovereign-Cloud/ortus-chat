@@ -94,7 +94,12 @@ for (;;) {
       // The text only (the phones' tests read it as before).
       say({ result: (await sealer.open(c.room, c.roomId, c.message.sealed, c.message.sender, c.message.id, c.message.thread ?? null))?.text ?? null });
     } else if (c.cmd === "setUpRecovery") {
-      say({ result: await sealer.setUpRecovery() });
+      // The escrow key the person accepted (as escrowInfo showed it), if any.
+      say({ result: await sealer.setUpRecovery(c.accepted ?? undefined) });
+    } else if (c.cmd === "escrowInfo") {
+      say({ result: await sealer.escrowInfo() });
+    } else if (c.cmd === "signWithMaster") {
+      say({ result: await sealer.signWithMaster(c.value) });
     } else if (c.cmd === "unverified") {
       say({ result: await sealer.unverified(c.room) });
     } else if (c.cmd === "verify") {
