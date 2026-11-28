@@ -515,7 +515,12 @@ impl E2e {
                     .to_string_lossy()
                     .starts_with("matrix-sdk-crypto")
                 {
-                    std::fs::remove_file(e.path()).map_err(store_err)?;
+                    // The closing store may remove its own journal files
+                    // (-wal, -shm) meanwhile: gone is what is wanted.
+                    match std::fs::remove_file(e.path()) {
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                        done => done.map_err(store_err)?,
+                    }
                 }
             }
         }
